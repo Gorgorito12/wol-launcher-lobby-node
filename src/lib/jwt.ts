@@ -78,11 +78,11 @@ export async function verifyJwt(token: string, secret: string): Promise<JwtPaylo
  */
 export async function mintSession(
     userId: string,
-    githubLogin: string,
+    discordUsername: string,
     secret: string,
 ): Promise<{ token: string; expiresAt: number }> {
     const now = Math.floor(Date.now() / 1000);
     const exp = now + 7 * 24 * 60 * 60;
-    const token = await signJwt({ sub: userId, du: githubLogin, iat: now, exp }, secret);
+    const token = await signJwt({ sub: userId, du: discordUsername, iat: now, exp }, secret);
     return { token, expiresAt: exp };
 }

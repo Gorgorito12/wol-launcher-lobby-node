@@ -46,7 +46,7 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
         const rows = await ctx.db.prepare(
             `SELECT l.id, l.host_user_id, l.title, l.mod_id, l.mod_combined_hash,
                     l.max_players, l.current_players, l.is_private, l.status,
-                    l.created_at, u.github_login AS host_login, u.display_name AS host_name
+                    l.created_at, u.discord_username AS host_login, u.display_name AS host_name
              FROM lobbies l
              JOIN users u ON u.id = l.host_user_id
              WHERE l.status IN ('open', 'locked', 'in_game')
@@ -81,7 +81,7 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
                 created_at: r.created_at,
                 host: {
                     id: r.host_user_id,
-                    github_login: r.host_login,
+                    discord_username: r.host_login,
                     display_name: r.host_name,
                 },
             })),
@@ -182,7 +182,7 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
         if (!lobby || lobby.status === 'closed') throw Errors.NotFound('Lobby');
 
         const members = await ctx.db.prepare(
-            `SELECT lm.user_id, lm.is_ready, lm.role, u.github_login, u.display_name, u.avatar_url
+            `SELECT lm.user_id, lm.is_ready, lm.role, u.discord_username, u.display_name, u.avatar_url
              FROM lobby_members lm
              JOIN users u ON u.id = lm.user_id
              WHERE lm.lobby_id = ?
@@ -191,7 +191,7 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
             user_id: string;
             is_ready: number;
             role: 'player' | 'spectator';
-            github_login: string;
+            discord_username: string;
             display_name: string;
             avatar_url: string | null;
         }>();
@@ -208,7 +208,7 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
             host_user_id: lobby.host_user_id,
             members: (members.results ?? []).map((m) => ({
                 id: m.user_id,
-                github_login: m.github_login,
+                discord_username: m.discord_username,
                 display_name: m.display_name,
                 avatar_url: m.avatar_url,
                 is_ready: m.is_ready === 1,

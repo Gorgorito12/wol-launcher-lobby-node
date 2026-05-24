@@ -7,7 +7,7 @@ declare module 'fastify' {
     interface FastifyRequest {
         /** Set by <c>readAuth</c> when a valid Bearer token is present. */
         userId?: string;
-        githubLogin?: string;
+        discordUsername?: string;
         authenticated?: boolean;
         /** Set by <c>safeRead</c> so the circuit breaker lets the request through in degraded mode. */
         safeRead?: boolean;
@@ -28,7 +28,7 @@ export function readAuth(ctx: AppContext): preHandlerHookHandler {
             const v = Array.isArray(header) ? header[0] : header;
             if (v) {
                 req.userId = v;
-                req.githubLogin = v;
+                req.discordUsername = v;
                 req.authenticated = true;
                 return;
             }
@@ -43,7 +43,7 @@ export function readAuth(ctx: AppContext): preHandlerHookHandler {
         const payload = await verifyJwt(m[1]!, cfg.jwtSigningKey);
         if (payload) {
             req.userId = payload.sub;
-            req.githubLogin = payload.du;
+            req.discordUsername = payload.du;
             req.authenticated = true;
         }
     };

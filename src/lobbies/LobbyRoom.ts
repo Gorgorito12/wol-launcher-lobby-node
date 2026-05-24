@@ -27,7 +27,7 @@ import type { AppContext } from '../context';
 
 interface AttachedSocket {
     userId: string;
-    githubLogin: string;
+    discordUsername: string;
     /** Last frame timestamp, used for idle-kick. */
     lastFrameAt: number;
     /** Counts chat frames inside the current minute window for per-user throttling. */
@@ -176,9 +176,9 @@ class LobbyRoom {
             await ctx.kv.delete(`lobby:join:${frame.join_token}`);
             userId = parsed.userId;
             const u = await ctx.db.prepare(
-                `SELECT github_login FROM users WHERE id = ?`,
-            ).bind(userId).first<{ github_login: string }>();
-            login = u?.github_login ?? '';
+                `SELECT discord_username FROM users WHERE id = ?`,
+            ).bind(userId).first<{ discord_username: string }>();
+            login = u?.discord_username ?? '';
         } else if (typeof frame.token === 'string') {
             const payload = await verifyJwt(frame.token, ctx.config.jwtSigningKey);
             if (!payload) {
@@ -206,7 +206,7 @@ class LobbyRoom {
         const now = Date.now();
         this.attached.set(ws, {
             userId,
-            githubLogin: login,
+            discordUsername: login,
             lastFrameAt: now,
             chatWindowStart: now,
             chatWindowCount: 0,
@@ -228,7 +228,7 @@ class LobbyRoom {
         this.broadcast({
             type: 'member_joined',
             user_id: userId,
-            github_login: login,
+            discord_username: login,
         }, ws);
     }
 
@@ -259,7 +259,7 @@ class LobbyRoom {
         const line: ChatLine = {
             id: randomUUID(),
             userId: attached.userId,
-            login: attached.githubLogin,
+            login: attached.discordUsername,
             body,
             at: now,
         };
@@ -277,7 +277,7 @@ class LobbyRoom {
         const existing = this.members[attached.userId];
         this.members[attached.userId] = {
             ready,
-            login: existing?.login ?? attached.githubLogin,
+            login: existing?.login ?? attached.discordUsername,
         };
         try {
             await ctx.db.prepare(
@@ -301,7 +301,7 @@ class LobbyRoom {
         this.broadcast({
             type: 'peer_announce',
             user_id: attached.userId,
-            login: attached.githubLogin,
+            login: attached.discordUsername,
             endpoints: frame.endpoints ?? [],
         }, null);
     }
@@ -315,7 +315,7 @@ class LobbyRoom {
         const payload = {
             type: 'peer_relay',
             from_user: attached.userId,
-            from_login: attached.githubLogin,
+            from_login: attached.discordUsername,
             payload: frame.payload ?? null,
         };
         const json = JSON.stringify(payload);
