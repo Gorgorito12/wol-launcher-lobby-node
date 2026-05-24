@@ -1,0 +1,63 @@
+[Unit]
+Description=WoL Launcher Lobby backend (Fastify + SQLite)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# The unit runs as a dedicated low-priv user. Create it once:
+#   sudo useradd --system --home /var/lib/wol-lobby --shell /usr/sbin/nologin wol-lobby
+#   sudo mkdir -p /var/lib/wol-lobby/replays
+#   sudo chown -R wol-lobby:wol-lobby /var/lib/wol-lobby
+User=wol-lobby
+Group=wol-lobby
+
+# Working directory must be the cloned repo (wol-launcher-lobby-node)
+# because the process reads .env and migrations/ relative to cwd.
+WorkingDirectory=/opt/wol-lobby
+
+# Use the tsx binary shipped in node_modules/.bin/ directly. The
+# alternative `node --import tsx/esm` form has a known issue
+# resolving some CJS deps that fastify pulls in (ajv tries to load
+# a sibling with an unexpected extension), which `tsx` itself
+# handles correctly. node + tsx both need to be on the PATH:
+#   curl -fsSL https://deb.nodesource.com/setup_20.x | sudo bash -
+#   sudo apt-get install -y nodejs build-essential
+#   cd /opt/wol-lobby && npm install --omit=dev
+# `npm install` puts tsx under ./node_modules/.bin/tsx.
+ExecStart=/opt/wol-lobby/node_modules/.bin/tsx /opt/wol-lobby/src/index.ts
+
+# Recommended limits + restart policy. Restart on any non-zero exit
+# (Fastify only exits non-zero on bind failure or a fatal startup
+# error, both of which deserve a retry-after-delay).
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+# Logs go to journald (`journalctl -u wol-lobby`). Fastify writes to
+# stdout via pino; pretty-printing is intentionally off in production
+# so the JSON lines stay grep-able.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wol-lobby
+
+# Sandbox hardening — pretty standard for a single-purpose Node app.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+
+# The DB + replay folder are the only places we need to write.
+ReadWritePaths=/var/lib/wol-lobby
+
+[Install]
+WantedBy=multi-user.target
