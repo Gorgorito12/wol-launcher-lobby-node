@@ -187,7 +187,7 @@ class LobbyRoom {
                 return;
             }
             userId = payload.sub;
-            login = payload.gh;
+            login = payload.du;
         } else {
             this.sendError(ws, 'unauthenticated', 'hello frame needs join_token or token');
             ws.close(4001, 'unauthenticated');

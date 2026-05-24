@@ -43,7 +43,7 @@ export function readAuth(ctx: AppContext): preHandlerHookHandler {
         const payload = await verifyJwt(m[1]!, cfg.jwtSigningKey);
         if (payload) {
             req.userId = payload.sub;
-            req.githubLogin = payload.gh;
+            req.githubLogin = payload.du;
             req.authenticated = true;
         }
     };

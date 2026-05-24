@@ -9,7 +9,7 @@ import { createHmac, timingSafeEqual } from 'node:crypto';
  * sign-ins survive the cutover from Cloudflare to the VM without users
  * having to re-authenticate.
  *
- * Token shape: { sub: userId, gh: githubLogin, iat, exp }.
+ * Token shape: { sub: userId, du: discordUsername, iat, exp }.
  * Sessions last 7 days; the launcher silently re-runs the device flow
  * when its stored token is within 24 h of expiry.
  */
@@ -17,8 +17,8 @@ import { createHmac, timingSafeEqual } from 'node:crypto';
 export interface JwtPayload {
     /** Our internal user id (UUID). */
     sub: string;
-    /** GitHub login at token-issue time, just for nicer log lines. */
-    gh: string;
+    /** Discord username at token-issue time, just for nicer log lines. */
+    du: string;
     /** Issued-at, seconds since epoch. */
     iat: number;
     /** Expiry, seconds since epoch. */
@@ -83,6 +83,6 @@ export async function mintSession(
 ): Promise<{ token: string; expiresAt: number }> {
     const now = Math.floor(Date.now() / 1000);
     const exp = now + 7 * 24 * 60 * 60;
-    const token = await signJwt({ sub: userId, gh: githubLogin, iat: now, exp }, secret);
+    const token = await signJwt({ sub: userId, du: githubLogin, iat: now, exp }, secret);
     return { token, expiresAt: exp };
 }
