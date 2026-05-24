@@ -13,23 +13,24 @@
 PRAGMA foreign_keys = ON;
 
 -- ---------------------------------------------------------------------------
--- Users — populated on first successful GitHub OAuth.
--- We store the GitHub numeric id (immutable) plus the login (mutable) so a
--- rename on GitHub's side doesn't orphan match history.
+-- Users — populated on first successful Discord OAuth.
+-- We store the Discord snowflake (immutable) plus the username (mutable) so
+-- a rename on Discord's side doesn't orphan match history. Snowflakes are
+-- 64-bit ints — stored as TEXT to avoid JS Number truncation.
 -- ---------------------------------------------------------------------------
 CREATE TABLE users (
-    id              TEXT    PRIMARY KEY,                 -- our internal id
-    github_id       INTEGER NOT NULL UNIQUE,              -- numeric id from GH
-    github_login    TEXT    NOT NULL,                     -- latest known login
-    display_name    TEXT    NOT NULL,                     -- defaults to github_login on first login
-    avatar_url      TEXT,                                 -- GH avatar CDN url
-    created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
-    last_seen_at    TEXT    NOT NULL DEFAULT (datetime('now')),
-    is_banned       INTEGER NOT NULL DEFAULT 0,           -- 0/1 boolean
-    ban_reason      TEXT
+    id                TEXT    PRIMARY KEY,                  -- our internal id (UUID v4)
+    discord_id        TEXT    NOT NULL UNIQUE,               -- Discord snowflake
+    discord_username  TEXT    NOT NULL,                      -- current Discord username
+    display_name      TEXT    NOT NULL,                      -- defaults to discord_username on first login
+    avatar_url        TEXT,                                  -- pre-built Discord CDN URL
+    created_at        TEXT    NOT NULL DEFAULT (datetime('now')),
+    last_seen_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+    is_banned         INTEGER NOT NULL DEFAULT 0,            -- 0/1 boolean
+    ban_reason        TEXT
 );
 
-CREATE INDEX idx_users_github_id ON users (github_id);
+CREATE INDEX idx_users_discord_id ON users (discord_id);
 CREATE INDEX idx_users_last_seen ON users (last_seen_at);
 
 -- ---------------------------------------------------------------------------
