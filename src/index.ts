@@ -12,7 +12,7 @@ import type { AppContext } from './context';
 import { readAuth, requireAuth, safeRead } from './middleware/auth';
 import { circuitBreaker, readGlobalCount } from './middleware/circuitBreaker';
 import { ipRateLimit, Limits } from './middleware/rateLimit';
-import { registerGithubAuth } from './auth/github';
+import { registerDiscordAuth } from './auth/discord';
 import { registerLobbiesRest } from './lobbies/rest';
 import { registerMatchesRest } from './matches/rest';
 import { registerReplaysRest } from './replays/rest';
@@ -130,7 +130,7 @@ async function main(): Promise<void> {
     // ----- Routes guarded by the circuit breaker -----
     app.addHook('preHandler', circuitBreaker(ctx));
 
-    registerGithubAuth(app, ctx);
+    registerDiscordAuth(app, ctx);
     registerLobbiesRest(app, ctx);
     registerMatchesRest(app, ctx);
     registerReplaysRest(app, ctx);
@@ -138,7 +138,7 @@ async function main(): Promise<void> {
     // /me — current user + ELO snapshot. Requires auth.
     app.get('/me', { preHandler: [requireAuth()] }, async (req, _reply) => {
         const u = await db.prepare(
-            `SELECT u.id, u.github_login, u.display_name, u.avatar_url, u.created_at,
+            `SELECT u.id, u.discord_username, u.display_name, u.avatar_url, u.created_at,
                     e.rating, e.rd, e.games_played
              FROM users u
              LEFT JOIN elo_ratings e ON e.user_id = u.id AND e.mode = 'default'

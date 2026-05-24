@@ -26,10 +26,15 @@ export interface Config {
     lobbyMaxPlayers: number;
     devAuthBypass: boolean;
 
+    // Public base URL of this service — used to construct the
+    // Discord OAuth redirect_uri. MUST match the entry registered in
+    // the Discord Developer Portal exactly (scheme + host + path).
+    publicBaseUrl: string;
+
     // Secrets
     jwtSigningKey: string;
-    githubClientId: string;
-    githubClientSecret: string;
+    discordClientId: string;
+    discordClientSecret: string;
 }
 
 function intEnv(name: string, fallback: number): number {
@@ -67,9 +72,11 @@ export function loadConfig(): Config {
         lobbyMaxPlayers: intEnv('LOBBY_MAX_PLAYERS', 8),
         devAuthBypass: (process.env.DEV_AUTH_BYPASS || '').toLowerCase() === 'true',
 
+        publicBaseUrl: strEnv('PUBLIC_BASE_URL', ''),
+
         jwtSigningKey: strEnv('JWT_SIGNING_KEY', ''),
-        githubClientId: strEnv('GITHUB_CLIENT_ID', ''),
-        githubClientSecret: strEnv('GITHUB_CLIENT_SECRET', ''),
+        discordClientId: strEnv('DISCORD_CLIENT_ID', ''),
+        discordClientSecret: strEnv('DISCORD_CLIENT_SECRET', ''),
     };
 
     // Hard fail on missing secrets — we don't want the service to start
@@ -77,13 +84,14 @@ export function loadConfig(): Config {
     if (!cfg.devAuthBypass) {
         const missing: string[] = [];
         if (!cfg.jwtSigningKey || cfg.jwtSigningKey.startsWith('replace-me')) missing.push('JWT_SIGNING_KEY');
-        if (!cfg.githubClientId || cfg.githubClientId.startsWith('replace-me')) missing.push('GITHUB_CLIENT_ID');
-        if (!cfg.githubClientSecret || cfg.githubClientSecret.startsWith('replace-me')) missing.push('GITHUB_CLIENT_SECRET');
+        if (!cfg.discordClientId || cfg.discordClientId.startsWith('replace-me')) missing.push('DISCORD_CLIENT_ID');
+        if (!cfg.discordClientSecret || cfg.discordClientSecret.startsWith('replace-me')) missing.push('DISCORD_CLIENT_SECRET');
+        if (!cfg.publicBaseUrl || cfg.publicBaseUrl.startsWith('replace-me')) missing.push('PUBLIC_BASE_URL');
         if (missing.length > 0) {
             throw new Error(
                 `Missing required env vars: ${missing.join(', ')}. ` +
                 `Set them in .env (see .env.example) or set DEV_AUTH_BYPASS=true ` +
-                `for local development without GitHub.`,
+                `for local development without Discord.`,
             );
         }
     }

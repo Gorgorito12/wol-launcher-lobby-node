@@ -45,14 +45,16 @@ npm install --omit=dev          # better-sqlite3 will compile here
 
 # 4. Configure env
 cp .env.example .env
-# Edit .env:
-#   - HOST=127.0.0.1 (Fastify listens local; nginx proxies in)
+# Edit .env. The values that matter:
+#   - HOST=127.0.0.1                          (Fastify listens local; nginx proxies in)
 #   - PORT=8080
 #   - DB_PATH=/var/lib/wol-lobby/lobby.db
 #   - REPLAYS_DIR=/var/lib/wol-lobby/replays
+#   - PUBLIC_BASE_URL=https://wol-lobby.duckdns.org
+#                                              (Match the Redirect URI registered in Discord exactly.)
 #   - JWT_SIGNING_KEY=$(openssl rand -hex 32)
-#   - GITHUB_CLIENT_ID=... (your OAuth app)
-#   - GITHUB_CLIENT_SECRET=... (your OAuth app)
+#   - DISCORD_CLIENT_ID=...                   (from discord.com/developers/applications)
+#   - DISCORD_CLIENT_SECRET=...
 sudo chown wol-lobby:wol-lobby .env
 sudo chmod 600 .env
 
