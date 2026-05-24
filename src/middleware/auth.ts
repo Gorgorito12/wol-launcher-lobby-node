@@ -1,7 +1,7 @@
 import type { FastifyReply, FastifyRequest, preHandlerHookHandler } from 'fastify';
-import { Errors } from '../lib/errors.js';
-import { verifyJwt } from '../lib/jwt.js';
-import type { AppContext } from '../context.js';
+import { Errors } from '../lib/errors';
+import { verifyJwt } from '../lib/jwt';
+import type { AppContext } from '../context';
 
 declare module 'fastify' {
     interface FastifyRequest {

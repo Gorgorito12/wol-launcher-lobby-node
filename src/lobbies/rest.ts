@@ -1,9 +1,9 @@
 import type { FastifyInstance } from 'fastify';
-import { Errors } from '../lib/errors.js';
-import { shortId, sha256Hex, uuid } from '../lib/ids.js';
-import { requireAuth } from '../middleware/auth.js';
-import { ipRateLimit, userRateLimit, Limits } from '../middleware/rateLimit.js';
-import type { AppContext } from '../context.js';
+import { Errors } from '../lib/errors';
+import { shortId, sha256Hex, uuid } from '../lib/ids';
+import { requireAuth } from '../middleware/auth';
+import { ipRateLimit, userRateLimit, Limits } from '../middleware/rateLimit';
+import type { AppContext } from '../context';
 
 interface LobbyRow {
     id: string;

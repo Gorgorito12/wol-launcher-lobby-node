@@ -1,6 +1,6 @@
 import type { preHandlerHookHandler } from 'fastify';
-import { Errors } from '../lib/errors.js';
-import type { AppContext } from '../context.js';
+import { Errors } from '../lib/errors';
+import type { AppContext } from '../context';
 
 /**
  * Daily-budget circuit breaker. Preserved here from the original

@@ -1,10 +1,10 @@
 import type { FastifyInstance } from 'fastify';
 import { fetch } from 'undici';
-import { Errors } from '../lib/errors.js';
-import { mintSession } from '../lib/jwt.js';
-import { uuid } from '../lib/ids.js';
-import { ipRateLimit, Limits } from '../middleware/rateLimit.js';
-import type { AppContext } from '../context.js';
+import { Errors } from '../lib/errors';
+import { mintSession } from '../lib/jwt';
+import { uuid } from '../lib/ids';
+import { ipRateLimit, Limits } from '../middleware/rateLimit';
+import type { AppContext } from '../context';
 
 /**
  * GitHub OAuth — Device Flow.

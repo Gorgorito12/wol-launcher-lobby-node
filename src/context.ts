@@ -1,7 +1,7 @@
-import type { Config } from './env.js';
-import type { Db } from './db.js';
-import type { KvStore } from './kv.js';
-import type { LobbyRoomRegistry } from './lobbies/LobbyRoom.js';
+import type { Config } from './env';
+import type { Db } from './db';
+import type { KvStore } from './kv';
+import type { LobbyRoomRegistry } from './lobbies/LobbyRoom';
 
 /**
  * Dependency container handed to every route and middleware. The Worker

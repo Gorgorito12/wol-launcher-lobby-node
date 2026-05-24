@@ -1,10 +1,10 @@
 import type { FastifyInstance } from 'fastify';
-import { Errors } from '../lib/errors.js';
-import { uuid } from '../lib/ids.js';
-import { requireAuth } from '../middleware/auth.js';
-import { ipRateLimit, Limits } from '../middleware/rateLimit.js';
-import { applyMatch, type ParticipantOutcome } from '../elo/glicko2.js';
-import type { AppContext } from '../context.js';
+import { Errors } from '../lib/errors';
+import { uuid } from '../lib/ids';
+import { requireAuth } from '../middleware/auth';
+import { ipRateLimit, Limits } from '../middleware/rateLimit';
+import { applyMatch, type ParticipantOutcome } from '../elo/glicko2';
+import type { AppContext } from '../context';
 
 interface ReportMatchBody {
     lobby_id?: string;

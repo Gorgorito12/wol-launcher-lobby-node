@@ -2,7 +2,7 @@
 // constructor under <c>.Glicko2</c> regardless of how the bundler
 // unwraps the module. Same approach the Worker used.
 import glicko2 from 'glicko2';
-import type { Db } from '../db.js';
+import type { Db } from '../db';
 
 const Glicko2Ctor = (glicko2 as unknown as { Glicko2: typeof import('glicko2').Glicko2 }).Glicko2
     ?? (glicko2 as unknown as { default: { Glicko2: typeof import('glicko2').Glicko2 } }).default?.Glicko2

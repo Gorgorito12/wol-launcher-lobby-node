@@ -1,7 +1,7 @@
 import type { WebSocket } from 'ws';
 import { randomUUID } from 'node:crypto';
-import { verifyJwt } from '../lib/jwt.js';
-import type { AppContext } from '../context.js';
+import { verifyJwt } from '../lib/jwt';
+import type { AppContext } from '../context';
 
 /**
  * Per-lobby room state, in-process replacement for the Cloudflare

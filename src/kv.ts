@@ -1,4 +1,4 @@
-import type { Db } from './db.js';
+import type { Db } from './db';
 
 /**
  * Cloudflare KV replacement backed by a single SQLite table.

@@ -1,6 +1,6 @@
 import type { FastifyRequest, preHandlerHookHandler } from 'fastify';
-import { Errors } from '../lib/errors.js';
-import type { AppContext } from '../context.js';
+import { Errors } from '../lib/errors';
+import type { AppContext } from '../context';
 
 /**
  * Sliding-bucket rate limiter, ported from the Worker. Each rule has a
