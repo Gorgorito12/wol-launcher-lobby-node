@@ -1,6 +1,8 @@
 node_modules/
 *.log
 .env
-lobby.db
-lobby.db-*
-replays/
+/lobby.db
+/lobby.db-*
+# Only ignore the DATA replays folder at the repo root, not src/replays/
+# which is part of the source tree.
+/replays/
