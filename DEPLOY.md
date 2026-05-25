@@ -6,7 +6,7 @@ multiplayer lobby. Replaces the original Cloudflare Worker
 
 ## Pre-flight: DuckDNS subdomain
 
-The backend needs HTTPS for GitHub OAuth callbacks to work cleanly,
+The backend needs HTTPS for Discord OAuth callbacks to work cleanly,
 and HTTPS needs a domain. DuckDNS gives you one for free:
 
 1. Visit <https://www.duckdns.org> → sign in with GitHub.
