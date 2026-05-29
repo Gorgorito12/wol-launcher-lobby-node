@@ -55,6 +55,9 @@ cp .env.example .env
 #   - JWT_SIGNING_KEY=$(openssl rand -hex 32)
 #   - DISCORD_CLIENT_ID=...                   (from discord.com/developers/applications)
 #   - DISCORD_CLIENT_SECRET=...
+#   - (optional) GLOBAL_CHAT_MSGS_PER_MIN / GLOBAL_CHAT_HISTORY /
+#     GLOBAL_CHAT_MAX_CONNECTIONS — global-chat limits; omit to use the
+#     defaults (20 msgs/min · 100 history · 60 connections). See .env.example.
 sudo chown wol-lobby:wol-lobby .env
 sudo chmod 600 .env
 
@@ -123,6 +126,38 @@ the new backend. Existing users with the old default still point at
 the Cloudflare Worker until they update OR the `MigrateLobbyBaseUrl`
 heuristic catches the old URL (you can extend that list to include
 the old Worker URL so it auto-rewrites to the new one on next launch).
+
+## Updating (redeploy after a code change)
+
+The service runs the TypeScript directly via `tsx` — there is **no build
+step**. To ship a change that's already on GitHub:
+
+```bash
+cd /opt/wol-lobby
+git pull
+# Only if package.json changed (new/updated deps):
+#   npm install --omit=dev
+# Only if a new file landed under migrations/ (DB schema change):
+#   npm run migrate
+sudo systemctl restart wol-lobby
+sudo systemctl status wol-lobby --no-pager   # → active (running)
+curl http://127.0.0.1:8080/health            # → {"ok":true, ...}
+```
+
+Most launcher-feature backends are **code-only** changes: no new deps, no
+migration, no nginx edit — `git pull` + `systemctl restart` is the whole
+deploy. Example: the **global chat** is a WebSocket room at `/global/ws`
+held in memory (`src/global/GlobalChatRoom.ts`); it rides the existing
+nginx `location /` upgrade block, so nginx is untouched, and its limits
+are env knobs (`GLOBAL_CHAT_*`, all optional with defaults). To confirm a
+WS route is live after a restart:
+
+```bash
+curl -i -N -H "Connection: Upgrade" -H "Upgrade: websocket" \
+  -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+  http://127.0.0.1:8080/global/ws
+# → HTTP/1.1 101 Switching Protocols   (404 = route not deployed)
+```
 
 ## Backups
 

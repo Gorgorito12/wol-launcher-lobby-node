@@ -36,6 +36,11 @@ interface AttachedSocket {
     /** Counts chat frames inside the current minute window for throttling. */
     chatWindowStart: number;
     chatWindowCount: number;
+    /** Timestamp of the last accepted chat message, for slow-mode. */
+    lastChatAt: number;
+    /** Anti-spam strikes inside the current minute (slow-mode / rate trips). */
+    strikes: number;
+    strikeWindowStart: number;
 }
 
 interface ChatLine {
@@ -52,6 +57,10 @@ const MAX_CHAT_LEN = 500;
 export class GlobalChatRoom {
     private chatRing: ChatLine[] = [];
     private attached = new Map<WebSocket, AttachedSocket>();
+    /** userId → epoch ms the auto-mute lifts. Keyed by user (not socket) so
+     * reconnecting can't shed an active timeout. Entries are pruned lazily
+     * when checked after expiry. */
+    private mutedUntilByUser = new Map<string, number>();
 
     /** Live count of authenticated sockets — the presence number. */
     get onlineCount(): number {
@@ -169,6 +178,9 @@ export class GlobalChatRoom {
             lastFrameAt: now,
             chatWindowStart: now,
             chatWindowCount: 0,
+            lastChatAt: 0,
+            strikes: 0,
+            strikeWindowStart: now,
         });
 
         // Hand the joiner the recent history + current presence in one
@@ -187,6 +199,19 @@ export class GlobalChatRoom {
         attached: AttachedSocket,
         frame: { type: string } & Record<string, unknown>,
     ): void {
+        const now = Date.now();
+
+        // Auto-timeout: while muted, every message is dropped with the
+        // remaining seconds. Keyed by USER id so a reconnect can't shed it.
+        // No new strike here — already punished.
+        const mutedUntil = this.mutedUntilByUser.get(attached.userId) ?? 0;
+        if (mutedUntil > now) {
+            const secs = Math.ceil((mutedUntil - now) / 1000);
+            this.sendError(ws, 'chat_muted', `Muted ${secs}s`);
+            return;
+        }
+        if (mutedUntil !== 0) this.mutedUntilByUser.delete(attached.userId);   // expired — prune
+
         const body = typeof frame.body === 'string' ? frame.body.trim() : '';
         if (!body) return;
         if (body.length > MAX_CHAT_LEN) {
@@ -194,17 +219,26 @@ export class GlobalChatRoom {
             return;
         }
 
-        const now = Date.now();
+        // Slow mode: enforce a minimum gap between messages. A violation is
+        // a strike (and drops the message) but is NOT counted toward the
+        // per-minute cap below — we bail before incrementing it.
+        if (now - attached.lastChatAt < ctx.config.globalChatMinIntervalMs) {
+            this.registerViolation(ws, ctx, attached, now, 'chat_slow_mode', 'Slow down between messages');
+            return;
+        }
+
+        // Per-minute cap (sliding window).
         if (now - attached.chatWindowStart > 60_000) {
             attached.chatWindowStart = now;
             attached.chatWindowCount = 0;
         }
         attached.chatWindowCount += 1;
         if (attached.chatWindowCount > ctx.config.globalChatMsgsPerMin) {
-            this.sendError(ws, 'chat_rate_limited', 'Slow down — global chat throttled');
+            this.registerViolation(ws, ctx, attached, now, 'chat_rate_limited', 'Too many messages — slow down');
             return;
         }
 
+        attached.lastChatAt = now;
         const line: ChatLine = {
             id: randomUUID(),
             userId: attached.userId,
@@ -216,6 +250,35 @@ export class GlobalChatRoom {
         const max = ctx.config.globalChatHistory;
         while (this.chatRing.length > max) this.chatRing.shift();
         this.broadcast({ type: 'chat', line }, null);
+    }
+
+    /**
+     * Count an anti-spam violation (slow-mode or per-minute trip). Strikes
+     * accumulate inside a rolling minute; cross <c>globalChatTimeoutStrikes</c>
+     * and the user is auto-muted for <c>globalChatTimeoutMs</c>. Otherwise we
+     * just surface the specific reason so the client can show a hint.
+     */
+    private registerViolation(
+        ws: WebSocket,
+        ctx: AppContext,
+        attached: AttachedSocket,
+        now: number,
+        code: string,
+        message: string,
+    ): void {
+        if (now - attached.strikeWindowStart > 60_000) {
+            attached.strikeWindowStart = now;
+            attached.strikes = 0;
+        }
+        attached.strikes += 1;
+        if (attached.strikes >= ctx.config.globalChatTimeoutStrikes) {
+            this.mutedUntilByUser.set(attached.userId, now + ctx.config.globalChatTimeoutMs);
+            attached.strikes = 0;
+            const secs = Math.ceil(ctx.config.globalChatTimeoutMs / 1000);
+            this.sendError(ws, 'chat_timeout', `Muted ${secs}s for spamming`);
+        } else {
+            this.sendError(ws, code, message);
+        }
     }
 
     // ---------- broadcast / send helpers --------------------------

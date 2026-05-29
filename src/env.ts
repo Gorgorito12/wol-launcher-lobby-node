@@ -26,6 +26,12 @@ export interface Config {
     globalChatMsgsPerMin: number;
     globalChatHistory: number;
     globalChatMaxConnections: number;
+    // Anti-spam: minimum gap between two messages (slow mode), and an
+    // auto-timeout — trip the slow-mode / per-minute limit this many times
+    // inside a minute and you're muted for globalChatTimeoutMs.
+    globalChatMinIntervalMs: number;
+    globalChatTimeoutStrikes: number;
+    globalChatTimeoutMs: number;
     dailyRequestBudget: number;
     dailyDegradeThreshold: number;
     dailyHardLimit: number;
@@ -80,6 +86,9 @@ export function loadConfig(): Config {
             'GLOBAL_CHAT_MAX_CONNECTIONS',
             intEnv('MAX_CONCURRENT_USERS', 60),
         ),
+        globalChatMinIntervalMs: intEnv('GLOBAL_CHAT_MIN_INTERVAL_MS', 1500),
+        globalChatTimeoutStrikes: intEnv('GLOBAL_CHAT_TIMEOUT_STRIKES', 5),
+        globalChatTimeoutMs: intEnv('GLOBAL_CHAT_TIMEOUT_MS', 30_000),
         dailyRequestBudget: intEnv('DAILY_REQUEST_BUDGET', 100_000),
         dailyDegradeThreshold: intEnv('DAILY_DEGRADE_THRESHOLD', 80_000),
         dailyHardLimit: intEnv('DAILY_HARD_LIMIT', 95_000),
