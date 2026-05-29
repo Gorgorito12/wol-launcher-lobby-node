@@ -31,6 +31,7 @@ import type { AppContext } from '../context';
 interface AttachedSocket {
     userId: string;
     login: string;
+    avatarUrl: string | null;
     /** Last frame timestamp, used for idle-kick. */
     lastFrameAt: number;
     /** Counts chat frames inside the current minute window for throttling. */
@@ -47,6 +48,7 @@ interface ChatLine {
     id: string;
     userId: string;
     login: string;
+    avatarUrl: string | null;
     body: string;
     at: number;
 }
@@ -153,6 +155,17 @@ export class GlobalChatRoom {
         const userId = payload.sub;
         const login = payload.du ?? '';
 
+        // The JWT carries no avatar, so do ONE cheap indexed read here (per
+        // connection, not per message) to show real Discord avatars in chat.
+        // Cosmetic — a DB hiccup mustn't block joining the chat.
+        let avatarUrl: string | null = null;
+        try {
+            const u = await ctx.db.prepare(
+                `SELECT avatar_url FROM users WHERE id = ?`,
+            ).bind(userId).first<{ avatar_url: string | null }>();
+            avatarUrl = u?.avatar_url ?? null;
+        } catch { /* leave null → client falls back to the monogram */ }
+
         // One socket per user: drop any previous socket this user holds so
         // they can't multiply connections or double-count presence. Done
         // BEFORE the capacity check so a reconnect (which frees the old
@@ -175,6 +188,7 @@ export class GlobalChatRoom {
         this.attached.set(ws, {
             userId,
             login,
+            avatarUrl,
             lastFrameAt: now,
             chatWindowStart: now,
             chatWindowCount: 0,
@@ -243,6 +257,7 @@ export class GlobalChatRoom {
             id: randomUUID(),
             userId: attached.userId,
             login: attached.login,
+            avatarUrl: attached.avatarUrl,
             body,
             at: now,
         };
