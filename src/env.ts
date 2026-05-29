@@ -19,6 +19,13 @@ export interface Config {
     maxConcurrentUsers: number;
     maxActiveGames: number;
     chatMsgsPerMin: number;
+    // Global chat (the process-wide /global/ws room). Separate knobs from
+    // the per-lobby chat so the shared channel can be throttled / bounded
+    // independently — it's more spam-prone and its connections + history
+    // are the only global-chat memory cost on the 1 GB VM.
+    globalChatMsgsPerMin: number;
+    globalChatHistory: number;
+    globalChatMaxConnections: number;
     dailyRequestBudget: number;
     dailyDegradeThreshold: number;
     dailyHardLimit: number;
@@ -65,6 +72,14 @@ export function loadConfig(): Config {
         maxConcurrentUsers: intEnv('MAX_CONCURRENT_USERS', 60),
         maxActiveGames: intEnv('MAX_ACTIVE_GAMES', 8),
         chatMsgsPerMin: intEnv('CHAT_MSGS_PER_MIN', 30),
+        globalChatMsgsPerMin: intEnv('GLOBAL_CHAT_MSGS_PER_MIN', 20),
+        globalChatHistory: intEnv('GLOBAL_CHAT_HISTORY', 100),
+        // Default the global-chat capacity to the concurrent-user budget so
+        // the room can't hold more sockets than the service is sized for.
+        globalChatMaxConnections: intEnv(
+            'GLOBAL_CHAT_MAX_CONNECTIONS',
+            intEnv('MAX_CONCURRENT_USERS', 60),
+        ),
         dailyRequestBudget: intEnv('DAILY_REQUEST_BUDGET', 100_000),
         dailyDegradeThreshold: intEnv('DAILY_DEGRADE_THRESHOLD', 80_000),
         dailyHardLimit: intEnv('DAILY_HARD_LIMIT', 95_000),

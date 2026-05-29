@@ -7,6 +7,7 @@ import { loadConfig } from './env';
 import { Db } from './db';
 import { KvStore } from './kv';
 import { LobbyRoomRegistry } from './lobbies/LobbyRoom';
+import { GlobalChatRoom } from './global/GlobalChatRoom';
 import { HttpError, Errors, apiError } from './lib/errors';
 import type { AppContext } from './context';
 import { readAuth, requireAuth, safeRead } from './middleware/auth';
@@ -37,7 +38,8 @@ async function main(): Promise<void> {
 
     // ----- App context -----
     const rooms = new LobbyRoomRegistry();
-    const ctx: AppContext = { config, db, kv, rooms };
+    const globalChat = new GlobalChatRoom();
+    const ctx: AppContext = { config, db, kv, rooms, globalChat };
 
     // ----- Fastify -----
     const app: FastifyInstance = Fastify({
@@ -169,6 +171,17 @@ async function main(): Promise<void> {
 
         const room = rooms.getOrCreate(lobbyId, lobby.host_user_id);
         room.handleConnection(socket, ctx);
+    });
+
+    // ----- WebSocket: process-wide global chat -----
+    //
+    // One shared room for every signed-in launcher. Unlike the lobby
+    // socket there's no id and no DB lookup — the room authenticates the
+    // JWT on the first `hello` frame and enforces capacity / one-per-user
+    // itself (see GlobalChatRoom). WS frames don't go through the per-
+    // request budget, so the channel is essentially free past the upgrade.
+    app.get('/global/ws', { websocket: true }, async (socket, _req) => {
+        globalChat.handleConnection(socket, ctx);
     });
 
     // ----- Error envelope -----
