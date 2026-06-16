@@ -173,6 +173,9 @@ class LobbyRoom {
             case 'set_radmin_ip':
                 this.handleSetRadminIp(attached, f);
                 break;
+            case 'kick':
+                this.handleKick(ws, attached, f);
+                break;
             case 'ping':
                 this.send(ws, { type: 'pong' });
                 break;
@@ -464,6 +467,31 @@ class LobbyRoom {
             reason: typeof frame.reason === 'string' ? frame.reason : 'aborted',
             cancelled_by: attached.userId,
         }, null);
+    }
+
+    /**
+     * Host kicks a member: tell the target it was kicked, then close its
+     * socket. The close fires the normal `ws.on('close')` cleanup (delete the
+     * row, recompute current_players, broadcast member_left), so the roster
+     * updates for everyone with no extra logic. Simple kick — no ban list, the
+     * target may re-join. Host-only; a non-host or a self-target is ignored.
+     */
+    private handleKick(
+        ws: WebSocket,
+        attached: AttachedSocket,
+        frame: { type: string } & Record<string, unknown>,
+    ): void {
+        if (this.hostUserId !== attached.userId) {
+            this.sendError(ws, 'forbidden', 'Only the host can kick players');
+            return;
+        }
+        const targetId = typeof frame.user_id === 'string' ? frame.user_id : '';
+        if (!targetId || targetId === attached.userId) return;
+        for (const [sock, a] of this.attached) {
+            if (a.userId !== targetId) continue;
+            try { this.send(sock, { type: 'kicked', by: attached.userId }); } catch { /* dying */ }
+            try { sock.close(4007, 'kicked'); } catch { /* already closing */ }
+        }
     }
 
     // ---------- host migration / disconnect cleanup ---------------

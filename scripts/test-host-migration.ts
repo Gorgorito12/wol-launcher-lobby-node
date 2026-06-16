@@ -164,6 +164,31 @@ async function main(): Promise<void> {
     check('abort past window is grace_window_closed', b2.framesOfType('error').some((e) => e.code === 'grace_window_closed'));
     check('abort past window did NOT broadcast game_cancelled', b2.framesOfType('game_cancelled').length === 0);
 
+    // ===== Scenario 3: kick (host-only) =====
+    const countLob2 = async () =>
+        (await db.prepare(`SELECT current_players FROM lobbies WHERE id = ?`).bind(lob2)
+            .first<{ current_players: number }>())?.current_players;
+    const membersLob2 = async () =>
+        (await db.prepare(`SELECT user_id FROM lobby_members WHERE lobby_id = ?`).bind(lob2)
+            .all<{ user_id: string }>()).results.map((r) => r.user_id);
+
+    // A non-host (C) trying to kick → forbidden, nobody removed.
+    c2.sent.length = 0;
+    c2.emit('message', JSON.stringify({ type: 'kick', user_id: 'B' }));
+    await sleep(30);
+    check('non-host kick is forbidden', c2.framesOfType('error').some((e) => e.code === 'forbidden'));
+    check('forbidden kick removed nobody', (await membersLob2()).includes('B'));
+
+    // Host (A) kicks B → B gets `kicked`, socket closes, member_left + DB cleanup.
+    a2.emit('message', JSON.stringify({ type: 'kick', user_id: 'B' }));
+    await sleep(60);
+    check('kicked target got a `kicked` frame', b2.framesOfType('kicked').length === 1);
+    check('kicked target socket closed', b2.readyState === 3);
+    check('others saw member_left for B', c2.framesOfType('member_left').some((f) => f.user_id === 'B'));
+    check('B removed from lobby_members', !(await membersLob2()).includes('B'));
+    // current_players is recomputed to the real remaining member count (A, C).
+    check('current_players recomputed to real count', (await countLob2()) === (await membersLob2()).length);
+
     db.close();
     console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURE(S)`);
     process.exit(failures === 0 ? 0 : 1);
