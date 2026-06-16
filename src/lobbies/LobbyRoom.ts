@@ -38,6 +38,13 @@ interface AttachedSocket {
 interface MemberEntry {
     ready: boolean;
     login: string;
+    /**
+     * The member's Radmin VPN IP (26.x.x.x), reported by the client via
+     * set_radmin_ip once it's actually on the VPN. Lets every peer ICMP-ping
+     * every other peer for the in-game per-player ping column. Undefined until
+     * reported (the client often isn't on Radmin yet at join time).
+     */
+    radminIp?: string;
 }
 
 interface ChatLine {
@@ -53,10 +60,24 @@ const IDLE_KICK_AFTER_MS = 90 * 1000;
 
 class LobbyRoom {
     readonly lobbyId: string;
-    readonly hostUserId: string;
+    /**
+     * NOT readonly: the host can be reassigned when the current host leaves
+     * (GameRanger-style host migration — see reassignHost). room_state emits
+     * this, so updating it + broadcasting host_changed moves control to the
+     * next member.
+     */
+    hostUserId: string;
     members: Record<string, MemberEntry> = {};
     chatRing: ChatLine[] = [];
     private attached = new Map<WebSocket, AttachedSocket>();
+    /**
+     * Wall-clock ms when the host pressed Start (countdown began). Drives the
+     * abort grace window in handleCancelGame. In-memory (not the DB started_at)
+     * so we compare against Date.now() on the same clock and skip date parsing;
+     * the room stays in RAM for the whole match, so it's reliable across the
+     * window. Null outside a starting/in-game match.
+     */
+    private startedAtMs: number | null = null;
 
     constructor(lobbyId: string, hostUserId: string) {
         this.lobbyId = lobbyId;
@@ -97,10 +118,19 @@ class LobbyRoom {
             const attached = this.attached.get(ws);
             this.attached.delete(ws);
             if (!attached) return;
+            const wasHost = attached.userId === this.hostUserId;
             if (this.members[attached.userId]) {
                 delete this.members[attached.userId];
             }
             this.broadcast({ type: 'member_left', user_id: attached.userId }, ws);
+            // An abrupt close (crash / alt-F4 / dropped connection) never hits
+            // REST /leave, so do the DB bookkeeping here that /leave normally
+            // does — for ANYONE, not just the host: a leftover lobby_members row
+            // makes the "1 active lobby per user" guard lock them out, and the
+            // denormalised current_players never decrements (the lobby list
+            // would read full and block joins). Best-effort + fire-and-forget
+            // (the 'close' callback can't be awaited).
+            void this.handleDisconnectCleanup(ctx, attached.userId, wasHost);
         });
 
         ws.on('error', () => {
@@ -139,6 +169,9 @@ class LobbyRoom {
                 break;
             case 'cancel_game':
                 await this.handleCancelGame(ws, ctx, attached, f);
+                break;
+            case 'set_radmin_ip':
+                this.handleSetRadminIp(attached, f);
                 break;
             case 'ping':
                 this.send(ws, { type: 'pong' });
@@ -294,6 +327,28 @@ class LobbyRoom {
         }, null);
     }
 
+    /** 26.0.0.0/8 — the Radmin VPN range. We only accept IPs in it. */
+    private static readonly RADMIN_IP_RE = /^26\.\d{1,3}\.\d{1,3}\.\d{1,3}$/;
+
+    private handleSetRadminIp(
+        attached: AttachedSocket,
+        frame: { type: string } & Record<string, unknown>,
+    ): void {
+        const ip = typeof frame.ip === 'string' ? frame.ip.trim() : '';
+        // Reject anything outside Radmin's 26.x range so a client can't inject
+        // an arbitrary host for everyone to ping.
+        if (!LobbyRoom.RADMIN_IP_RE.test(ip)) return;
+        const existing = this.members[attached.userId];
+        if (!existing) return;
+        if (existing.radminIp === ip) return; // no change → no broadcast
+        existing.radminIp = ip;
+        this.broadcast({
+            type: 'member_net',
+            user_id: attached.userId,
+            radmin_ip: ip,
+        }, null);
+    }
+
     private handlePeerAnnounce(
         attached: AttachedSocket,
         frame: { type: string } & Record<string, unknown>,
@@ -349,7 +404,14 @@ class LobbyRoom {
         }
     }
 
-    private static readonly COUNTDOWN_MS = 3000;
+    // 10s, matching the launcher (which floors game_countdown to 10s). The two
+    // MUST agree or the abort-window math below is off by their difference.
+    private static readonly COUNTDOWN_MS = 10_000;
+    // Abort grace window: any member can cancel the match for everyone from the
+    // moment Start is pressed until COUNTDOWN_MS + 60s — i.e. the 10s countdown
+    // plus 60s after AoE3 launches (covers map load + the first moments of
+    // play). After that, leaving only removes yourself.
+    private static readonly ABORT_GRACE_MS = LobbyRoom.COUNTDOWN_MS + 60_000;
 
     private async handleStart(
         ws: WebSocket,
@@ -363,7 +425,8 @@ class LobbyRoom {
         await ctx.db.prepare(
             `UPDATE lobbies SET status = 'in_game', started_at = datetime('now') WHERE id = ?`,
         ).bind(this.lobbyId).run();
-        const startsAtMs = Date.now() + LobbyRoom.COUNTDOWN_MS;
+        this.startedAtMs = Date.now();
+        const startsAtMs = this.startedAtMs + LobbyRoom.COUNTDOWN_MS;
         this.broadcast({
             type: 'game_countdown',
             starts_at_ms: startsAtMs,
@@ -377,18 +440,108 @@ class LobbyRoom {
         attached: AttachedSocket,
         frame: { reason?: string } & Record<string, unknown>,
     ): Promise<void> {
-        if (this.hostUserId !== attached.userId) {
-            this.sendError(ws, 'forbidden', 'Only the host can cancel the game');
+        // Abort is allowed for ANY member, but only inside the grace window
+        // (server-authoritative — measured off our own Start clock, no client
+        // timestamp trust). Past the window nobody aborts the match for everyone;
+        // leaving only removes the leaver.
+        const withinWindow =
+            this.startedAtMs != null &&
+            (Date.now() - this.startedAtMs) < LobbyRoom.ABORT_GRACE_MS;
+        if (!withinWindow) {
+            this.sendError(
+                ws,
+                'grace_window_closed',
+                'The abort window has passed — leaving only removes you.',
+            );
             return;
         }
+        this.startedAtMs = null;
         await ctx.db.prepare(
             `UPDATE lobbies SET status = 'open', started_at = NULL WHERE id = ?`,
         ).bind(this.lobbyId).run();
         this.broadcast({
             type: 'game_cancelled',
-            reason: typeof frame.reason === 'string' ? frame.reason : 'host_cancelled',
+            reason: typeof frame.reason === 'string' ? frame.reason : 'aborted',
             cancelled_by: attached.userId,
         }, null);
+    }
+
+    // ---------- host migration / disconnect cleanup ---------------
+
+    /**
+     * DB bookkeeping for an abrupt socket close (the path REST /leave never
+     * sees). Removes the leaver's lobby_members row and recomputes
+     * current_players for ANYONE; if the leaver was the host, migrates the host
+     * to the next live member, or closes the lobby if nobody's left.
+     */
+    private async handleDisconnectCleanup(
+        ctx: AppContext,
+        userId: string,
+        wasHost: boolean,
+    ): Promise<void> {
+        try {
+            await ctx.db.batch([
+                ctx.db.prepare(
+                    `DELETE FROM lobby_members WHERE lobby_id = ? AND user_id = ?`,
+                ).bind(this.lobbyId, userId),
+                ctx.db.prepare(
+                    `UPDATE lobbies SET current_players = (
+                        SELECT COUNT(*) FROM lobby_members WHERE lobby_id = ?
+                     ) WHERE id = ?`,
+                ).bind(this.lobbyId, this.lobbyId),
+            ]);
+        } catch {
+            // Best-effort: a transient DB hiccup mustn't crash the close handler.
+        }
+        if (!wasHost) return;
+        const migrated = await this.reassignHost(ctx, userId);
+        if (!migrated) {
+            try {
+                await ctx.db.prepare(
+                    `UPDATE lobbies SET status='closed', closed_at=datetime('now') WHERE id = ?`,
+                ).bind(this.lobbyId).run();
+            } catch { /* best-effort */ }
+        }
+    }
+
+    /**
+     * Move the host to the next member by JOIN ORDER that is still LIVE
+     * (attached). Selecting from lobby_members alone would pick a "ghost" (a
+     * crashed member whose row lingers because abrupt closes don't sync the DB);
+     * intersecting with the live attached set guarantees the new host actually
+     * has an open socket while preserving "the second who joined" order.
+     * Idempotent: if the host is already someone other than the leaver, a prior
+     * path (the other of REST /leave vs ws close) handled it. Returns false when
+     * no live member remains (caller should close the lobby).
+     */
+    async reassignHost(ctx: AppContext, leavingUserId: string): Promise<boolean> {
+        if (this.hostUserId !== leavingUserId) return true;
+        const rows = await ctx.db.prepare(
+            `SELECT user_id FROM lobby_members WHERE lobby_id = ? ORDER BY joined_at ASC`,
+        ).bind(this.lobbyId).all<{ user_id: string }>();
+        const live = new Set<string>();
+        for (const a of this.attached.values()) live.add(a.userId);
+        const next = (rows.results ?? [])
+            .map((r) => r.user_id)
+            .find((id) => id !== leavingUserId && live.has(id));
+        if (!next) return false;
+        // Commit the DB host BEFORE broadcasting, so a client that re-queries on
+        // host_changed doesn't race the stale value.
+        await ctx.db.prepare(
+            `UPDATE lobbies SET host_user_id = ? WHERE id = ?`,
+        ).bind(next, this.lobbyId).run();
+        this.hostUserId = next;
+        this.broadcast({
+            type: 'host_changed',
+            new_host_user_id: next,
+            new_host_login: this.members[next]?.login ?? '',
+        }, null);
+        return true;
+    }
+
+    /** True when at least one socket is still attached (used by REST /leave). */
+    hasLiveSockets(): boolean {
+        return this.attached.size > 0;
     }
 
     // ---------- broadcast / send helpers --------------------------

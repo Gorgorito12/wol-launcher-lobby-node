@@ -299,15 +299,29 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
 
         const isHost = lobby.host_user_id === userId;
         if (isHost) {
+            // GameRanger-style migration: instead of closing the lobby when the
+            // host leaves, drop the host's membership, recompute the count, then
+            // hand the lobby to the next LIVE member by join order. Only close if
+            // nobody live remains to inherit. (reassignHost excludes the leaver
+            // and is idempotent with the ws-close path, whichever fires first.)
             await ctx.db.batch([
                 ctx.db.prepare(
-                    `UPDATE lobbies SET status='closed', closed_at=datetime('now') WHERE id = ?`,
-                ).bind(lobbyId),
+                    `DELETE FROM lobby_members WHERE lobby_id = ? AND user_id = ?`,
+                ).bind(lobbyId, userId),
                 ctx.db.prepare(
-                    `DELETE FROM lobby_members WHERE lobby_id = ?`,
-                ).bind(lobbyId),
+                    `UPDATE lobbies SET current_players = (
+                        SELECT COUNT(*) FROM lobby_members WHERE lobby_id = ?
+                     ) WHERE id = ?`,
+                ).bind(lobbyId, lobbyId),
             ]);
-            ctx.rooms.close(lobbyId);
+            const room = ctx.rooms.get(lobbyId);
+            const migrated = room ? await room.reassignHost(ctx, userId) : false;
+            if (!migrated) {
+                await ctx.db.prepare(
+                    `UPDATE lobbies SET status='closed', closed_at=datetime('now') WHERE id = ?`,
+                ).bind(lobbyId).run();
+                ctx.rooms.close(lobbyId);
+            }
         } else {
             await ctx.db.batch([
                 ctx.db.prepare(
