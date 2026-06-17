@@ -146,7 +146,14 @@ curl http://127.0.0.1:8080/health            # → {"ok":true, ...}
 
 Most launcher-feature backends are **code-only** changes: no new deps, no
 migration, no nginx edit — `git pull` + `systemctl restart` is the whole
-deploy. Example: the **global chat** is a WebSocket room at `/global/ws`
+deploy. Example: the recent multiplayer features — **host migration**,
+the **abort-grace window**, **kick** (`handleKick`) and the per-player ping
+plumbing (`set_radmin_ip` → `member_net`) — all live in
+`src/lobbies/LobbyRoom.ts` + `src/lobbies/rest.ts` over the existing
+`/lobbies/:id/ws` route, so they shipped with nothing but a pull + restart
+(deploy them **together with the matching launcher** — the new WS frames are
+ignored by old clients). Another example: the **global chat** is a WebSocket
+room at `/global/ws`
 held in memory (`src/global/GlobalChatRoom.ts`); it rides the existing
 nginx `location /` upgrade block, so nginx is untouched, and its limits
 are env knobs (`GLOBAL_CHAT_*`, all optional with defaults). To confirm a
