@@ -15,6 +15,7 @@ import { circuitBreaker, readGlobalCount } from './middleware/circuitBreaker';
 import { ipRateLimit, Limits } from './middleware/rateLimit';
 import { registerDiscordAuth } from './auth/discord';
 import { registerLobbiesRest } from './lobbies/rest';
+import { configure as configureDiscordAnnounce } from './lobbies/discordAnnounce';
 import { registerMatchesRest } from './matches/rest';
 import { registerReplaysRest } from './replays/rest';
 
@@ -49,6 +50,10 @@ async function main(): Promise<void> {
         trustProxy: true,
         bodyLimit: 1 * 1024 * 1024, // 1 MB default; replays override per-route
     });
+
+    // Share config + logger with the Discord room-announcement module so the WS
+    // broadcast / close paths can post & edit messages without threading ctx.
+    configureDiscordAnnounce(config, app.log);
 
     // CORS — open like the Worker. The launcher is the only intended
     // client, but leaving CORS open keeps a future status page on a

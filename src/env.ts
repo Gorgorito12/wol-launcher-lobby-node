@@ -49,12 +49,12 @@ export interface Config {
     discordClientId: string;
     discordClientSecret: string;
 
-    // Optional: a Discord channel webhook URL. When set, the server posts a
-    // message to that channel every time a lobby is created (name, mod,
-    // player count, host). Left blank the feature is simply off — it is NOT
-    // part of the hard-fail secret check below, so the service starts fine
-    // without it.
-    discordWebhookUrl: string;
+    // Optional: Discord channel webhook URLs. When set, the server posts a
+    // live-updating message to those channels every time a (public) lobby is
+    // created. Several channels/servers can be targeted — the env var accepts a
+    // comma-separated list. Empty the feature is simply off — it is NOT part of
+    // the hard-fail secret check below, so the service starts fine without it.
+    discordWebhookUrls: string[];
 }
 
 function intEnv(name: string, fallback: number): number {
@@ -67,6 +67,18 @@ function intEnv(name: string, fallback: number): number {
 function strEnv(name: string, fallback: string): string {
     const v = process.env[name];
     return v && v.length > 0 ? v : fallback;
+}
+
+/**
+ * Parse a comma/newline-separated env var into a list of http(s) URLs. Trims
+ * each entry and drops empties + anything that isn't an http(s) URL, so a stray
+ * comma or blank line can't produce a bogus target. Returns [] when unset.
+ */
+function urlListEnv(name: string): string[] {
+    return strEnv(name, '')
+        .split(/[,\n]/)
+        .map((s) => s.trim())
+        .filter((s) => /^https?:\/\//i.test(s));
 }
 
 /**
@@ -109,7 +121,7 @@ export function loadConfig(): Config {
         discordClientId: strEnv('DISCORD_CLIENT_ID', ''),
         discordClientSecret: strEnv('DISCORD_CLIENT_SECRET', ''),
 
-        discordWebhookUrl: strEnv('DISCORD_WEBHOOK_URL', ''),
+        discordWebhookUrls: urlListEnv('DISCORD_WEBHOOK_URL'),
     };
 
     // Hard fail on missing secrets — we don't want the service to start

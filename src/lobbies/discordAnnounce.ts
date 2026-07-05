@@ -3,24 +3,89 @@ import type { FastifyBaseLogger } from 'fastify';
 import type { Config } from '../env';
 
 /**
- * Optional Discord channel announcements for newly-created lobbies.
+ * Optional Discord channel announcements for lobbies, with LIVE updates.
  *
- * When <c>DISCORD_WEBHOOK_URL</c> is configured, {@link announceLobbyCreated}
- * posts one embed to that channel each time a room is created, so a community
- * Discord shows at a glance that matches are being assembled. It is a
- * best-effort, fire-and-forget side effect: it MUST never throw into or slow
- * down the lobby-creation request. All fixed text is English on purpose
- * (the channel is community-facing and the mod names are English), matching
- * the server's English-only logs — it never touches the launcher's
- * localization layer. The only variable text is the room name the player
- * typed, which may be in any language.
+ * When one or more webhooks are configured (`DISCORD_WEBHOOK_URL`, comma-
+ * separated for several channels/servers), a room's message is posted on
+ * creation and then EDITED in place as the room changes — player count and
+ * status (Waiting → In game → Closed) — so a community Discord shows current
+ * activity, not a stale snapshot. When the room closes the message is edited to
+ * "Closed" and kept as history.
+ *
+ * Design / cost:
+ *  - Best-effort and non-blocking: it must NEVER throw into or slow down room
+ *    creation or the WS broadcast path. Every network call swallows its errors.
+ *  - Private rooms are NOT announced at all.
+ *  - Per-room state (the posted message ids + the data to re-render the embed)
+ *    lives IN MEMORY here — no SQLite column, no migration. A server restart
+ *    with an active room just freezes that message at its last state (rooms are
+ *    ephemeral and restarts rare — accepted trade-off).
+ *  - Edits are debounced (~2 s) so a burst of joins is one edit, well within
+ *    Discord's per-webhook edit rate limit.
+ *  - All fixed text is English on purpose (community-facing, mirrors the
+ *    server's English logs); the only variable text is the player-typed room
+ *    name. The pretty mod name comes from the small `MOD_LABELS` map (the server
+ *    has no mod catalog), falling back to the raw `mod_id`.
  */
 
+// ---------- shared config, stashed once at startup by configure() -----------
+let cfg: Config | null = null;
+let log: FastifyBaseLogger | null = null;
+
+/** Stash the shared config + logger. Call once from index.ts at startup. */
+export function configure(config: Config, logger: FastifyBaseLogger): void {
+    cfg = config;
+    log = logger;
+}
+
+function webhookUrls(): string[] {
+    return cfg?.discordWebhookUrls ?? [];
+}
+
+// ---------- in-memory per-room state ----------------------------------------
+type RoomStatus = 'open' | 'in_game' | 'closed';
+
+interface Target {
+    /** The webhook base URL, e.g. https://discord.com/api/webhooks/<id>/<token> */
+    url: string;
+    /** The id of the message we posted to that webhook (for PATCH edits). */
+    messageId: string;
+}
+
+interface RoomAnnounceState {
+    title: string;
+    modId: string;
+    maxPlayers: number;
+    hostName: string;
+    hostAvatar: string | null;
+    players: number;
+    status: RoomStatus;
+    createdAt: string;
+    targets: Target[];
+    /** players+status of the last render, to skip no-op edits. */
+    lastKey: string;
+    /** pending debounced-edit timer, or null. */
+    timer: ReturnType<typeof setTimeout> | null;
+}
+
+const rooms = new Map<string, RoomAnnounceState>();
+
+const EDIT_DEBOUNCE_MS = 2000;
+
+// Base URL for mod icons in the public catalog repo. `<base>/<modId>/icon.png`;
+// an unknown mod 404s and Discord simply omits the thumbnail.
+const MOD_ICON_BASE =
+    'https://raw.githubusercontent.com/Gorgorito12/aoe3-mods-catalog/main/mods';
+
+// Embed accent colours by status: gold (waiting), green (in game), grey (closed).
+const COLOR_OPEN = 0xe0a82e;
+const COLOR_IN_GAME = 0x22c55e;
+const COLOR_CLOSED = 0x9aa0a6;
+
 /**
- * Human-readable names for the first-party mods. Community/catalog mods
- * aren't listed here — {@link modLabel} falls back to the raw <c>mod_id</c>,
- * which the launcher sends verbatim. The server has no mod catalog of its
- * own, so this small map is the only place that knows a "pretty" name.
+ * Human-readable names for the first-party mods. Community/catalog mods fall
+ * back to the raw `mod_id` (which the launcher sends verbatim) — the server has
+ * no mod catalog of its own, so this small map is the only "pretty name" source.
  */
 const MOD_LABELS: Record<string, string> = {
     'wol': 'Wars of Liberty',
@@ -33,88 +98,194 @@ export function modLabel(id: string): string {
     return MOD_LABELS[id.toLowerCase()] ?? id;
 }
 
-/** The data a room announcement needs — a projection of the lobby row. */
-export interface LobbyAnnouncement {
+// ---------- public API ------------------------------------------------------
+export interface NewRoom {
     id: string;
     title: string;
     modId: string;
     maxPlayers: number;
     isPrivate: boolean;
-    host: {
-        displayName?: string | null;
-        discordUsername?: string | null;
-    };
-}
-
-// Embed accent colours: warm gold for public rooms, muted grey for private.
-const COLOR_PUBLIC = 0xE0A82E;
-const COLOR_PRIVATE = 0x9AA0A6;
-
-interface EmbedField {
-    name: string;
-    value: string;
-    inline: boolean;
+    hostName: string;
+    hostAvatar?: string | null;
 }
 
 /**
- * Post a "new room" embed to the configured Discord webhook. No-op when the
- * webhook isn't configured. Swallows every error (network, rate-limit, bad
- * response) — a failed announcement must not break room creation.
+ * Post the initial "new room" embed to every configured webhook and start
+ * tracking the room for live edits. No-op when no webhook is configured or the
+ * room is private. Fire-and-forget from the caller.
  */
-export async function announceLobbyCreated(
-    cfg: Config,
-    lobby: LobbyAnnouncement,
-    log?: FastifyBaseLogger,
-): Promise<void> {
-    if (!cfg.discordWebhookUrl) return;
+export async function announceLobbyCreated(room: NewRoom): Promise<void> {
+    const urls = webhookUrls();
+    if (urls.length === 0 || room.isPrivate) return;
 
-    try {
-        const mod = modLabel(lobby.modId);
-        const hostName =
-            lobby.host.displayName || lobby.host.discordUsername || 'Unknown';
+    const state: RoomAnnounceState = {
+        title: room.title,
+        modId: room.modId,
+        maxPlayers: room.maxPlayers,
+        hostName: room.hostName || 'Unknown',
+        hostAvatar: room.hostAvatar ?? null,
+        players: 1,
+        status: 'open',
+        createdAt: new Date().toISOString(),
+        targets: [],
+        lastKey: '',
+        timer: null,
+    };
+    // Register BEFORE the POST so an immediate join isn't lost; flushEdit skips
+    // targets that have no message id yet.
+    rooms.set(room.id, state);
+    state.lastKey = renderKey(state);
 
-        const fields: EmbedField[] = [
-            { name: 'Mod', value: mod, inline: true },
-            { name: 'Players', value: `1 / ${lobby.maxPlayers}`, inline: true },
-            { name: 'Host', value: hostName, inline: true },
-        ];
-        if (lobby.isPrivate) {
-            // Zero-width name → a full-width note row under the inline fields.
-            fields.push({
-                name: '​',
-                value: '🔒 Private · password protected',
-                inline: false,
-            });
-        }
+    const payload = { embeds: [buildEmbed(state)] };
+    await Promise.allSettled(
+        urls.map(async (url) => {
+            try {
+                // `?wait=true` makes Discord return the created message object,
+                // so we capture its id to edit later.
+                const resp = await fetch(`${url}?wait=true`, {
+                    method: 'POST',
+                    headers: jsonHeaders(),
+                    body: JSON.stringify(payload),
+                });
+                if (!resp.ok) {
+                    const txt = await resp.text().catch(() => '');
+                    log?.warn(
+                        { status: resp.status, body: txt.slice(0, 200) },
+                        'Discord room announce failed',
+                    );
+                    return;
+                }
+                const msg = (await resp.json().catch(() => null)) as { id?: string } | null;
+                if (msg?.id) state.targets.push({ url, messageId: msg.id });
+            } catch (err) {
+                log?.warn({ err }, 'Discord room announce threw');
+            }
+        }),
+    );
+}
 
-        const embed = {
-            title: lobby.isPrivate
-                ? `🔒 New private room · ${mod}`
-                : `🎮 New room · ${mod}`,
-            description: lobby.title,
-            color: lobby.isPrivate ? COLOR_PRIVATE : COLOR_PUBLIC,
-            fields,
-            footer: { text: 'AoE3 Mod Launcher · Multiplayer' },
-            timestamp: new Date().toISOString(),
-        };
+/**
+ * Record a change to a tracked room and schedule a debounced edit. No-op when
+ * the room isn't tracked (private / webhooks off / not announced).
+ */
+export function notifyRoomChanged(
+    lobbyId: string,
+    change: { players?: number; status?: RoomStatus },
+): void {
+    const state = rooms.get(lobbyId);
+    if (!state) return;
+    if (typeof change.players === 'number') state.players = change.players;
+    if (change.status) state.status = change.status;
 
-        const resp = await fetch(cfg.discordWebhookUrl, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'User-Agent': 'wol-launcher-lobby-node',
-            },
-            body: JSON.stringify({ embeds: [embed] }),
-        });
+    const key = renderKey(state);
+    if (key === state.lastKey) return; // nothing visible changed
+    state.lastKey = key;
 
-        if (!resp.ok) {
-            const txt = await resp.text().catch(() => '');
-            log?.warn(
-                { status: resp.status, body: txt.slice(0, 200) },
-                'Discord room announcement failed',
-            );
-        }
-    } catch (err) {
-        log?.warn({ err }, 'Discord room announcement threw');
+    // A flush already pending will render the latest state when it fires.
+    if (state.timer) return;
+    state.timer = setTimeout(() => {
+        state.timer = null;
+        void flushEdit(lobbyId);
+    }, EDIT_DEBOUNCE_MS);
+}
+
+/**
+ * Final edit of a room's message to its closing state (default "Closed"), then
+ * stop tracking it. The message stays in Discord as history.
+ */
+export function finalizeRoom(lobbyId: string, status: RoomStatus = 'closed'): void {
+    const state = rooms.get(lobbyId);
+    if (!state) return;
+    if (state.timer) {
+        clearTimeout(state.timer);
+        state.timer = null;
     }
+    state.status = status;
+    rooms.delete(lobbyId);
+    void flushEditState(state);
+}
+
+// ---------- internals -------------------------------------------------------
+function renderKey(state: RoomAnnounceState): string {
+    return `${state.players}|${state.status}`;
+}
+
+function jsonHeaders(): Record<string, string> {
+    return {
+        'Content-Type': 'application/json',
+        'User-Agent': 'wol-launcher-lobby-node',
+    };
+}
+
+async function flushEdit(lobbyId: string): Promise<void> {
+    const state = rooms.get(lobbyId);
+    if (!state) return;
+    await flushEditState(state);
+}
+
+async function flushEditState(state: RoomAnnounceState): Promise<void> {
+    if (state.targets.length === 0) return;
+    const payload = { embeds: [buildEmbed(state)] };
+    await Promise.allSettled(
+        state.targets.map(async (t) => {
+            try {
+                const resp = await fetch(`${t.url}/messages/${t.messageId}`, {
+                    method: 'PATCH',
+                    headers: jsonHeaders(),
+                    body: JSON.stringify(payload),
+                });
+                if (!resp.ok) {
+                    const txt = await resp.text().catch(() => '');
+                    log?.warn(
+                        { status: resp.status, body: txt.slice(0, 200) },
+                        'Discord room edit failed',
+                    );
+                }
+            } catch (err) {
+                log?.warn({ err }, 'Discord room edit threw');
+            }
+        }),
+    );
+}
+
+function statusLabel(s: RoomStatus): string {
+    switch (s) {
+        case 'in_game':
+            return 'In game';
+        case 'closed':
+            return 'Closed';
+        default:
+            return 'Waiting for players';
+    }
+}
+
+function statusColor(s: RoomStatus): number {
+    switch (s) {
+        case 'in_game':
+            return COLOR_IN_GAME;
+        case 'closed':
+            return COLOR_CLOSED;
+        default:
+            return COLOR_OPEN;
+    }
+}
+
+function buildEmbed(state: RoomAnnounceState): Record<string, unknown> {
+    const mod = modLabel(state.modId);
+    const author: Record<string, unknown> = { name: state.hostName };
+    if (state.hostAvatar) author.icon_url = state.hostAvatar;
+
+    return {
+        author,
+        title: state.title,
+        color: statusColor(state.status),
+        fields: [
+            { name: 'Mod', value: mod, inline: true },
+            { name: 'Players', value: `${state.players} / ${state.maxPlayers}`, inline: true },
+            { name: 'Status', value: statusLabel(state.status), inline: true },
+        ],
+        thumbnail: { url: `${MOD_ICON_BASE}/${encodeURIComponent(state.modId)}/icon.png` },
+        footer: { text: 'AoE3 Mod Launcher · Multiplayer' },
+        timestamp: state.createdAt,
+    };
 }

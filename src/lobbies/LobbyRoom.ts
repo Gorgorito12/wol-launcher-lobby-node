@@ -1,6 +1,7 @@
 import type { WebSocket } from 'ws';
 import { randomUUID } from 'node:crypto';
 import { verifyJwt } from '../lib/jwt';
+import { notifyRoomChanged, finalizeRoom } from './discordAnnounce';
 import type { AppContext } from '../context';
 
 /**
@@ -529,6 +530,7 @@ class LobbyRoom {
                     `UPDATE lobbies SET status='closed', closed_at=datetime('now') WHERE id = ?`,
                 ).bind(this.lobbyId).run();
             } catch { /* best-effort */ }
+            finalizeRoom(this.lobbyId);
         }
     }
 
@@ -574,7 +576,31 @@ class LobbyRoom {
 
     // ---------- broadcast / send helpers --------------------------
 
+    /**
+     * Mirror room-state changes to the Discord announcement (live edit). This
+     * is the single choke point every state change passes through, so one hook
+     * here covers join/leave (player count) and start/cancel (status). No-op
+     * for untracked rooms (private / webhooks off), so it's cheap. Best-effort:
+     * notifyRoomChanged only schedules a debounced, self-swallowing edit.
+     */
+    private reflectToDiscord(frame: object): void {
+        const type = (frame as { type?: string }).type;
+        switch (type) {
+            case 'member_joined':
+            case 'member_left':
+                notifyRoomChanged(this.lobbyId, { players: Object.keys(this.members).length });
+                break;
+            case 'game_countdown':
+                notifyRoomChanged(this.lobbyId, { status: 'in_game' });
+                break;
+            case 'game_cancelled':
+                notifyRoomChanged(this.lobbyId, { status: 'open' });
+                break;
+        }
+    }
+
     private broadcast(frame: object, exclude: WebSocket | null): void {
+        this.reflectToDiscord(frame);
         const payload = JSON.stringify(frame);
         const now = Date.now();
         for (const [ws, attached] of this.attached) {

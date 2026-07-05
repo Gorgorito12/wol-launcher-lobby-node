@@ -3,7 +3,7 @@ import { Errors } from '../lib/errors';
 import { shortId, sha256Hex, uuid } from '../lib/ids';
 import { requireAuth } from '../middleware/auth';
 import { ipRateLimit, userRateLimit, Limits } from '../middleware/rateLimit';
-import { announceLobbyCreated } from './discordAnnounce';
+import { announceLobbyCreated, finalizeRoom } from './discordAnnounce';
 import type { AppContext } from '../context';
 
 interface LobbyRow {
@@ -129,6 +129,7 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
                 ).bind(row.id),
             ]);
             ctx.rooms.close(row.id);
+            finalizeRoom(row.id);
         }
 
         const active = await ctx.db.prepare(
@@ -161,23 +162,26 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
         ctx.rooms.getOrCreate(lobbyId, userId);
 
         // Announce the new room to Discord (best-effort, fire-and-forget).
-        // No-op unless DISCORD_WEBHOOK_URL is set; never awaited so it can't
-        // add latency to the 201, and it swallows its own errors internally.
-        if (cfg.discordWebhookUrl) {
+        // No-op unless a webhook is configured; private rooms are never
+        // announced. Never awaited so it can't add latency to the 201, and it
+        // swallows its own errors internally.
+        if (cfg.discordWebhookUrls.length > 0 && isPrivate === 0) {
             const host = await ctx.db.prepare(
-                `SELECT display_name, discord_username FROM users WHERE id = ?`,
-            ).bind(userId).first<{ display_name: string; discord_username: string }>();
-            void announceLobbyCreated(cfg, {
+                `SELECT display_name, discord_username, avatar_url FROM users WHERE id = ?`,
+            ).bind(userId).first<{
+                display_name: string;
+                discord_username: string;
+                avatar_url: string | null;
+            }>();
+            void announceLobbyCreated({
                 id: lobbyId,
                 title,
                 modId: body.mod_id,
                 maxPlayers,
-                isPrivate: isPrivate === 1,
-                host: {
-                    displayName: host?.display_name,
-                    discordUsername: host?.discord_username,
-                },
-            }, app.log);
+                isPrivate: false,
+                hostName: host?.display_name || host?.discord_username || 'Unknown',
+                hostAvatar: host?.avatar_url ?? null,
+            });
         }
 
         return reply.code(201).send({
@@ -342,6 +346,7 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
                     `UPDATE lobbies SET status='closed', closed_at=datetime('now') WHERE id = ?`,
                 ).bind(lobbyId).run();
                 ctx.rooms.close(lobbyId);
+                finalizeRoom(lobbyId);
             }
         } else {
             await ctx.db.batch([

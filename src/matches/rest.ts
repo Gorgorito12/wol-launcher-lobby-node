@@ -4,6 +4,7 @@ import { uuid } from '../lib/ids';
 import { requireAuth } from '../middleware/auth';
 import { ipRateLimit, Limits } from '../middleware/rateLimit';
 import { applyMatch, type ParticipantOutcome } from '../elo/glicko2';
+import { finalizeRoom } from '../lobbies/discordAnnounce';
 import type { AppContext } from '../context';
 
 interface ReportMatchBody {
@@ -105,6 +106,7 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
                 `UPDATE lobbies SET status = 'closed', closed_at = datetime('now') WHERE id = ?`,
             ).bind(body.lobby_id).run();
             ctx.rooms.close(body.lobby_id, 4007, 'match_reported');
+            finalizeRoom(body.lobby_id);
         }
 
         return reply.send({
