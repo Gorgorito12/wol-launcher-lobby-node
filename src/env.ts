@@ -48,6 +48,13 @@ export interface Config {
     jwtSigningKey: string;
     discordClientId: string;
     discordClientSecret: string;
+
+    // Optional: a Discord channel webhook URL. When set, the server posts a
+    // message to that channel every time a lobby is created (name, mod,
+    // player count, host). Left blank the feature is simply off — it is NOT
+    // part of the hard-fail secret check below, so the service starts fine
+    // without it.
+    discordWebhookUrl: string;
 }
 
 function intEnv(name: string, fallback: number): number {
@@ -101,6 +108,8 @@ export function loadConfig(): Config {
         jwtSigningKey: strEnv('JWT_SIGNING_KEY', ''),
         discordClientId: strEnv('DISCORD_CLIENT_ID', ''),
         discordClientSecret: strEnv('DISCORD_CLIENT_SECRET', ''),
+
+        discordWebhookUrl: strEnv('DISCORD_WEBHOOK_URL', ''),
     };
 
     // Hard fail on missing secrets — we don't want the service to start

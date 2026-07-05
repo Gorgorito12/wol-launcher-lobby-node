@@ -3,6 +3,7 @@ import { Errors } from '../lib/errors';
 import { shortId, sha256Hex, uuid } from '../lib/ids';
 import { requireAuth } from '../middleware/auth';
 import { ipRateLimit, userRateLimit, Limits } from '../middleware/rateLimit';
+import { announceLobbyCreated } from './discordAnnounce';
 import type { AppContext } from '../context';
 
 interface LobbyRow {
@@ -158,6 +159,26 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
         // Pre-create the in-memory room so the host's WS upgrade
         // doesn't race against an empty registry.
         ctx.rooms.getOrCreate(lobbyId, userId);
+
+        // Announce the new room to Discord (best-effort, fire-and-forget).
+        // No-op unless DISCORD_WEBHOOK_URL is set; never awaited so it can't
+        // add latency to the 201, and it swallows its own errors internally.
+        if (cfg.discordWebhookUrl) {
+            const host = await ctx.db.prepare(
+                `SELECT display_name, discord_username FROM users WHERE id = ?`,
+            ).bind(userId).first<{ display_name: string; discord_username: string }>();
+            void announceLobbyCreated(cfg, {
+                id: lobbyId,
+                title,
+                modId: body.mod_id,
+                maxPlayers,
+                isPrivate: isPrivate === 1,
+                host: {
+                    displayName: host?.display_name,
+                    discordUsername: host?.discord_username,
+                },
+            }, app.log);
+        }
 
         return reply.code(201).send({
             id: lobbyId,
