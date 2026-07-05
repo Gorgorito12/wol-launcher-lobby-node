@@ -109,13 +109,13 @@ export function userRateLimit(ctx: AppContext, rule: RateLimitRule): preHandlerH
  * for end users. If you tune one, tune it here, not at the call site.
  */
 export const Limits = {
-    CatchAllIp:       { scope: 'all',       keyKind: 'ip',   perMinute: 120, perDay: 2500 } as const,
+    CatchAllIp:       { scope: 'all',       keyKind: 'ip',   perMinute: 120, perDay: 15000 } as const,
     AuthDeviceIp:     { scope: 'authd',     keyKind: 'ip',   perMinute: 5,   perDay: 30   } as const,
     AuthPollIp:       { scope: 'authp',     keyKind: 'ip',   perMinute: 60,  perDay: 500  } as const,
     AuthIp:           { scope: 'auth',      keyKind: 'ip',   perMinute: 60,  perDay: 500  } as const,
     LobbyCreateIp:    { scope: 'lcreate',   keyKind: 'ip',   perMinute: 20,  perDay: 200  } as const,
     LobbyJoinIp:      { scope: 'ljoin',     keyKind: 'ip',   perMinute: 20,  perDay: 200  } as const,
-    LobbyListIp:      { scope: 'llist',     keyKind: 'ip',   perMinute: 120, perDay: 5000 } as const,
+    LobbyListIp:      { scope: 'llist',     keyKind: 'ip',   perMinute: 120, perDay: 15000 } as const,
     ChatIp:           { scope: 'chat',      keyKind: 'ip',   perMinute: 30,  perDay: 500  } as const,
     StatsIp:          { scope: 'stats',     keyKind: 'ip',   perMinute: 20,  perDay: 500  } as const,
     LobbyCreateUser:  { scope: 'lcreate-u', keyKind: 'user', perMinute: 10,  perDay: 100  } as const,
