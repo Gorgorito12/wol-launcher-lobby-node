@@ -115,7 +115,7 @@ export const Limits = {
     AuthIp:           { scope: 'auth',      keyKind: 'ip',   perMinute: 60,  perDay: 500  } as const,
     LobbyCreateIp:    { scope: 'lcreate',   keyKind: 'ip',   perMinute: 20,  perDay: 200  } as const,
     LobbyJoinIp:      { scope: 'ljoin',     keyKind: 'ip',   perMinute: 20,  perDay: 200  } as const,
-    LobbyListIp:      { scope: 'llist',     keyKind: 'ip',   perMinute: 60,  perDay: 2000 } as const,
+    LobbyListIp:      { scope: 'llist',     keyKind: 'ip',   perMinute: 120, perDay: 5000 } as const,
     ChatIp:           { scope: 'chat',      keyKind: 'ip',   perMinute: 30,  perDay: 500  } as const,
     StatsIp:          { scope: 'stats',     keyKind: 'ip',   perMinute: 20,  perDay: 500  } as const,
     LobbyCreateUser:  { scope: 'lcreate-u', keyKind: 'user', perMinute: 10,  perDay: 100  } as const,
