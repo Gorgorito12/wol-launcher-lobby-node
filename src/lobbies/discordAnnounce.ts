@@ -311,8 +311,12 @@ function buildEmbed(state: RoomAnnounceState): Record<string, unknown> {
     };
 
     if (joinable) {
-        embed.url = joinUrl; // makes the room title itself clickable
-        embed.description = `▶️ **[Join this room in the launcher](${joinUrl})**`;
+        // A single, prominent "Join" call-to-action. `## ` renders as a large,
+        // bold header in Discord; the [text](url) inside stays a clickable link —
+        // the most button-like affordance a webhook embed allows (no real buttons
+        // without a bot). The room title stays plain text (a second link read as
+        // two join buttons). No `**` — the header is already bold.
+        embed.description = `## ▶️ [Join this room in the launcher](${joinUrl})`;
     }
 
     return embed;
