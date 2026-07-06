@@ -283,9 +283,15 @@ function buildEmbed(state: RoomAnnounceState): Record<string, unknown> {
     const author: Record<string, unknown> = { name: state.hostName };
     if (state.hostAvatar) author.icon_url = state.hostAvatar;
 
-    // A clickable "Join" link only while the room is joinable (a closed/in-game
-    // room can't be joined). Points at the HTTPS bounce page, which redirects to
-    // wol-launcher://join/<id> and opens the launcher for anyone who has it.
+    // The room is joinable while it's open (a closed/in-game room can't be
+    // joined). Webhooks can't send real buttons, so the "Join" affordance is the
+    // most prominent clickable things an embed allows: the TITLE is a link and a
+    // bold call-to-action line, both pointing at the HTTPS bounce page (which
+    // redirects to wol-launcher://join/<id> and opens the launcher). The
+    // "needs the launcher" caveat moves to the footer so it doesn't dominate.
+    const joinable = state.status !== 'closed';
+    const joinUrl = `${JOIN_LINK_BASE}/j/${encodeURIComponent(state.id)}`;
+
     const embed: Record<string, unknown> = {
         author,
         title: state.title,
@@ -296,14 +302,17 @@ function buildEmbed(state: RoomAnnounceState): Record<string, unknown> {
             { name: 'Status', value: statusLabel(state.status), inline: true },
         ],
         thumbnail: { url: `${MOD_ICON_BASE}/${encodeURIComponent(state.modId)}/icon.png` },
-        footer: { text: 'AoE3 Mod Launcher · Multiplayer' },
+        footer: {
+            text: joinable
+                ? 'AoE3 Mod Launcher · Requires the launcher to join'
+                : 'AoE3 Mod Launcher · Multiplayer',
+        },
         timestamp: state.createdAt,
     };
 
-    if (state.status !== 'closed') {
-        embed.description =
-            `▶ **[Join in the launcher](${JOIN_LINK_BASE}/j/${encodeURIComponent(state.id)})**\n` +
-            `_Requires the AoE3 Mod Launcher installed._`;
+    if (joinable) {
+        embed.url = joinUrl; // makes the room title itself clickable
+        embed.description = `▶️ **[Join this room in the launcher](${joinUrl})**`;
     }
 
     return embed;
