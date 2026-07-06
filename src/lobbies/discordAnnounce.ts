@@ -53,6 +53,7 @@ interface Target {
 }
 
 interface RoomAnnounceState {
+    id: string;
     title: string;
     modId: string;
     maxPlayers: number;
@@ -76,6 +77,12 @@ const EDIT_DEBOUNCE_MS = 2000;
 // an unknown mod 404s and Discord simply omits the thumbnail.
 const MOD_ICON_BASE =
     'https://raw.githubusercontent.com/Gorgorito12/aoe3-mods-catalog/main/mods';
+
+// Public base for the "Join" deep-link bounce page (GET /j/:id in index.ts).
+// Discord can't linkify a custom scheme (wol-launcher://) directly, so the embed
+// links to this HTTPS URL, which redirects the browser to the launcher's scheme.
+// Change if the backend is hosted elsewhere.
+const JOIN_LINK_BASE = 'https://wol-lobby.duckdns.org';
 
 // Embed accent colours by status: gold (waiting), green (in game), grey (closed).
 const COLOR_OPEN = 0xe0a82e;
@@ -119,6 +126,7 @@ export async function announceLobbyCreated(room: NewRoom): Promise<void> {
     if (urls.length === 0 || room.isPrivate) return;
 
     const state: RoomAnnounceState = {
+        id: room.id,
         title: room.title,
         modId: room.modId,
         maxPlayers: room.maxPlayers,
@@ -275,7 +283,10 @@ function buildEmbed(state: RoomAnnounceState): Record<string, unknown> {
     const author: Record<string, unknown> = { name: state.hostName };
     if (state.hostAvatar) author.icon_url = state.hostAvatar;
 
-    return {
+    // A clickable "Join" link only while the room is joinable (a closed/in-game
+    // room can't be joined). Points at the HTTPS bounce page, which redirects to
+    // wol-launcher://join/<id> and opens the launcher for anyone who has it.
+    const embed: Record<string, unknown> = {
         author,
         title: state.title,
         color: statusColor(state.status),
@@ -288,4 +299,12 @@ function buildEmbed(state: RoomAnnounceState): Record<string, unknown> {
         footer: { text: 'AoE3 Mod Launcher · Multiplayer' },
         timestamp: state.createdAt,
     };
+
+    if (state.status !== 'closed') {
+        embed.description =
+            `▶ **[Join in the launcher](${JOIN_LINK_BASE}/j/${encodeURIComponent(state.id)})**\n` +
+            `_Requires the AoE3 Mod Launcher installed._`;
+    }
+
+    return embed;
 }

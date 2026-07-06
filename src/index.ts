@@ -83,6 +83,34 @@ async function main(): Promise<void> {
     app.addHook('preHandler', ipRateLimit(ctx, Limits.CatchAllIp));
 
     // ----- Routes that stay up in degraded mode -----
+
+    // Deep-link bounce for the Discord "Join" link. Discord can't linkify a
+    // custom scheme, so a room announcement links here (HTTPS); this returns a
+    // tiny page that redirects the browser to wol-launcher://join/<id>, opening
+    // the launcher and auto-joining the room. Public + no DB; the id is UNTRUSTED
+    // so only a validated alphanumeric token is ever emitted into the scheme.
+    app.get('/j/:id', async (req, reply) => {
+        const id = String((req.params as { id?: string }).id ?? '');
+        if (!/^[A-Za-z0-9]{1,32}$/.test(id)) {
+            reply.code(400).type('text/plain').send('Invalid room id.');
+            return;
+        }
+        const deep = `wol-launcher://join/${id}`;
+        const deepJs = JSON.stringify(deep); // safe for the inline script
+        reply.type('text/html').send(
+            '<!doctype html><html><head><meta charset="utf-8">' +
+            '<meta name="viewport" content="width=device-width,initial-scale=1">' +
+            '<title>Joining room…</title>' +
+            `<meta http-equiv="refresh" content="0;url=${deep}">` +
+            `<script>location.href=${deepJs};</script>` +
+            '<style>body{font-family:system-ui,Segoe UI,sans-serif;background:#0f1a2b;' +
+            'color:#e6eef8;text-align:center;padding:48px}a{color:#e0a82e}</style>' +
+            '</head><body><h2>Opening the Wars of Liberty Launcher…</h2>' +
+            `<p>If nothing happens, <a href="${deep}">click here</a> — ` +
+            'or make sure the launcher is installed.</p></body></html>',
+        );
+    });
+
     app.get('/health', {
         preHandler: [safeRead(), circuitBreaker(ctx)],
     }, async (_req, _reply) => {
