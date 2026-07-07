@@ -84,9 +84,12 @@ const MOD_ICON_BASE =
 // Change if the backend is hosted elsewhere.
 const JOIN_LINK_BASE = 'https://wol-lobby.duckdns.org';
 
-// Embed accent colours by status: gold (waiting), green (in game), grey (closed).
-const COLOR_OPEN = 0xe0a82e;
-const COLOR_IN_GAME = 0x22c55e;
+// Embed accent colours by state — the universal "traffic-light + presence" reading
+// (green = go/join, amber = caution/full, blue = in progress, grey = inactive):
+//   open = green, full = amber, in game = blue, closed = grey.
+const COLOR_OPEN = 0x22c55e;
+const COLOR_FULL = 0xf59e0b;
+const COLOR_IN_GAME = 0x3b82f6;
 const COLOR_CLOSED = 0x9aa0a6;
 
 /**
@@ -256,50 +259,54 @@ async function flushEditState(state: RoomAnnounceState): Promise<void> {
     );
 }
 
-function statusLabel(s: RoomStatus): string {
-    switch (s) {
-        case 'in_game':
-            return 'In game';
-        case 'closed':
-            return 'Closed';
-        default:
-            return 'Waiting for players';
-    }
+// A "full" room is still 'open' on the wire — collapse (status + player count)
+// into one effective state so the colour, emoji and label all agree.
+type EffectiveState = 'open' | 'full' | 'in_game' | 'closed';
+
+function effectiveState(s: RoomAnnounceState): EffectiveState {
+    if (s.status === 'closed') return 'closed';
+    if (s.status === 'in_game') return 'in_game';
+    if (s.maxPlayers > 0 && s.players >= s.maxPlayers) return 'full';
+    return 'open';
 }
 
-function statusColor(s: RoomStatus): number {
-    switch (s) {
-        case 'in_game':
-            return COLOR_IN_GAME;
-        case 'closed':
-            return COLOR_CLOSED;
-        default:
-            return COLOR_OPEN;
-    }
-}
+// Per-state presentation: a colour dot (so the state is visible IN the content,
+// not just the thin border bar), a label, and the border colour.
+const STATE_META: Record<EffectiveState, { dot: string; label: string; color: number }> = {
+    open: { dot: '🟢', label: 'Open', color: COLOR_OPEN },
+    full: { dot: '🟡', label: 'Full', color: COLOR_FULL },
+    in_game: { dot: '🔵', label: 'In game', color: COLOR_IN_GAME },
+    closed: { dot: '⚫', label: 'Closed', color: COLOR_CLOSED },
+};
 
 function buildEmbed(state: RoomAnnounceState): Record<string, unknown> {
     const mod = modLabel(state.modId);
     const author: Record<string, unknown> = { name: state.hostName };
     if (state.hostAvatar) author.icon_url = state.hostAvatar;
 
-    // The room is joinable while it's open (a closed/in-game room can't be
-    // joined). Webhooks can't send real buttons, so the "Join" affordance is the
-    // most prominent clickable things an embed allows: the TITLE is a link and a
-    // bold call-to-action line, both pointing at the HTTPS bounce page (which
-    // redirects to wol-launcher://join/<id> and opens the launcher). The
-    // "needs the launcher" caveat moves to the footer so it doesn't dominate.
-    const joinable = state.status !== 'closed';
+    const st = effectiveState(state);
+    const meta = STATE_META[st];
+
+    // Joinable only when there's a point: an open OR full room (a slot can free
+    // up in a full one). In-game and closed rooms can't be joined, so they drop
+    // the ▶️ Join affordance. Webhooks can't send real buttons, so the "Join" is
+    // the most prominent clickable things an embed allows: the TITLE is a link and
+    // a bold call-to-action line, both pointing at the HTTPS bounce page (which
+    // redirects to wol-launcher://join/<id> and opens the launcher). The "needs
+    // the launcher" caveat lives in the footer so it doesn't dominate.
+    const joinable = st === 'open' || st === 'full';
     const joinUrl = `${JOIN_LINK_BASE}/j/${encodeURIComponent(state.id)}`;
 
     const embed: Record<string, unknown> = {
         author,
-        title: state.title,
-        color: statusColor(state.status),
+        // Colour dot beside the title so the state reads at a glance, before the
+        // fields — reinforced by the same colour in the border bar + Status field.
+        title: `${meta.dot} ${state.title}`,
+        color: meta.color,
         fields: [
             { name: 'Mod', value: mod, inline: true },
             { name: 'Players', value: `${state.players} / ${state.maxPlayers}`, inline: true },
-            { name: 'Status', value: statusLabel(state.status), inline: true },
+            { name: 'Status', value: `${meta.dot} ${meta.label}`, inline: true },
         ],
         thumbnail: { url: `${MOD_ICON_BASE}/${encodeURIComponent(state.modId)}/icon.png` },
         footer: {
