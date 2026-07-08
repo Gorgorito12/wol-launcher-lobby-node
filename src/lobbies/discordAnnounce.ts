@@ -147,7 +147,17 @@ export async function announceLobbyCreated(room: NewRoom): Promise<void> {
     rooms.set(room.id, state);
     state.lastKey = renderKey(state);
 
-    const payload = { embeds: [buildEmbed(state)] };
+    // Optionally @mention a role (e.g. "Players"/"Jugadores") so the community
+    // gets pinged. The mention MUST live in `content` — embeds never notify —
+    // and only on this create POST (edits keep the embed but never re-ping).
+    // allowed_mentions is restricted to that one role so a player-typed room
+    // name can never @everyone/@here.
+    const roleId = cfg?.discordPlayersRoleId ?? '';
+    const payload: Record<string, unknown> = { embeds: [buildEmbed(state)] };
+    if (roleId) {
+        payload.content = `<@&${roleId}>`;
+        payload.allowed_mentions = { parse: [], roles: [roleId] };
+    }
     await Promise.allSettled(
         urls.map(async (url) => {
             try {

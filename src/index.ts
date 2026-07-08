@@ -6,7 +6,7 @@ import { mkdirSync } from 'node:fs';
 import { loadConfig } from './env';
 import { Db } from './db';
 import { KvStore } from './kv';
-import { LobbyRoomRegistry } from './lobbies/LobbyRoom';
+import { LobbyRoomRegistry, attachGlobalChat } from './lobbies/LobbyRoom';
 import { GlobalChatRoom } from './global/GlobalChatRoom';
 import { HttpError, Errors, apiError } from './lib/errors';
 import type { AppContext } from './context';
@@ -41,6 +41,8 @@ async function main(): Promise<void> {
     const rooms = new LobbyRoomRegistry();
     const globalChat = new GlobalChatRoom();
     const ctx: AppContext = { config, db, kv, rooms, globalChat };
+    // Let the lobby paths nudge the global players panel on room-state changes.
+    attachGlobalChat(globalChat);
 
     // ----- Fastify -----
     const app: FastifyInstance = Fastify({

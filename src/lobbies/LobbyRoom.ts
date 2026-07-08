@@ -5,6 +5,18 @@ import { notifyRoomChanged, finalizeRoom } from './discordAnnounce';
 import type { AppContext } from '../context';
 
 /**
+ * The global chat instance, stashed once at startup (see attachGlobalChat, wired
+ * in index.ts) so room-state changes can nudge the launcher's live players panel
+ * without threading ctx through the broadcast path. Typed minimally to avoid a
+ * circular import with GlobalChatRoom. Best-effort: refreshPlayers self-debounces
+ * and never throws.
+ */
+let s_globalChat: { refreshPlayers(): void } | null = null;
+export function attachGlobalChat(gc: { refreshPlayers(): void }): void {
+    s_globalChat = gc;
+}
+
+/**
  * Per-lobby room state, in-process replacement for the Cloudflare
  * Durable Object that backed the same protocol on the Worker.
  *
@@ -534,6 +546,9 @@ class LobbyRoom {
         } catch {
             // Best-effort: a transient DB hiccup mustn't crash the close handler.
         }
+        // A member left (and possibly the room closed) — refresh the global
+        // players panel so they/everyone reflect the new status.
+        ctx.globalChat.refreshPlayers();
         if (!wasHost) return;
         const migrated = await this.reassignHost(ctx, userId);
         if (!migrated) {
@@ -543,6 +558,7 @@ class LobbyRoom {
                 ).bind(this.lobbyId).run();
             } catch { /* best-effort */ }
             finalizeRoom(this.lobbyId);
+            ctx.globalChat.refreshPlayers(); // room closed → its members go idle
         }
     }
 
@@ -597,6 +613,13 @@ class LobbyRoom {
      */
     private reflectToDiscord(frame: object): void {
         const type = (frame as { type?: string }).type;
+        // The same four events that change the Discord embed also change a
+        // player's status (in a room / in game), so nudge the global players
+        // panel here too. refreshPlayers is debounced + best-effort.
+        if (type === 'member_joined' || type === 'member_left'
+            || type === 'game_countdown' || type === 'game_cancelled') {
+            s_globalChat?.refreshPlayers();
+        }
         switch (type) {
             case 'member_joined':
             case 'member_left':

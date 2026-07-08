@@ -64,6 +64,15 @@ export class GlobalChatRoom {
      * when checked after expiry. */
     private mutedUntilByUser = new Map<string, number>();
 
+    /** The shared AppContext (singleton), stashed on the first connection so
+     * broadcastPresence / refreshPlayers can query the DB for each connected
+     * user's live room status. */
+    private ctx: AppContext | null = null;
+
+    /** Debounce timer for refreshPlayers() so a burst of lobby state changes
+     * collapses into one presence rebroadcast. */
+    private playersRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+
     /** Live count of authenticated sockets — the presence number. */
     get onlineCount(): number {
         return this.attached.size;
@@ -75,6 +84,7 @@ export class GlobalChatRoom {
      * auth happens lazily on the first <c>hello</c> frame.
      */
     handleConnection(ws: WebSocket, ctx: AppContext): void {
+        this.ctx = ctx; // singleton AppContext; stash for DB-backed presence
         ws.on('message', async (raw, _isBinary) => {
             let frame: unknown;
             try {
@@ -96,7 +106,7 @@ export class GlobalChatRoom {
             // Only re-broadcast presence if this socket had actually
             // joined (passed hello) — an unauthenticated socket closing
             // never changed the count.
-            if (attached) this.broadcastPresence();
+            if (attached) void this.broadcastPresence();
         });
 
         ws.on('error', () => {
@@ -203,9 +213,9 @@ export class GlobalChatRoom {
             type: 'global_state',
             history: this.chatRing,
             online: this.attached.size,
-            onlineUsers: this.onlineUsers(),
+            onlineUsers: await this.onlineUsers(),
         });
-        this.broadcastPresence();
+        await this.broadcastPresence();
     }
 
     private handleChat(
@@ -299,25 +309,67 @@ export class GlobalChatRoom {
 
     // ---------- broadcast / send helpers --------------------------
 
-    private broadcastPresence(): void {
+    private async broadcastPresence(): Promise<void> {
         this.broadcast(
-            { type: 'presence', online: this.attached.size, onlineUsers: this.onlineUsers() },
+            { type: 'presence', online: this.attached.size, onlineUsers: await this.onlineUsers() },
             null,
         );
     }
 
     /**
-     * The connected users' public identities, for the client's "who's online"
-     * popup. Built purely in memory from `attached` (each entry already carries
-     * `login`/`avatarUrl` cached at hello — no DB read), deduped by user (the
-     * one-socket-per-user rule) and bounded by `globalChatMaxConnections` (~60),
-     * so it's trivial to serialise on every presence broadcast. Sent ALONGSIDE
-     * the `online` count so old clients that read only the count still work.
+     * Rebroadcast presence (which now carries each player's live room status)
+     * to everyone. The lobby paths call this whenever a room's membership or
+     * status changes, so the launcher's players panel updates live. Debounced
+     * (~1.5s) so a burst of lobby events is ONE rebroadcast, and best-effort
+     * (never throws into the lobby flow).
      */
-    private onlineUsers(): { userId: string; login: string; avatarUrl: string | null }[] {
-        const out: { userId: string; login: string; avatarUrl: string | null }[] = [];
+    refreshPlayers(): void {
+        if (this.playersRefreshTimer) return;
+        this.playersRefreshTimer = setTimeout(() => {
+            this.playersRefreshTimer = null;
+            void this.broadcastPresence().catch(() => { /* swallow */ });
+        }, 1500);
+    }
+
+    /**
+     * The connected users' public identities PLUS each one's live room status,
+     * for the client's players panel. `login`/`avatarUrl` come from the cached
+     * `attached` entries (no per-user DB read); the status comes from ONE bounded
+     * query over active lobbies (≤ maxActiveGames × lobbyMaxPlayers rows, on the
+     * indexed `lobby_members(user_id)` + `lobbies` PK). `in_game` → in a match,
+     * `open`/`locked` → in a room/waiting, absent → `idle` (in the launcher).
+     * Sent ALONGSIDE the `online` count so old clients that read only the count
+     * still work; an old client also just ignores the `status` field.
+     */
+    private async onlineUsers():
+        Promise<{ userId: string; login: string; avatarUrl: string | null; status: string }[]> {
+        const statusByUser = new Map<string, string>();
+        try {
+            if (this.ctx) {
+                const rows = await this.ctx.db
+                    .prepare(
+                        `SELECT lm.user_id AS userId, l.status AS status
+                         FROM lobby_members lm JOIN lobbies l ON l.id = lm.lobby_id
+                         WHERE l.status IN ('open','locked','in_game')`,
+                    )
+                    .bind()
+                    .all<{ userId: string; status: string }>();
+                for (const r of rows.results) {
+                    statusByUser.set(r.userId, r.status === 'in_game' ? 'in_game' : 'in_room');
+                }
+            }
+        } catch {
+            // Best-effort: on a query failure everyone falls back to 'idle'
+            // (still listed, just uncategorised).
+        }
+        const out: { userId: string; login: string; avatarUrl: string | null; status: string }[] = [];
         for (const a of this.attached.values()) {
-            out.push({ userId: a.userId, login: a.login, avatarUrl: a.avatarUrl });
+            out.push({
+                userId: a.userId,
+                login: a.login,
+                avatarUrl: a.avatarUrl,
+                status: statusByUser.get(a.userId) ?? 'idle',
+            });
         }
         return out;
     }

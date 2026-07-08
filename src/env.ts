@@ -55,6 +55,11 @@ export interface Config {
     // comma-separated list. Empty the feature is simply off — it is NOT part of
     // the hard-fail secret check below, so the service starts fine without it.
     discordWebhookUrls: string[];
+
+    // Optional: a Discord role ID to @mention (ping) at the top of the room-
+    // creation announcement, so a "Players"/"Jugadores" role gets notified. The
+    // displayed text is the role's own name. Server-specific; empty = no ping.
+    discordPlayersRoleId: string;
 }
 
 function intEnv(name: string, fallback: number): number {
@@ -122,6 +127,7 @@ export function loadConfig(): Config {
         discordClientSecret: strEnv('DISCORD_CLIENT_SECRET', ''),
 
         discordWebhookUrls: urlListEnv('DISCORD_WEBHOOK_URL'),
+        discordPlayersRoleId: strEnv('DISCORD_PLAYERS_ROLE_ID', ''),
     };
 
     // Hard fail on missing secrets — we don't want the service to start

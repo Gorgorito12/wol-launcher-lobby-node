@@ -164,6 +164,9 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
         // doesn't race against an empty registry.
         ctx.rooms.getOrCreate(lobbyId, userId);
 
+        // The creator is now "in a room" — refresh the global players panel.
+        ctx.globalChat.refreshPlayers();
+
         // Announce the new room to Discord (best-effort, fire-and-forget).
         // No-op unless a webhook is configured; private rooms are never
         // announced. Never awaited so it can't add latency to the 201, and it
@@ -363,6 +366,8 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
                 ).bind(lobbyId, lobbyId),
             ]);
         }
+        // Membership changed (leave / host-close) — refresh the players panel.
+        ctx.globalChat.refreshPlayers();
         return reply.send({ ok: true });
     });
 }
