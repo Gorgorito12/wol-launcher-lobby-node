@@ -56,9 +56,10 @@ export interface Config {
     // the hard-fail secret check below, so the service starts fine without it.
     discordWebhookUrls: string[];
 
-    // Optional: a Discord role ID to @mention (ping) at the top of the room-
-    // creation announcement, so a "Players"/"Jugadores" role gets notified. The
-    // displayed text is the role's own name. Server-specific; empty = no ping.
+    // A Discord role ID to @mention (ping) at the top of the room-creation
+    // announcement, so a "Players"/"Jugadores" role gets notified. The displayed
+    // text is the role's own name. Defaults to the WoL community role (hardcoded
+    // in loadConfig); override via env for another server, or "none" to disable.
     discordPlayersRoleId: string;
 }
 
@@ -127,7 +128,14 @@ export function loadConfig(): Config {
         discordClientSecret: strEnv('DISCORD_CLIENT_SECRET', ''),
 
         discordWebhookUrls: urlListEnv('DISCORD_WEBHOOK_URL'),
-        discordPlayersRoleId: strEnv('DISCORD_PLAYERS_ROLE_ID', ''),
+        // Defaults to the WoL community server's "Players" role so the ping works
+        // out of the box (like the other hardcoded server defaults). A role id is
+        // a public identifier, not a secret. Override via env for another server,
+        // or set it to "none"/empty in the .env to disable the ping.
+        discordPlayersRoleId: (() => {
+            const v = strEnv('DISCORD_PLAYERS_ROLE_ID', '1088344884882194563');
+            return v.toLowerCase() === 'none' ? '' : v;
+        })(),
     };
 
     // Hard fail on missing secrets — we don't want the service to start
