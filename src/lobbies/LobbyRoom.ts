@@ -46,6 +46,9 @@ interface MemberEntry {
      * reported (the client often isn't on Radmin yet at join time).
      */
     radminIp?: string;
+    /** The member's Discord avatar URL, so the roster can show their real photo
+     * (read from users.avatar_url on join). Undefined when unknown. */
+    avatarUrl?: string;
 }
 
 interface ChatLine {
@@ -231,14 +234,19 @@ class LobbyRoom {
             return;
         }
 
+        // Verify membership AND fetch the avatar in one query, so the roster can
+        // paint the member's real Discord photo (room_state/member_joined).
         const member = await ctx.db.prepare(
-            `SELECT 1 FROM lobby_members WHERE lobby_id = ? AND user_id = ? LIMIT 1`,
-        ).bind(this.lobbyId, userId).first();
+            `SELECT u.avatar_url AS avatar_url
+             FROM lobby_members lm JOIN users u ON u.id = lm.user_id
+             WHERE lm.lobby_id = ? AND lm.user_id = ? LIMIT 1`,
+        ).bind(this.lobbyId, userId).first<{ avatar_url: string | null }>();
         if (!member) {
             this.sendError(ws, 'not_in_lobby', 'You are not a member of this lobby');
             ws.close(4004, 'not_in_lobby');
             return;
         }
+        const avatarUrl = member.avatar_url ?? undefined;
 
         const now = Date.now();
         this.attached.set(ws, {
@@ -253,6 +261,8 @@ class LobbyRoom {
         this.members[userId] = {
             ready: existing?.ready ?? false,
             login,
+            radminIp: existing?.radminIp,
+            avatarUrl: avatarUrl ?? existing?.avatarUrl,
         };
 
         this.send(ws, {
@@ -266,6 +276,7 @@ class LobbyRoom {
             type: 'member_joined',
             user_id: userId,
             discord_username: login,
+            avatar_url: avatarUrl,
         }, ws);
     }
 
@@ -313,6 +324,7 @@ class LobbyRoom {
         const ready = Boolean(frame.ready);
         const existing = this.members[attached.userId];
         this.members[attached.userId] = {
+            ...existing,
             ready,
             login: existing?.login ?? attached.discordUsername,
         };

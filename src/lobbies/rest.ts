@@ -47,7 +47,8 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
         const rows = await ctx.db.prepare(
             `SELECT l.id, l.host_user_id, l.title, l.mod_id, l.mod_combined_hash,
                     l.max_players, l.current_players, l.is_private, l.status,
-                    l.created_at, u.discord_username AS host_login, u.display_name AS host_name
+                    l.created_at, u.discord_username AS host_login, u.display_name AS host_name,
+                    u.avatar_url AS host_avatar
              FROM lobbies l
              JOIN users u ON u.id = l.host_user_id
              WHERE l.status IN ('open', 'locked', 'in_game')
@@ -66,6 +67,7 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
             created_at: string;
             host_login: string;
             host_name: string;
+            host_avatar: string | null;
         }>();
 
         reply.header('Cache-Control', 'public, max-age=5');
@@ -84,6 +86,7 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
                     id: r.host_user_id,
                     discord_username: r.host_login,
                     display_name: r.host_name,
+                    avatar_url: r.host_avatar,
                 },
             })),
         });
