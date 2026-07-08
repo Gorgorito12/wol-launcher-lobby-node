@@ -203,6 +203,7 @@ export class GlobalChatRoom {
             type: 'global_state',
             history: this.chatRing,
             online: this.attached.size,
+            onlineUsers: this.onlineUsers(),
         });
         this.broadcastPresence();
     }
@@ -299,7 +300,26 @@ export class GlobalChatRoom {
     // ---------- broadcast / send helpers --------------------------
 
     private broadcastPresence(): void {
-        this.broadcast({ type: 'presence', online: this.attached.size }, null);
+        this.broadcast(
+            { type: 'presence', online: this.attached.size, onlineUsers: this.onlineUsers() },
+            null,
+        );
+    }
+
+    /**
+     * The connected users' public identities, for the client's "who's online"
+     * popup. Built purely in memory from `attached` (each entry already carries
+     * `login`/`avatarUrl` cached at hello — no DB read), deduped by user (the
+     * one-socket-per-user rule) and bounded by `globalChatMaxConnections` (~60),
+     * so it's trivial to serialise on every presence broadcast. Sent ALONGSIDE
+     * the `online` count so old clients that read only the count still work.
+     */
+    private onlineUsers(): { userId: string; login: string; avatarUrl: string | null }[] {
+        const out: { userId: string; login: string; avatarUrl: string | null }[] = [];
+        for (const a of this.attached.values()) {
+            out.push({ userId: a.userId, login: a.login, avatarUrl: a.avatarUrl });
+        }
+        return out;
     }
 
     private broadcast(frame: object, exclude: WebSocket | null): void {

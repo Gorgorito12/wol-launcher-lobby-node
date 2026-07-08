@@ -279,6 +279,22 @@ const STATE_META: Record<EffectiveState, { dot: string; label: string; color: nu
     closed: { dot: '⚫', label: 'Closed', color: COLOR_CLOSED },
 };
 
+/**
+ * Compact English duration, e.g. "1h 5m" / "12m" / "45s". Zero units are
+ * omitted. Only used for the CLOSED state's "Lasted" field — while a room is
+ * open the uptime is a Discord live relative timestamp (see buildEmbed), so no
+ * duration is formatted server-side for active rooms.
+ */
+function formatDuration(ms: number): string {
+    const total = Math.max(0, Math.floor(ms / 1000));
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    if (h > 0) return `${h}h ${m}m`;
+    if (m > 0) return `${m}m`;
+    return `${s}s`;
+}
+
 function buildEmbed(state: RoomAnnounceState): Record<string, unknown> {
     const mod = modLabel(state.modId);
     const author: Record<string, unknown> = { name: state.hostName };
@@ -286,6 +302,17 @@ function buildEmbed(state: RoomAnnounceState): Record<string, unknown> {
 
     const st = effectiveState(state);
     const meta = STATE_META[st];
+
+    // Uptime. While the room is live, use Discord's native RELATIVE timestamp
+    // `<t:unix:R>` — the client renders "5 minutes ago" and updates it live,
+    // localised per viewer, at ZERO server cost (no polling / edits / timers).
+    // Once closed, freeze it to a static total duration so it doesn't keep
+    // counting forever. createdAt is an ISO string; floor to unix seconds.
+    const openedUnix = Math.floor(Date.parse(state.createdAt) / 1000);
+    const uptimeField =
+        st === 'closed'
+            ? { name: 'Lasted', value: formatDuration(Date.now() - Date.parse(state.createdAt)), inline: true }
+            : { name: 'Opened', value: `<t:${openedUnix}:R>`, inline: true };
 
     // Joinable only when there's a point: an open OR full room (a slot can free
     // up in a full one). In-game and closed rooms can't be joined, so they drop
@@ -307,6 +334,7 @@ function buildEmbed(state: RoomAnnounceState): Record<string, unknown> {
             { name: 'Mod', value: mod, inline: true },
             { name: 'Players', value: `${state.players} / ${state.maxPlayers}`, inline: true },
             { name: 'Status', value: `${meta.dot} ${meta.label}`, inline: true },
+            uptimeField,
         ],
         thumbnail: { url: `${MOD_ICON_BASE}/${encodeURIComponent(state.modId)}/icon.png` },
         footer: {
