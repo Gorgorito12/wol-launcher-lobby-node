@@ -129,7 +129,8 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
         const rows = await ctx.db.prepare(
             `SELECT m.id, m.mod_id, m.map_name, m.duration_seconds, m.started_at, m.ended_at,
                     m.replay_object_key, mp.team, mp.civ, mp.score, mp.result,
-                    mp.rating_before, mp.rating_after
+                    mp.rating_before, mp.rating_after,
+                    (SELECT COUNT(*) FROM match_participants WHERE match_id = m.id) AS player_count
              FROM match_participants mp
              JOIN matches m ON m.id = mp.match_id
              WHERE mp.user_id = ?
