@@ -105,12 +105,17 @@ export function loadConfig(): Config {
         chatMsgsPerMin: intEnv('CHAT_MSGS_PER_MIN', 30),
         globalChatMsgsPerMin: intEnv('GLOBAL_CHAT_MSGS_PER_MIN', 20),
         globalChatHistory: intEnv('GLOBAL_CHAT_HISTORY', 100),
-        // Default the global-chat capacity to the concurrent-user budget so
-        // the room can't hold more sockets than the service is sized for.
-        globalChatMaxConnections: intEnv(
-            'GLOBAL_CHAT_MAX_CONNECTIONS',
-            intEnv('MAX_CONCURRENT_USERS', 60),
-        ),
+        // Global-chat / PRESENCE capacity. Decoupled from MAX_CONCURRENT_USERS
+        // (the in-lobby player budget, 60): the launcher now keeps this socket
+        // open in the BACKGROUND while signed in — that's how every running
+        // launcher shows up as "connected" (presence) — so the cap must cover the
+        // whole installed base that's online, not just active lobby players.
+        // Default 200 sized for a ~50-150 user community on the 1-core/1GB VM
+        // (each idle socket ~50KB in Node + ~50KB in nginx ≈ ~15MB total at 150;
+        // pings ~5/s; the presence frame is O(N²) bytes but debounced ~1.5s and
+        // event-driven). Bump via GLOBAL_CHAT_MAX_CONNECTIONS; past ~300-500 the
+        // full-list presence frame strains the single vCPU → switch to deltas.
+        globalChatMaxConnections: intEnv('GLOBAL_CHAT_MAX_CONNECTIONS', 200),
         globalChatMinIntervalMs: intEnv('GLOBAL_CHAT_MIN_INTERVAL_MS', 1500),
         globalChatTimeoutStrikes: intEnv('GLOBAL_CHAT_TIMEOUT_STRIKES', 5),
         globalChatTimeoutMs: intEnv('GLOBAL_CHAT_TIMEOUT_MS', 30_000),

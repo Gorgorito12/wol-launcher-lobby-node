@@ -432,11 +432,11 @@ class LobbyRoom {
         }
     }
 
-    // 10s, matching the launcher (which floors game_countdown to 10s). The two
-    // MUST agree or the abort-window math below is off by their difference.
-    private static readonly COUNTDOWN_MS = 10_000;
+    // 5s. The launcher OBEYS this value (no client-side floor), so this is the
+    // single source of truth for the countdown length — redeploy to change it.
+    private static readonly COUNTDOWN_MS = 5_000;
     // Abort grace window: any member can cancel the match for everyone from the
-    // moment Start is pressed until COUNTDOWN_MS + 60s — i.e. the 10s countdown
+    // moment Start is pressed until COUNTDOWN_MS + 60s — i.e. the 5s countdown
     // plus 60s after AoE3 launches (covers map load + the first moments of
     // play). After that, leaving only removes yourself.
     private static readonly ABORT_GRACE_MS = LobbyRoom.COUNTDOWN_MS + 60_000;
