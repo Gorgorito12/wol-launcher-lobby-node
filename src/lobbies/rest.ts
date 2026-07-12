@@ -167,11 +167,12 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
         // The creator is now "in a room" — refresh the global players panel.
         ctx.globalChat.refreshPlayers();
 
-        // Announce the new room to Discord (best-effort, fire-and-forget).
-        // No-op unless a webhook is configured; private rooms are never
-        // announced. Never awaited so it can't add latency to the 201, and it
-        // swallows its own errors internally.
-        if (cfg.discordWebhookUrls.length > 0 && isPrivate === 0) {
+        // Announce the new room — both to the in-app global toast (every connected
+        // launcher) and to Discord (only if a webhook is configured). BOTH skip
+        // private rooms. The host identity is read once and shared. Best-effort:
+        // never awaited so it can't add latency to the 201, and each swallows its
+        // own errors internally.
+        if (isPrivate === 0) {
             const host = await ctx.db.prepare(
                 `SELECT display_name, discord_username, avatar_url FROM users WHERE id = ?`,
             ).bind(userId).first<{
@@ -179,15 +180,22 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
                 discord_username: string;
                 avatar_url: string | null;
             }>();
-            void announceLobbyCreated({
-                id: lobbyId,
-                title,
-                modId: body.mod_id,
-                maxPlayers,
-                isPrivate: false,
-                hostName: host?.display_name || host?.discord_username || 'Unknown',
-                hostAvatar: host?.avatar_url ?? null,
+            const hostName = host?.display_name || host?.discord_username || 'Unknown';
+            const hostAvatar = host?.avatar_url ?? null;
+
+            // In-app popup for every connected launcher (they filter + dedup).
+            ctx.globalChat.announceLobbyCreated({
+                id: lobbyId, title, modId: body.mod_id, maxPlayers,
+                hostUserId: userId, hostName, hostAvatar,
             });
+
+            // Discord webhook (only when configured).
+            if (cfg.discordWebhookUrls.length > 0) {
+                void announceLobbyCreated({
+                    id: lobbyId, title, modId: body.mod_id, maxPlayers,
+                    isPrivate: false, hostName, hostAvatar,
+                });
+            }
         }
 
         return reply.code(201).send({

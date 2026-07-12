@@ -32,6 +32,8 @@ export interface Config {
     globalChatMinIntervalMs: number;
     globalChatTimeoutStrikes: number;
     globalChatTimeoutMs: number;
+    // Max room invites a user can send over /global/ws per rolling minute.
+    globalChatInvitesPerMin: number;
     dailyRequestBudget: number;
     dailyDegradeThreshold: number;
     dailyHardLimit: number;
@@ -119,6 +121,7 @@ export function loadConfig(): Config {
         globalChatMinIntervalMs: intEnv('GLOBAL_CHAT_MIN_INTERVAL_MS', 1500),
         globalChatTimeoutStrikes: intEnv('GLOBAL_CHAT_TIMEOUT_STRIKES', 5),
         globalChatTimeoutMs: intEnv('GLOBAL_CHAT_TIMEOUT_MS', 30_000),
+        globalChatInvitesPerMin: intEnv('GLOBAL_CHAT_INVITES_PER_MIN', 10),
         dailyRequestBudget: intEnv('DAILY_REQUEST_BUDGET', 100_000),
         dailyDegradeThreshold: intEnv('DAILY_DEGRADE_THRESHOLD', 80_000),
         dailyHardLimit: intEnv('DAILY_HARD_LIMIT', 95_000),

@@ -23,9 +23,10 @@ import type { AppContext } from '../context';
  *     500-char cap, reusing the <c>LobbyRoom</c> anti-flood approach.
  *
  * Wire protocol (JSON frames):
- *   client → server : hello {token}, chat {body}, ping
+ *   client → server : hello {token}, chat {body}, invite {target_user_id, lobby_id}, ping
  *   server → client : global_state {history, online}, chat {line},
- *                     presence {online}, error {code, message}, pong
+ *                     presence {online}, lobby_created {lobby}, invite {from, lobbyId,
+ *                     roomName, modId}, invite_sent {login}, error {code, message}, pong
  */
 
 interface AttachedSocket {
@@ -42,6 +43,9 @@ interface AttachedSocket {
     /** Anti-spam strikes inside the current minute (slow-mode / rate trips). */
     strikes: number;
     strikeWindowStart: number;
+    /** Rolling-minute counter for room invites sent (separate rate limit). */
+    inviteWindowStart: number;
+    inviteCount: number;
 }
 
 interface ChatLine {
@@ -136,12 +140,116 @@ export class GlobalChatRoom {
             case 'chat':
                 this.handleChat(ws, ctx, attached, f);
                 break;
+            case 'invite':
+                await this.handleInvite(ws, ctx, attached, f);
+                break;
             case 'ping':
                 this.send(ws, { type: 'pong' });
                 break;
             default:
                 this.sendError(ws, 'unknown_type', `Unknown frame type: ${f.type}`);
         }
+    }
+
+    /**
+     * Route a room invite: player A (a member of lobby X) invites player B to it.
+     * The sender is validated to actually be in that lobby (so a client can't spam
+     * arbitrary invites), rate-limited per minute, and the invite is delivered to
+     * B's one socket if they're online. Best-effort — errors surface to the sender
+     * as an `error` frame, never throw.
+     */
+    private async handleInvite(
+        ws: WebSocket,
+        ctx: AppContext,
+        attached: AttachedSocket,
+        frame: { type: string } & Record<string, unknown>,
+    ): Promise<void> {
+        const targetUserId = typeof frame.target_user_id === 'string' ? frame.target_user_id : '';
+        const lobbyId = typeof frame.lobby_id === 'string' ? frame.lobby_id : '';
+        if (!targetUserId || !lobbyId) {
+            this.sendError(ws, 'invite_bad', 'invite needs target_user_id and lobby_id');
+            return;
+        }
+        if (targetUserId === attached.userId) return;   // can't invite yourself
+
+        // Rate limit (rolling minute).
+        const now = Date.now();
+        if (now - attached.inviteWindowStart > 60_000) {
+            attached.inviteWindowStart = now;
+            attached.inviteCount = 0;
+        }
+        attached.inviteCount += 1;
+        if (attached.inviteCount > ctx.config.globalChatInvitesPerMin) {
+            this.sendError(ws, 'invite_rate_limited', 'Too many invites — slow down');
+            return;
+        }
+
+        // The sender must actually be in that (still-active) lobby.
+        let room: { title: string; mod_id: string } | null = null;
+        try {
+            room = (await ctx.db.prepare(
+                `SELECT l.title AS title, l.mod_id AS mod_id
+                 FROM lobbies l JOIN lobby_members lm ON lm.lobby_id = l.id
+                 WHERE l.id = ? AND lm.user_id = ? AND l.status IN ('open','locked','in_game')`,
+            ).bind(lobbyId, attached.userId).first<{ title: string; mod_id: string }>()) ?? null;
+        } catch {
+            room = null;
+        }
+        if (!room) {
+            this.sendError(ws, 'invite_not_in_room', 'You are not in that room');
+            return;
+        }
+
+        // Find the target's live socket (one per user).
+        let targetWs: WebSocket | null = null;
+        let targetLogin = '';
+        for (const [otherWs, other] of this.attached) {
+            if (other.userId === targetUserId) { targetWs = otherWs; targetLogin = other.login; break; }
+        }
+        if (!targetWs) {
+            this.sendError(ws, 'invite_target_offline', 'That player is offline');
+            return;
+        }
+
+        this.send(targetWs, {
+            type: 'invite',
+            from: { userId: attached.userId, login: attached.login, avatarUrl: attached.avatarUrl },
+            lobbyId,
+            roomName: room.title,
+            modId: room.mod_id,
+        });
+        this.send(ws, { type: 'invite_sent', login: targetLogin });
+    }
+
+    /**
+     * Broadcast a "new room" announcement to every connected launcher so it can
+     * show a small in-app toast. The client filters (not-own, mod-installed) and
+     * dedups. Called from POST /lobbies for NON-private rooms only. Best-effort.
+     */
+    announceLobbyCreated(lobby: {
+        id: string;
+        title: string;
+        modId: string;
+        maxPlayers: number;
+        hostUserId: string;
+        hostName: string;
+        hostAvatar: string | null;
+    }): void {
+        try {
+            this.broadcast(
+                {
+                    type: 'lobby_created',
+                    lobby: {
+                        id: lobby.id,
+                        title: lobby.title,
+                        modId: lobby.modId,
+                        maxPlayers: lobby.maxPlayers,
+                        host: { userId: lobby.hostUserId, login: lobby.hostName, avatarUrl: lobby.hostAvatar },
+                    },
+                },
+                null,
+            );
+        } catch { /* never break room creation on a broadcast hiccup */ }
     }
 
     private async handleHello(
@@ -205,6 +313,8 @@ export class GlobalChatRoom {
             lastChatAt: 0,
             strikes: 0,
             strikeWindowStart: now,
+            inviteWindowStart: now,
+            inviteCount: 0,
         });
 
         // Hand the joiner the recent history + current presence in one
