@@ -186,6 +186,9 @@ class LobbyRoom {
             case 'cancel_game':
                 await this.handleCancelGame(ws, ctx, attached, f);
                 break;
+            case 'game_ended':
+                await this.handleGameEnded(ws, ctx, attached);
+                break;
             case 'set_radmin_ip':
                 this.handleSetRadminIp(attached, f);
                 break;
@@ -492,6 +495,41 @@ class LobbyRoom {
             reason: typeof frame.reason === 'string' ? frame.reason : 'aborted',
             cancelled_by: attached.userId,
         }, null);
+    }
+
+    /**
+     * The HOST's game process exited (natural end), so the match is over — revert
+     * the room from `in_game` back to `open` (Waiting) so it's joinable again and
+     * the Discord embed flips back to "Waiting". UNLIKE handleCancelGame this has
+     * NO grace window: a host's own game ending is always a legitimate reset (the
+     * launcher only sends `game_ended` when the game actually exited, not from a
+     * button). Idempotent — no-op if no match is running. Sent by the host from
+     * OnGameExitedAsync ONLY when the match wasn't reported+closed (solo / short /
+     * failed report), so a real recorded match still CLOSES the room as before.
+     */
+    private async handleGameEnded(
+        ws: WebSocket,
+        ctx: AppContext,
+        attached: AttachedSocket,
+    ): Promise<void> {
+        if (this.hostUserId !== attached.userId) {
+            this.sendError(ws, 'forbidden', 'Only the host can end the game');
+            return;
+        }
+        if (this.startedAtMs == null) return;   // no match running — nothing to reset
+        this.startedAtMs = null;
+        await ctx.db.prepare(
+            `UPDATE lobbies SET status = 'open', started_at = NULL WHERE id = ?`,
+        ).bind(this.lobbyId).run();
+        // Reuse the game_cancelled frame (reflectToDiscord maps it → status open →
+        // Discord "Waiting"; peers return to the lobby). Exclude the host — it already
+        // exited the in-game phase locally when its game closed. reason='ended' lets
+        // clients show "the host ended the match" instead of "aborted".
+        this.broadcast({
+            type: 'game_cancelled',
+            reason: 'ended',
+            cancelled_by: attached.userId,
+        }, ws);
     }
 
     /**
