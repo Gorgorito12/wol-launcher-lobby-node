@@ -16,6 +16,7 @@ import { ipRateLimit, Limits } from './middleware/rateLimit';
 import { registerDiscordAuth } from './auth/discord';
 import { registerLobbiesRest } from './lobbies/rest';
 import { configure as configureDiscordAnnounce } from './lobbies/discordAnnounce';
+import { scheduleOrphanLobbySweep } from './lobbies/orphanSweep';
 import { registerMatchesRest } from './matches/rest';
 import { registerReplaysRest } from './replays/rest';
 
@@ -53,9 +54,11 @@ async function main(): Promise<void> {
         bodyLimit: 1 * 1024 * 1024, // 1 MB default; replays override per-route
     });
 
-    // Share config + logger with the Discord room-announcement module so the WS
-    // broadcast / close paths can post & edit messages without threading ctx.
-    configureDiscordAnnounce(config, app.log);
+    // Share config + logger + db with the Discord room-announcement module so the
+    // WS broadcast / close paths can post & edit messages without threading ctx.
+    // The db is what lets it rehydrate an announcement posted by a PREVIOUS
+    // process (see discordAnnounce's ensureState).
+    configureDiscordAnnounce(config, app.log, db);
 
     // CORS — open like the Worker. The launcher is the only intended
     // client, but leaving CORS open keeps a future status page on a
@@ -250,9 +253,14 @@ async function main(): Promise<void> {
         process.exit(1);
     }
 
+    // ----- Reap lobbies left behind by the previous process -----
+    // After the grace window, so rooms whose players reconnect survive.
+    const orphanSweep = scheduleOrphanLobbySweep(ctx, app.log);
+
     // ----- Graceful shutdown -----
     const shutdown = async (signal: string): Promise<void> => {
         app.log.info(`Received ${signal}, shutting down...`);
+        try { clearTimeout(orphanSweep); } catch { /* ignore */ }
         try { await app.close(); } catch { /* ignore */ }
         try { kv.stopSweepLoop(); } catch { /* ignore */ }
         try { db.close(); } catch { /* ignore */ }

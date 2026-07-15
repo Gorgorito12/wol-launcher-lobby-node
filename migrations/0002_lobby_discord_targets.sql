@@ -1,0 +1,24 @@
+-- v1.1 — persist the Discord announcement message ids per lobby.
+--
+-- Why this column exists (it reverses an earlier deliberate choice):
+--   The room-announcement module (src/lobbies/discordAnnounce.ts) used to keep
+--   the posted message ids in a process-local Map, on the theory that rooms are
+--   ephemeral and restarts rare. In practice a restart orphaned every live
+--   announcement: finalizeRoom() looked the room up in that Map, missed, and
+--   returned early — so the embed stayed "🟢 Open" in the channel forever, even
+--   when the room had already closed. Persisting the ids here lets any close
+--   path (and the startup orphan sweep) still edit the message after a restart.
+--
+-- Shape: a JSON array, one entry per webhook we successfully posted to:
+--     [{"w": "<webhookId>", "m": "<messageId>"}]
+--
+--   * "w" is the webhook's ID segment from .../webhooks/<id>/<token> — the
+--     PUBLIC half of the URL. The secret token is deliberately NOT stored: it
+--     already lives in .env, and the id is enough to re-pair a persisted message
+--     with its configured URL at edit time. A leaked/backed-up DB therefore
+--     can't be used to post into the channel.
+--   * NULL / absent for private rooms, for rooms created while no webhook was
+--     configured, and for every lobby that predates this migration — all of
+--     which simply have no message to edit (rehydration returns null and the
+--     callers no-op, same as today).
+ALTER TABLE lobbies ADD COLUMN discord_targets TEXT;

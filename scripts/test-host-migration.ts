@@ -63,6 +63,11 @@ async function main(): Promise<void> {
             delete: async (k: string) => { kvStore.delete(k); },
         },
         config: { chatMsgsPerMin: 30 },
+        // handleDisconnectCleanup nudges the global players panel, so the mock
+        // ctx needs it or every abrupt-close case dies on undefined. This script
+        // rotted silently when that call was added — it is the pin for host
+        // migration, so keep the mock in step with what LobbyRoom touches.
+        globalChat: { refreshPlayers: () => {} },
     } as unknown as AppContext;
 
     const registry = new LobbyRoomRegistry();

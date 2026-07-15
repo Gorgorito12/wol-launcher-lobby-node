@@ -1,6 +1,7 @@
 import { fetch } from 'undici';
 import type { FastifyBaseLogger } from 'fastify';
 import type { Config } from '../env';
+import type { Db } from '../db';
 
 /**
  * Optional Discord channel announcements for lobbies, with LIVE updates.
@@ -16,10 +17,16 @@ import type { Config } from '../env';
  *  - Best-effort and non-blocking: it must NEVER throw into or slow down room
  *    creation or the WS broadcast path. Every network call swallows its errors.
  *  - Private rooms are NOT announced at all.
- *  - Per-room state (the posted message ids + the data to re-render the embed)
- *    lives IN MEMORY here — no SQLite column, no migration. A server restart
- *    with an active room just freezes that message at its last state (rooms are
- *    ephemeral and restarts rare — accepted trade-off).
+ *  - Per-room state is cached in memory for the hot path, but the posted message
+ *    ids are ALSO PERSISTED on `lobbies.discord_targets` (migration 0002), and a
+ *    cache miss REHYDRATES from the DB — see `ensureState`. This used to be
+ *    memory-only on the theory that restarts were rare; the reality was that any
+ *    restart orphaned every live announcement (the room vanished from the Map,
+ *    so `finalizeRoom` returned early and the embed stayed "Open" forever, even
+ *    once the room had closed). Rehydration is what lets every close path still
+ *    edit the message across a restart, and what lets a REVIVED room (clients
+ *    auto-reconnect, so the lobby WS route rebuilds the room from the DB) keep
+ *    getting live edits.
  *  - Edits are debounced (~2 s) so a burst of joins is one edit, well within
  *    Discord's per-webhook edit rate limit.
  *  - All fixed text is English on purpose (community-facing, mirrors the
@@ -31,15 +38,36 @@ import type { Config } from '../env';
 // ---------- shared config, stashed once at startup by configure() -----------
 let cfg: Config | null = null;
 let log: FastifyBaseLogger | null = null;
+let database: Db | null = null;
 
-/** Stash the shared config + logger. Call once from index.ts at startup. */
-export function configure(config: Config, logger: FastifyBaseLogger): void {
+/** Stash the shared config + logger + db. Call once from index.ts at startup. */
+export function configure(config: Config, logger: FastifyBaseLogger, db: Db): void {
     cfg = config;
     log = logger;
+    database = db;
 }
 
 function webhookUrls(): string[] {
     return cfg?.discordWebhookUrls ?? [];
+}
+
+/**
+ * The ID segment of a Discord webhook URL (`.../webhooks/<id>/<token>`) — the
+ * public half. We persist only this and re-pair it with the configured URL (and
+ * therefore its secret token) at edit time, so the DB never holds a credential.
+ * Returns null for a URL that doesn't look like a webhook.
+ */
+function webhookIdOf(url: string): string | null {
+    const m = /\/webhooks\/(\d+)\//.exec(url);
+    return m ? m[1] : null;
+}
+
+/** Resolve a persisted webhook id back to its configured URL, if still present. */
+function urlForWebhookId(id: string): string | null {
+    for (const url of webhookUrls()) {
+        if (webhookIdOf(url) === id) return url;
+    }
+    return null;
 }
 
 // ---------- in-memory per-room state ----------------------------------------
@@ -70,6 +98,13 @@ interface RoomAnnounceState {
 }
 
 const rooms = new Map<string, RoomAnnounceState>();
+
+/**
+ * Rehydrations currently in flight, keyed by lobby id. Without this, two close
+ * calls racing on the same untracked lobby would each build their own state and
+ * double-PATCH the message.
+ */
+const rehydrating = new Map<string, Promise<RoomAnnounceState | null>>();
 
 const EDIT_DEBOUNCE_MS = 2000;
 
@@ -183,47 +218,194 @@ export async function announceLobbyCreated(room: NewRoom): Promise<void> {
             }
         }),
     );
+
+    // Persist the message ids so a restart doesn't orphan this announcement.
+    await persistTargets(state);
 }
 
 /**
- * Record a change to a tracked room and schedule a debounced edit. No-op when
- * the room isn't tracked (private / webhooks off / not announced).
+ * Write a room's message ids onto its `lobbies` row. Best-effort: a failure only
+ * costs us the ability to edit the embed after a restart, which is exactly the
+ * old behaviour, so it must never bubble into room creation.
+ */
+async function persistTargets(state: RoomAnnounceState): Promise<void> {
+    if (!database) return;
+    try {
+        const rows = state.targets
+            .map((t) => {
+                const w = webhookIdOf(t.url);
+                return w ? { w, m: t.messageId } : null;
+            })
+            .filter((r): r is { w: string; m: string } => r !== null);
+        if (rows.length === 0) return;
+        await database.prepare(
+            `UPDATE lobbies SET discord_targets = ? WHERE id = ?`,
+        ).bind(JSON.stringify(rows), state.id).run();
+    } catch (err) {
+        log?.warn({ err, lobbyId: state.id }, 'Discord targets persist failed');
+    }
+}
+
+/**
+ * Rebuild a room's announce state from the DB — used when the in-memory cache
+ * misses (i.e. after a restart, for a room announced by the previous process).
+ * Everything the embed renders already lives on the `lobbies` row plus the host's
+ * `users` row; only the message ids needed the new column.
+ *
+ * Returns null when there's nothing to edit: no row, no persisted targets (a
+ * private room / webhooks were off / a pre-migration lobby), or none of the
+ * persisted webhook ids is still configured.
+ */
+async function rehydrate(lobbyId: string): Promise<RoomAnnounceState | null> {
+    if (!database || webhookUrls().length === 0) return null;
+    try {
+        const row = await database.prepare(
+            `SELECT l.id, l.title, l.mod_id, l.max_players, l.current_players, l.status,
+                    l.created_at, l.discord_targets,
+                    u.display_name, u.discord_username, u.avatar_url
+             FROM lobbies l JOIN users u ON u.id = l.host_user_id
+             WHERE l.id = ?`,
+        ).bind(lobbyId).first<{
+            id: string;
+            title: string;
+            mod_id: string;
+            max_players: number;
+            current_players: number;
+            status: string;
+            created_at: string;
+            discord_targets: string | null;
+            display_name: string | null;
+            discord_username: string | null;
+            avatar_url: string | null;
+        }>();
+        if (!row?.discord_targets) return null;
+
+        const parsed = JSON.parse(row.discord_targets) as Array<{ w: string; m: string }>;
+        const targets: Target[] = [];
+        for (const t of parsed) {
+            const url = urlForWebhookId(t.w);
+            if (url) targets.push({ url, messageId: t.m });
+        }
+        if (targets.length === 0) return null;
+
+        // created_at is stored by SQLite's datetime('now') as 'YYYY-MM-DD HH:MM:SS'
+        // (space-separated, no zone). Normalise to ISO-UTC so Date.parse gives the
+        // right instant — the embed's "Opened <t:unix:R>" would otherwise be read
+        // as local time and drift by the host's offset.
+        const createdAt = normaliseSqliteTimestamp(row.created_at);
+
+        const state: RoomAnnounceState = {
+            id: row.id,
+            title: row.title,
+            modId: row.mod_id,
+            maxPlayers: row.max_players,
+            hostName: row.display_name || row.discord_username || 'Unknown',
+            hostAvatar: row.avatar_url ?? null,
+            players: row.current_players,
+            status: (row.status === 'in_game' ? 'in_game'
+                : row.status === 'closed' ? 'closed'
+                    : 'open') as RoomStatus,
+            createdAt,
+            targets,
+            lastKey: '',
+            timer: null,
+        };
+        state.lastKey = renderKey(state);
+        return state;
+    } catch (err) {
+        log?.warn({ err, lobbyId }, 'Discord announce rehydrate failed');
+        return null;
+    }
+}
+
+/**
+ * SQLite's datetime('now') yields 'YYYY-MM-DD HH:MM:SS' in UTC with no zone
+ * marker, which Date.parse reads as LOCAL time. Convert to ISO-8601 UTC. An
+ * already-ISO value (what announceLobbyCreated stores in memory) passes through.
+ */
+function normaliseSqliteTimestamp(ts: string): string {
+    if (!ts) return new Date().toISOString();
+    if (ts.includes('T')) return ts;
+    return `${ts.replace(' ', 'T')}Z`;
+}
+
+/**
+ * The room's live state, rehydrating from the DB on a cache miss. Concurrent
+ * callers for the same lobby share one rehydration.
+ */
+async function ensureState(lobbyId: string): Promise<RoomAnnounceState | null> {
+    const cached = rooms.get(lobbyId);
+    if (cached) return cached;
+
+    const inFlight = rehydrating.get(lobbyId);
+    if (inFlight) return inFlight;
+
+    const p = rehydrate(lobbyId).then((state) => {
+        // Re-check the cache: a concurrent announce may have registered the room
+        // while we were reading the DB — that copy is fresher, so it wins.
+        const now = rooms.get(lobbyId);
+        if (now) return now;
+        if (state) rooms.set(lobbyId, state);
+        return state;
+    }).finally(() => {
+        rehydrating.delete(lobbyId);
+    });
+    rehydrating.set(lobbyId, p);
+    return p;
+}
+
+/**
+ * Record a change to a room and schedule a debounced edit. No-op when the room
+ * has no announcement to edit (private / webhooks off / never announced).
+ *
+ * Stays SYNCHRONOUS: it's called from the WS broadcast path, which must not be
+ * slowed down or made failable. The rehydrating lookup is fire-and-forget.
  */
 export function notifyRoomChanged(
     lobbyId: string,
     change: { players?: number; status?: RoomStatus },
 ): void {
-    const state = rooms.get(lobbyId);
-    if (!state) return;
-    if (typeof change.players === 'number') state.players = change.players;
-    if (change.status) state.status = change.status;
+    void (async () => {
+        const state = await ensureState(lobbyId);
+        if (!state) return;
+        if (typeof change.players === 'number') state.players = change.players;
+        if (change.status) state.status = change.status;
 
-    const key = renderKey(state);
-    if (key === state.lastKey) return; // nothing visible changed
-    state.lastKey = key;
+        const key = renderKey(state);
+        if (key === state.lastKey) return; // nothing visible changed
+        state.lastKey = key;
 
-    // A flush already pending will render the latest state when it fires.
-    if (state.timer) return;
-    state.timer = setTimeout(() => {
-        state.timer = null;
-        void flushEdit(lobbyId);
-    }, EDIT_DEBOUNCE_MS);
+        // A flush already pending will render the latest state when it fires.
+        if (state.timer) return;
+        state.timer = setTimeout(() => {
+            state.timer = null;
+            void flushEdit(lobbyId);
+        }, EDIT_DEBOUNCE_MS);
+    })();
 }
 
 /**
  * Final edit of a room's message to its closing state (default "Closed"), then
  * stop tracking it. The message stays in Discord as history.
+ *
+ * Rehydrates on a cache miss, which is the whole point: the callers (the
+ * "creating a room closes my prior one" loop, the host-leave paths, the
+ * match-reported close, the startup orphan sweep) routinely fire for a room
+ * announced by a PREVIOUS process, and this used to return early and leave the
+ * embed reading "Open" forever.
  */
 export function finalizeRoom(lobbyId: string, status: RoomStatus = 'closed'): void {
-    const state = rooms.get(lobbyId);
-    if (!state) return;
-    if (state.timer) {
-        clearTimeout(state.timer);
-        state.timer = null;
-    }
-    state.status = status;
-    rooms.delete(lobbyId);
-    void flushEditState(state);
+    void (async () => {
+        const state = await ensureState(lobbyId);
+        if (!state) return;
+        if (state.timer) {
+            clearTimeout(state.timer);
+            state.timer = null;
+        }
+        state.status = status;
+        rooms.delete(lobbyId);
+        await flushEditState(state);
+    })();
 }
 
 // ---------- internals -------------------------------------------------------
