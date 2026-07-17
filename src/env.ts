@@ -58,11 +58,13 @@ export interface Config {
     // the hard-fail secret check below, so the service starts fine without it.
     discordWebhookUrls: string[];
 
-    // A Discord role ID to @mention (ping) at the top of the room-creation
-    // announcement, so a "Players"/"Jugadores" role gets notified. The displayed
-    // text is the role's own name. Defaults to the WoL community role (hardcoded
-    // in loadConfig); override via env for another server, or "none" to disable.
-    discordPlayersRoleId: string;
+    // Discord role IDs to @mention (ping) at the top of the room-creation
+    // announcement, so a "Players"/"Jugadores" role gets notified. A role belongs
+    // to ONE server, so this is a LIST aligned POSITIONALLY with discordWebhookUrls:
+    // roleIds[i] is pinged on webhook[i]. An empty / "none" slot = no ping for that
+    // server. Defaults to the WoL community role at index 0 (hardcoded in
+    // loadConfig). The displayed text is each role's own name.
+    discordPlayersRoleIds: string[];
 }
 
 function intEnv(name: string, fallback: number): number {
@@ -87,6 +89,23 @@ function urlListEnv(name: string): string[] {
         .split(/[,\n]/)
         .map((s) => s.trim())
         .filter((s) => /^https?:\/\//i.test(s));
+}
+
+/**
+ * Parse a comma/newline-separated list of Discord role IDs, KEEPING positional
+ * slots so it stays index-aligned with the webhook list (an empty or "none" slot
+ * becomes '' = "no ping for that server"). This deliberately does NOT drop empties
+ * the way urlListEnv does — a middle blank is a meaningful "skip this one". Trailing
+ * blanks are harmless. When the env var is unset the caller's fallback is used
+ * (e.g. the WoL role at index 0, for out-of-the-box behaviour).
+ */
+function roleIdListEnv(name: string, fallback: string[]): string[] {
+    const raw = process.env[name];
+    if (!raw || raw.trim().length === 0) return fallback;
+    return raw
+        .split(/[,\n]/)
+        .map((s) => s.trim())
+        .map((s) => (s === '' || s.toLowerCase() === 'none' ? '' : s));
 }
 
 /**
@@ -136,14 +155,14 @@ export function loadConfig(): Config {
         discordClientSecret: strEnv('DISCORD_CLIENT_SECRET', ''),
 
         discordWebhookUrls: urlListEnv('DISCORD_WEBHOOK_URL'),
-        // Defaults to the WoL community server's "Players" role so the ping works
-        // out of the box (like the other hardcoded server defaults). A role id is
-        // a public identifier, not a secret. Override via env for another server,
-        // or set it to "none"/empty in the .env to disable the ping.
-        discordPlayersRoleId: (() => {
-            const v = strEnv('DISCORD_PLAYERS_ROLE_ID', '1088344884882194563');
-            return v.toLowerCase() === 'none' ? '' : v;
-        })(),
+        // Per-server ping role ids, aligned by index with DISCORD_WEBHOOK_URL.
+        // Defaults to the WoL community server's "Players" role at index 0 so the
+        // ping works out of the box (like the other hardcoded server defaults). A
+        // role id is a public identifier, not a secret. Override via env with a
+        // comma list matching the webhook order; use "none"/empty in a slot to skip
+        // that server's ping. See roleIdListEnv — empties are KEPT as positional
+        // placeholders (unlike urlListEnv, which drops them), so the alignment holds.
+        discordPlayersRoleIds: roleIdListEnv('DISCORD_PLAYERS_ROLE_ID', ['1088344884882194563']),
     };
 
     // Hard fail on missing secrets — we don't want the service to start

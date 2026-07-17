@@ -52,6 +52,15 @@ function webhookUrls(): string[] {
 }
 
 /**
+ * The @role id to ping on the webhook at index `i` — a role belongs to ONE server,
+ * so the ping is per-webhook (see discordPlayersRoleIds, aligned by index with the
+ * webhook list). '' = no ping for that server.
+ */
+function roleIdFor(i: number): string {
+    return cfg?.discordPlayersRoleIds?.[i] ?? '';
+}
+
+/**
  * The ID segment of a Discord webhook URL (`.../webhooks/<id>/<token>`) — the
  * public half. We persist only this and re-pair it with the configured URL (and
  * therefore its secret token) at edit time, so the DB never holds a credential.
@@ -182,19 +191,23 @@ export async function announceLobbyCreated(room: NewRoom): Promise<void> {
     rooms.set(room.id, state);
     state.lastKey = renderKey(state);
 
-    // Optionally @mention a role (e.g. "Players"/"Jugadores") so the community
-    // gets pinged. The mention MUST live in `content` — embeds never notify —
-    // and only on this create POST (edits keep the embed but never re-ping).
-    // allowed_mentions is restricted to that one role so a player-typed room
-    // name can never @everyone/@here.
-    const roleId = cfg?.discordPlayersRoleId ?? '';
-    const payload: Record<string, unknown> = { embeds: [buildEmbed(state)] };
-    if (roleId) {
-        payload.content = `<@&${roleId}>`;
-        payload.allowed_mentions = { parse: [], roles: [roleId] };
-    }
+    // The embed is identical for every server; only the @role ping differs, so
+    // build it once and reuse it in each per-webhook payload below.
+    const embed = buildEmbed(state);
     await Promise.allSettled(
-        urls.map(async (url) => {
+        urls.map(async (url, i) => {
+            // Optionally @mention this SERVER'S role (e.g. "Players"/"Jugadores")
+            // so its community gets pinged. A role belongs to one server, so the
+            // ping is per-webhook (roleIdFor(i)). The mention MUST live in `content`
+            // — embeds never notify — and only on this create POST (edits keep the
+            // embed but never re-ping). allowed_mentions is restricted to that one
+            // role so a player-typed room name can never @everyone/@here.
+            const payload: Record<string, unknown> = { embeds: [embed] };
+            const roleId = roleIdFor(i);
+            if (roleId) {
+                payload.content = `<@&${roleId}>`;
+                payload.allowed_mentions = { parse: [], roles: [roleId] };
+            }
             try {
                 // `?wait=true` makes Discord return the created message object,
                 // so we capture its id to edit later.
