@@ -45,6 +45,31 @@ export function configure(config: Config, logger: FastifyBaseLogger, db: Db): vo
     cfg = config;
     log = logger;
     database = db;
+
+    // Diagnosability: the @role ping is per-webhook (discordPlayersRoleIds aligned
+    // by index with discordWebhookUrls). Deploying the per-server-ping change WITHOUT
+    // updating DISCORD_PLAYERS_ROLE_ID silently drops pings for the webhooks past the
+    // configured roles — which is exactly what bit us once. Surface it at startup so a
+    // missing/short list is visible in the logs instead of "the ping just vanished".
+    try {
+        const n = config.discordWebhookUrls.length;
+        if (n > 0) {
+            const missing: number[] = [];
+            for (let i = 0; i < n; i++) {
+                if (!config.discordPlayersRoleIds?.[i]) missing.push(i);
+            }
+            if (missing.length > 0) {
+                logger.warn(
+                    { webhooks: n, roles: config.discordPlayersRoleIds?.length ?? 0, missingIndexes: missing },
+                    'Discord announce: some webhooks have no aligned role in DISCORD_PLAYERS_ROLE_ID — ' +
+                    'those servers will NOT @mention a role. Set DISCORD_PLAYERS_ROLE_ID to a comma list ' +
+                    'in the SAME order as DISCORD_WEBHOOK_URL (use "none" to intentionally skip a server).',
+                );
+            }
+        }
+    } catch {
+        /* never let a startup log break configure() */
+    }
 }
 
 function webhookUrls(): string[] {
