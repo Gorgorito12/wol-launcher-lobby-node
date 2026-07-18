@@ -155,13 +155,19 @@ export function loadConfig(): Config {
         discordClientSecret: strEnv('DISCORD_CLIENT_SECRET', ''),
 
         discordWebhookUrls: urlListEnv('DISCORD_WEBHOOK_URL'),
-        // Per-server ping role ids, aligned by index with DISCORD_WEBHOOK_URL.
-        // Defaults to the WoL community server's "Players" role at index 0 so the
-        // ping works out of the box (like the other hardcoded server defaults). A
-        // role id is a public identifier, not a secret. Override via env with a
-        // comma list matching the webhook order; use "none"/empty in a slot to skip
-        // that server's ping. See roleIdListEnv — empties are KEPT as positional
-        // placeholders (unlike urlListEnv, which drops them), so the alignment holds.
+        // Per-server ping role ids, aligned by INDEX with DISCORD_WEBHOOK_URL
+        // (webhook[i] pings roleIds[i]). This DEFAULT is only a sensible starting
+        // value (the WoL-community "Players" role at index 0) — the real per-webhook
+        // layout is deployment-specific and lives in the .env, NOT here: with several
+        // webhooks (possibly to different servers, some with no ping) the env must
+        // list one entry per webhook IN WEBHOOK ORDER, using "none"/empty for a
+        // server that should not be pinged, e.g.
+        //   DISCORD_PLAYERS_ROLE_ID=none,<serverB_role>,<serverC_role>
+        // Don't bake the multi-webhook layout into this default — it drifts from the
+        // real webhook order and misleads. A role id is a public identifier, not a
+        // secret. NOTE: an env value OVERRIDES this default entirely. See
+        // roleIdListEnv — empties/"none" are KEPT as positional placeholders (unlike
+        // urlListEnv, which drops them), so the index alignment holds.
         discordPlayersRoleIds: roleIdListEnv('DISCORD_PLAYERS_ROLE_ID', ['1088344884882194563']),
     };
 
