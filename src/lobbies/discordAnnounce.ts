@@ -401,13 +401,14 @@ async function ensureState(lobbyId: string): Promise<RoomAnnounceState | null> {
  */
 export function notifyRoomChanged(
     lobbyId: string,
-    change: { players?: number; status?: RoomStatus },
+    change: { players?: number; status?: RoomStatus; title?: string },
 ): void {
     void (async () => {
         const state = await ensureState(lobbyId);
         if (!state) return;
         if (typeof change.players === 'number') state.players = change.players;
         if (change.status) state.status = change.status;
+        if (change.title) state.title = change.title;
 
         const key = renderKey(state);
         if (key === state.lastKey) return; // nothing visible changed
@@ -447,8 +448,15 @@ export function finalizeRoom(lobbyId: string, status: RoomStatus = 'closed'): vo
 }
 
 // ---------- internals -------------------------------------------------------
+/**
+ * Everything the embed renders that can CHANGE while a room is open. An edit is
+ * skipped when this key is unchanged, so anything omitted here is invisible to
+ * Discord: the title is in the key because the host can rename a live room
+ * (`rename_room`) — drop it and the rename updates the launcher but silently
+ * never reaches the webhook.
+ */
 function renderKey(state: RoomAnnounceState): string {
-    return `${state.players}|${state.status}`;
+    return `${state.players}|${state.status}|${state.title}`;
 }
 
 function jsonHeaders(): Record<string, string> {

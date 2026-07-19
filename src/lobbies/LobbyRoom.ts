@@ -73,6 +73,12 @@ interface ChatLine {
 
 const CHAT_RING_MAX = 100;
 const IDLE_KICK_AFTER_MS = 90 * 1000;
+/**
+ * Minimum gap between accepted renames, per room. Aligned with the Discord
+ * edit debounce (EDIT_DEBOUNCE_MS) — a rename costs a DB write plus a PATCH to
+ * every configured webhook, so it can't be spammable.
+ */
+const RENAME_MIN_GAP_MS = 2000;
 
 class LobbyRoom {
     readonly lobbyId: string;
@@ -94,6 +100,18 @@ class LobbyRoom {
      * window. Null outside a starting/in-game match.
      */
     private startedAtMs: number | null = null;
+    /**
+     * Wall-clock ms of the last accepted rename, for the per-room throttle in
+     * handleRename. A rename writes the DB and PATCHes every Discord webhook,
+     * so it must not be spammable.
+     */
+    private lastRenameAt = 0;
+    /**
+     * Last title we broadcast, for the "renamed to the same thing" no-op check.
+     * The room isn't constructed with the title (the registry only knows id +
+     * host), so this starts null and the first rename always goes through.
+     */
+    private lastTitle: string | null = null;
 
     constructor(lobbyId: string, hostUserId: string) {
         this.lobbyId = lobbyId;
@@ -194,6 +212,9 @@ class LobbyRoom {
                 break;
             case 'kick':
                 this.handleKick(ws, attached, f);
+                break;
+            case 'rename_room':
+                await this.handleRename(ws, ctx, attached, f);
                 break;
             case 'ping':
                 this.send(ws, { type: 'pong' });
@@ -557,6 +578,57 @@ class LobbyRoom {
         }
     }
 
+    /**
+     * Host renames the room while it's already open. The new title is validated
+     * with the SAME rule as room creation (rest.ts: trim → 80 chars → min 3) —
+     * a name must obey one limit no matter which path set it.
+     *
+     * Broadcast with `exclude: null` so the sender gets it too: the server is
+     * the single source of truth for the name, and the launcher deliberately
+     * doesn't paint it locally, so host and peers can never disagree.
+     *
+     * The Discord embed follows via reflectToDiscord → notifyRoomChanged.
+     */
+    private async handleRename(
+        ws: WebSocket,
+        ctx: AppContext,
+        attached: AttachedSocket,
+        frame: { type: string } & Record<string, unknown>,
+    ): Promise<void> {
+        if (this.hostUserId !== attached.userId) {
+            this.sendError(ws, 'forbidden', 'Only the host can rename the room');
+            return;
+        }
+
+        const title = String(frame.title ?? '').trim().slice(0, 80);
+        if (title.length < 3) {
+            this.sendError(ws, 'bad_title', 'title too short');
+            return;
+        }
+        if (title === this.lastTitle) return; // no-op, don't burn a webhook edit
+
+        const now = Date.now();
+        if (now - this.lastRenameAt < RENAME_MIN_GAP_MS) {
+            this.sendError(ws, 'rename_too_fast', 'Wait a moment before renaming again');
+            return;
+        }
+        this.lastRenameAt = now;
+
+        try {
+            await ctx.db.prepare(
+                `UPDATE lobbies SET title = ? WHERE id = ?`,
+            ).bind(title, this.lobbyId).run();
+        } catch {
+            // Best-effort, same as the other DB writes here: a transient hiccup
+            // mustn't kill the socket. Bail without broadcasting so the clients
+            // keep showing the name the DB still holds.
+            return;
+        }
+
+        this.lastTitle = title;
+        this.broadcast({ type: 'room_renamed', title, by: attached.userId }, null);
+    }
+
     // ---------- host migration / disconnect cleanup ---------------
 
     /**
@@ -668,6 +740,9 @@ class LobbyRoom {
                 break;
             case 'game_cancelled':
                 notifyRoomChanged(this.lobbyId, { status: 'open' });
+                break;
+            case 'room_renamed':
+                notifyRoomChanged(this.lobbyId, { title: (frame as { title?: string }).title });
                 break;
         }
     }
