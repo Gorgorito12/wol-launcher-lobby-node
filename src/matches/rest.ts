@@ -154,9 +154,26 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
             games_played: number;
             updated_at: string;
         }>();
+
+        // Decided games only. A result of 0.5 means the outcome could not be read —
+        // no recording, a team game, a skirmish, or any match reported before the
+        // launcher could read one — so it is counted as neither a win nor a loss.
+        // Most stored rows are 0.5, which is why the client must divide by wins+losses
+        // and not by games_played: doing the latter would report "3% wins" for someone
+        // who won 3 of their 4 decided games.
+        const tally = await ctx.db.prepare(
+            `SELECT SUM(CASE WHEN result >= 0.999 THEN 1 ELSE 0 END) AS wins,
+                    SUM(CASE WHEN result <= 0.001 THEN 1 ELSE 0 END) AS losses
+             FROM match_participants WHERE user_id = ?`,
+        ).bind(userId).first<{ wins: number | null; losses: number | null }>();
+
+        // SUM() over no rows is NULL, not 0.
+        const wins = tally?.wins ?? 0;
+        const losses = tally?.losses ?? 0;
+
         if (!row) return reply.send({
-            rating: 1500, rd: 350, volatility: 0.06, games_played: 0,
+            rating: 1500, rd: 350, volatility: 0.06, games_played: 0, wins, losses,
         });
-        return reply.send(row);
+        return reply.send({ ...row, wins, losses });
     });
 }
