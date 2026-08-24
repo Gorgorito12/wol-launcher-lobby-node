@@ -126,8 +126,7 @@ function idListEnv(name: string, fallback: string[]): string[] {
     const raw = process.env[name];
     if (!raw || raw.trim().length === 0) return fallback;
     const ids = raw
-        .split(/[,
-]/)
+        .split(/[,\n]/)
         .map((s) => s.trim().toLowerCase())
         .filter((s) => s.length > 0);
     return ids.length > 0 ? ids : fallback;

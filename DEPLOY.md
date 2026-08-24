@@ -127,6 +127,33 @@ the Cloudflare Worker until they update OR the `MigrateLobbyBaseUrl`
 heuristic catches the old URL (you can extend that list to include
 the old Worker URL so it auto-rewrites to the new one on next launch).
 
+## Before you deploy: check it parses
+
+The service runs TypeScript directly through `tsx`, with no build step — which means
+**nothing checks the code until the process starts**, and a syntax error there does
+not produce an application error. The module fails to load, the process exits before
+it can listen, and nginx answers **502 to every request with nothing in the app log,
+because the app never ran.** That has happened once, from a single stray newline
+inside a regex literal in `env.ts`.
+
+```bash
+node scripts/syntax-check.mjs src
+```
+
+It needs no dependencies. On a Windows machine with no Node installed, VS Code's
+Electron is one:
+
+```powershell
+$env:ELECTRON_RUN_AS_NODE = "1"
+& "$env:LOCALAPPDATA\Programs\Microsoft VS Code\Code.exe" scripts/syntax-check.mjs src
+```
+
+`lib/errors.ts` always reports one failure — a constructor parameter property, which
+Node's strip-only mode refuses by design. Ignore that one; anything else is real.
+
+With the dependencies installed, `npm run typecheck` and `npm test` are stricter and
+should be preferred. The check above is the one that works when they are not.
+
 ## Updating (redeploy after a code change)
 
 The service runs the TypeScript directly via `tsx` — there is **no build
