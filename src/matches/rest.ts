@@ -3,7 +3,8 @@ import { Errors } from '../lib/errors';
 import { uuid } from '../lib/ids';
 import { requireAuth } from '../middleware/auth';
 import { ipRateLimit, Limits } from '../middleware/rateLimit';
-import { applyMatch, type ParticipantOutcome } from '../elo/glicko2';
+import { applyMatch, DEFAULT_RATING, DEFAULT_RD, DEFAULT_VOLATILITY,
+         type ParticipantOutcome } from '../elo/glicko2';
 import { ratabilityReason, compareReadings,
          type UnratedReason } from '../elo/ratability';
 import { finalizeRoom } from '../lobbies/discordAnnounce';
@@ -510,8 +511,13 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
         const wins = tally?.wins ?? 0;
         const losses = tally?.losses ?? 0;
 
+        // No row: unrated, which is the starting rating. This endpoint always answered
+        // that way — it is where the chip's 1500 comes from — while the rooms list, the
+        // presence frame and the room roster sent null for the same player. Same
+        // constants everywhere now, so they cannot drift apart again.
         if (!row) return reply.send({
-            rating: 1500, rd: 350, volatility: 0.06, games_played: 0, wins, losses,
+            rating: DEFAULT_RATING, rd: DEFAULT_RD, volatility: DEFAULT_VOLATILITY,
+            games_played: 0, wins, losses,
         });
         return reply.send({ ...row, wins, losses });
     });

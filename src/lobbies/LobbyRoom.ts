@@ -2,6 +2,7 @@ import type { WebSocket } from 'ws';
 import { randomUUID } from 'node:crypto';
 import { verifyJwt } from '../lib/jwt';
 import { notifyRoomChanged, finalizeRoom } from './discordAnnounce';
+import { DEFAULT_RATING, DEFAULT_RD } from '../elo/glicko2';
 import type { AppContext } from '../context';
 
 /**
@@ -66,9 +67,13 @@ interface MemberEntry {
      * so the roster can show everyone's ELO instead of only your own — eight
      * single-user calls to /matches/elo would not fit the rate budget.
      *
-     * Undefined when the player has no rating row yet, and that is the point: it
-     * must NOT be filled in with the 1500/350 default. A rating nobody earned is
-     * exactly what the client refuses to paint, so it never travels.
+     * A player with NO rating row is sent as the starting 1500/350, not as undefined.
+     * This used to say the opposite — that the default must never be filled in, because
+     * the client refuses to paint a rating nobody earned. That rule was dropped: everyone
+     * who has not played is on exactly 1500, so a number they all share claims nothing
+     * about any of them, and withholding it left the roster blank for the whole room.
+     * The reversal was applied in the launcher and missed here, which is why it kept
+     * looking broken after the ratings reset left nobody with a row.
      *
      * A snapshot taken at join. Nothing refreshes it while the room lives, which
      * is fine because reporting a match closes the room.
@@ -309,8 +314,11 @@ class LobbyRoom {
             return;
         }
         const avatarUrl = member.avatar_url ?? undefined;
-        const rating = member.rating ?? undefined;
-        const rd = member.rd ?? undefined;
+        // No row means unrated, and unrated IS the starting rating — see the note on
+        // Member.rating. One place covers both frames below, since room_state sends
+        // this.members as-is and member_joined reuses these two.
+        const rating = member.rating ?? DEFAULT_RATING;
+        const rd = member.rd ?? DEFAULT_RD;
 
         const now = Date.now();
         this.attached.set(ws, {
@@ -327,8 +335,8 @@ class LobbyRoom {
             login,
             radminIp: existing?.radminIp,
             avatarUrl: avatarUrl ?? existing?.avatarUrl,
-            rating: rating ?? existing?.rating,
-            rd: rd ?? existing?.rd,
+            rating,
+            rd,
         };
 
         this.send(ws, {

@@ -17,6 +17,22 @@ const Glicko2Ctor = (glicko2 as unknown as { Glicko2: typeof import('glicko2').G
  * SQL → identical numeric behaviour, so a user's ELO survives the
  * migration unchanged.
  */
+/**
+ * What an UNRATED player is worth. Glicko's own starting point, and the single
+ * source for it — it used to be typed out at each site, which is how the surfaces
+ * came to disagree about the same player.
+ *
+ * These are not a placeholder standing in for a real answer: a player with no row
+ * in `elo_ratings` genuinely IS 1500/350, which is why `applyMatch` below already
+ * rates their first match as if they were. Every endpoint that reports a rating
+ * fills these in for such a player, so `null` on the wire keeps ONE meaning — no
+ * answer (an older server, a query that failed) — and never "this player is worth
+ * nothing".
+ */
+export const DEFAULT_RATING = 1500;
+export const DEFAULT_RD = 350;
+export const DEFAULT_VOLATILITY = 0.06;
+
 export interface ParticipantOutcome {
     userId: string;
     result: 0 | 0.5 | 1;
@@ -36,7 +52,7 @@ export async function applyMatch(
 ): Promise<Map<string, { before: number; after: number; rdBefore: number; rdAfter: number }>> {
     if (outcomes.length < 2) return new Map();
 
-    const ranking = new Glicko2Ctor({ tau: 0.5, rating: 1500, rd: 350, vol: 0.06 });
+    const ranking = new Glicko2Ctor({ tau: 0.5, rating: DEFAULT_RATING, rd: DEFAULT_RD, vol: DEFAULT_VOLATILITY });
 
     const ids = outcomes.map((o) => o.userId);
     const placeholders = ids.map(() => '?').join(',');
@@ -52,9 +68,9 @@ export async function applyMatch(
     const before = new Map<string, { rating: number; rd: number }>();
     for (const o of outcomes) {
         const row = byId.get(o.userId);
-        const r = row?.rating ?? 1500;
-        const rd = row?.rd ?? 350;
-        const vol = row?.volatility ?? 0.06;
+        const r = row?.rating ?? DEFAULT_RATING;
+        const rd = row?.rd ?? DEFAULT_RD;
+        const vol = row?.volatility ?? DEFAULT_VOLATILITY;
         players.set(o.userId, ranking.makePlayer(r, rd, vol));
         before.set(o.userId, { rating: r, rd });
     }

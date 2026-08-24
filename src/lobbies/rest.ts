@@ -4,6 +4,7 @@ import { shortId, sha256Hex, uuid } from '../lib/ids';
 import { requireAuth } from '../middleware/auth';
 import { ipRateLimit, userRateLimit, Limits } from '../middleware/rateLimit';
 import { announceLobbyCreated, finalizeRoom } from './discordAnnounce';
+import { DEFAULT_RATING } from '../elo/glicko2';
 import type { AppContext } from '../context';
 
 interface LobbyRow {
@@ -93,10 +94,17 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
                     discord_username: r.host_login,
                     display_name: r.host_name,
                     avatar_url: r.host_avatar,
-                    // Null when the player has no rating row yet. The launcher shows the
-                    // server's starting 1500 for that case itself; what it must never do
-                    // is invent a number, so nothing is substituted here.
-                    rating: r.host_rating,
+                    // No row means UNRATED, and unrated is the starting rating — the
+                    // server is the only side that can tell that apart from "I could not
+                    // answer", because it ran the query. Sending null for it made the
+                    // rooms list show no rating at all for everybody, since the ratings
+                    // reset left nobody with a row.
+                    //
+                    // The comment here used to claim the launcher substituted this value
+                    // itself. It does not: RatingDisplay.ShouldShow is `rating.HasValue`.
+                    // Filling it in on the client would be wrong anyway — it cannot tell
+                    // an unrated player from a server that did not send the field.
+                    rating: r.host_rating ?? DEFAULT_RATING,
                 },
             })),
         });

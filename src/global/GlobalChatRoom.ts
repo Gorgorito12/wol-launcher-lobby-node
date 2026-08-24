@@ -1,6 +1,7 @@
 import type { WebSocket } from 'ws';
 import { randomUUID } from 'node:crypto';
 import { verifyJwt } from '../lib/jwt';
+import { DEFAULT_RATING } from '../elo/glicko2';
 import type { AppContext } from '../context';
 
 /**
@@ -479,8 +480,15 @@ export class GlobalChatRoom {
         // Ratings for whoever is connected. Queried here rather than cached on the
         // socket at connect time so it cannot go stale after a match — and this runs
         // only when somebody joins or leaves, never on a timer, so it is not a hot path.
-        // Best-effort like the status query above: a failure leaves everyone unrated
-        // (still listed) instead of emptying the panel.
+        //
+        // `ratingsKnown` is the whole point of this being best-effort rather than fatal,
+        // and it is what keeps the two cases apart. A user MISSING from the map once the
+        // query succeeded has no rating row, and that means unrated, which is the starting
+        // rating — so it is filled in. A query that THREW tells us nothing about anyone,
+        // so everybody stays null and the panel simply shows no number. Collapsing the two
+        // would either hide every rating (what happened after the reset) or invent one for
+        // a player we failed to look up.
+        let ratingsKnown = false;
         try {
             const ids = [...new Set([...this.attached.values()].map((a) => a.userId))];
             if (this.ctx && ids.length > 0) {
@@ -493,6 +501,9 @@ export class GlobalChatRoom {
                     .bind(...ids)
                     .all<{ user_id: string; rating: number }>();
                 for (const r of rows.results) ratingByUser.set(r.user_id, r.rating);
+                // Set only here: without a ctx no query ran at all, and an empty
+                // roster has nobody to report either way.
+                ratingsKnown = true;
             }
         } catch {
             // See above.
@@ -508,7 +519,7 @@ export class GlobalChatRoom {
                 login: a.login,
                 avatarUrl: a.avatarUrl,
                 status: statusByUser.get(a.userId) ?? 'idle',
-                rating: ratingByUser.get(a.userId) ?? null,
+                rating: ratingsKnown ? (ratingByUser.get(a.userId) ?? DEFAULT_RATING) : null,
             });
         }
         return out;
