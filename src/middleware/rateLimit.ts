@@ -118,6 +118,13 @@ export const Limits = {
     LobbyListIp:      { scope: 'llist',     keyKind: 'ip',   perMinute: 120, perDay: 15000 } as const,
     ChatIp:           { scope: 'chat',      keyKind: 'ip',   perMinute: 30,  perDay: 500  } as const,
     StatsIp:          { scope: 'stats',     keyKind: 'ip',   perMinute: 20,  perDay: 500  } as const,
+    // Public community stats (leaderboard + activity). Its OWN scope rather than a
+    // share of StatsIp: those 20/min are already spent by /matches/elo and
+    // /matches/history, and behind one Radmin NAT eight players opening the
+    // Multiplayer tab at once would let two decorative cards starve the profile of
+    // its budget. Cached for a minute server-side, so this ceiling is never reached
+    // by honest use anyway.
+    StatsPublicIp:    { scope: 'statsp',    keyKind: 'ip',   perMinute: 30,  perDay: 2000 } as const,
     LobbyCreateUser:  { scope: 'lcreate-u', keyKind: 'user', perMinute: 10,  perDay: 100  } as const,
     LobbyJoinUser:    { scope: 'ljoin-u',   keyKind: 'user', perMinute: 50,  perDay: 200  } as const,
     ReportUser:       { scope: 'report-u',  keyKind: 'user', perMinute: 5,   perDay: 20   } as const,

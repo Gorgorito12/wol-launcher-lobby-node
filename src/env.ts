@@ -65,6 +65,15 @@ export interface Config {
     // server. Defaults to the WoL community role at index 0 (hardcoded in
     // loadConfig). The displayed text is each role's own name.
     discordPlayersRoleIds: string[];
+
+    // Mod ids whose matches are allowed to move ELO. Everything else is still
+    // stored in the match history — it just doesn't score. This is policy, not
+    // capability: a rating that adds up wins across mods is adding up games that
+    // cannot even be played against each other, since the mod fingerprint gate
+    // keeps players of different mods apart. Comma-separated; defaults to the one
+    // mod with a real ladder. Widening it needs no code change and no deploy of a
+    // new build, only a restart.
+    rankedModIds: string[];
 }
 
 function intEnv(name: string, fallback: number): number {
@@ -106,6 +115,22 @@ function roleIdListEnv(name: string, fallback: string[]): string[] {
         .split(/[,\n]/)
         .map((s) => s.trim())
         .map((s) => (s === '' || s.toLowerCase() === 'none' ? '' : s));
+}
+
+/**
+ * Parse a comma/newline-separated list of plain ids (no URL shape to validate).
+ * Trims, drops empties, lowercases — ids are compared case-insensitively so an
+ * operator typing "WoL" in the .env still matches the launcher's "wol".
+ */
+function idListEnv(name: string, fallback: string[]): string[] {
+    const raw = process.env[name];
+    if (!raw || raw.trim().length === 0) return fallback;
+    const ids = raw
+        .split(/[,
+]/)
+        .map((s) => s.trim().toLowerCase())
+        .filter((s) => s.length > 0);
+    return ids.length > 0 ? ids : fallback;
 }
 
 /**
@@ -169,6 +194,8 @@ export function loadConfig(): Config {
         // roleIdListEnv — empties/"none" are KEPT as positional placeholders (unlike
         // urlListEnv, which drops them), so the index alignment holds.
         discordPlayersRoleIds: roleIdListEnv('DISCORD_PLAYERS_ROLE_ID', ['1088344884882194563']),
+
+        rankedModIds: idListEnv('RANKED_MOD_IDS', ['wol']),
     };
 
     // Hard fail on missing secrets — we don't want the service to start

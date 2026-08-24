@@ -61,6 +61,20 @@ interface MemberEntry {
     /** The member's Discord avatar URL, so the roster can show their real photo
      * (read from users.avatar_url on join). Undefined when unknown. */
     avatarUrl?: string;
+    /**
+     * The member's Glicko rating and deviation, read alongside the avatar on join
+     * so the roster can show everyone's ELO instead of only your own — eight
+     * single-user calls to /matches/elo would not fit the rate budget.
+     *
+     * Undefined when the player has no rating row yet, and that is the point: it
+     * must NOT be filled in with the 1500/350 default. A rating nobody earned is
+     * exactly what the client refuses to paint, so it never travels.
+     *
+     * A snapshot taken at join. Nothing refreshes it while the room lives, which
+     * is fine because reporting a match closes the room.
+     */
+    rating?: number;
+    rd?: number;
 }
 
 interface ChatLine {
@@ -270,19 +284,33 @@ class LobbyRoom {
             return;
         }
 
-        // Verify membership AND fetch the avatar in one query, so the roster can
-        // paint the member's real Discord photo (room_state/member_joined).
+        // Verify membership AND fetch the avatar AND the rating in one query, so the
+        // roster can paint the member's real Discord photo and their ELO
+        // (room_state/member_joined) without a single extra round-trip.
+        //
+        // The elo_ratings join MUST stay a LEFT JOIN. This query is also the
+        // membership check — a row means "you are in this lobby" — so an inner join
+        // would throw out of the room, with 4004 not_in_lobby, everyone who has no
+        // rating row yet. Right after a ratings reset that is every single player.
         const member = await ctx.db.prepare(
-            `SELECT u.avatar_url AS avatar_url
-             FROM lobby_members lm JOIN users u ON u.id = lm.user_id
+            `SELECT u.avatar_url AS avatar_url, e.rating AS rating, e.rd AS rd
+             FROM lobby_members lm
+             JOIN users u ON u.id = lm.user_id
+             LEFT JOIN elo_ratings e ON e.user_id = lm.user_id AND e.mode = 'default'
              WHERE lm.lobby_id = ? AND lm.user_id = ? LIMIT 1`,
-        ).bind(this.lobbyId, userId).first<{ avatar_url: string | null }>();
+        ).bind(this.lobbyId, userId).first<{
+            avatar_url: string | null;
+            rating: number | null;
+            rd: number | null;
+        }>();
         if (!member) {
             this.sendError(ws, 'not_in_lobby', 'You are not a member of this lobby');
             ws.close(4004, 'not_in_lobby');
             return;
         }
         const avatarUrl = member.avatar_url ?? undefined;
+        const rating = member.rating ?? undefined;
+        const rd = member.rd ?? undefined;
 
         const now = Date.now();
         this.attached.set(ws, {
@@ -299,6 +327,8 @@ class LobbyRoom {
             login,
             radminIp: existing?.radminIp,
             avatarUrl: avatarUrl ?? existing?.avatarUrl,
+            rating: rating ?? existing?.rating,
+            rd: rd ?? existing?.rd,
         };
 
         this.send(ws, {
@@ -313,6 +343,8 @@ class LobbyRoom {
             user_id: userId,
             discord_username: login,
             avatar_url: avatarUrl,
+            rating,
+            rd,
         }, ws);
     }
 
@@ -474,9 +506,17 @@ class LobbyRoom {
             this.sendError(ws, 'forbidden', 'Only the host can start the game');
             return;
         }
+        // Freeze the roster here, because this is the moment the question
+        // "who played this match" has an answer. It cannot be asked later: REST
+        // /leave deletes the lobby_members row, and the first person to leave after
+        // a game is usually the one who lost, so by the time the host reports the
+        // result the loser may no longer look like a member at all.
+        const rosterAtStart = JSON.stringify(Object.keys(this.members));
         await ctx.db.prepare(
-            `UPDATE lobbies SET status = 'in_game', started_at = datetime('now') WHERE id = ?`,
-        ).bind(this.lobbyId).run();
+            `UPDATE lobbies SET status = 'in_game', started_at = datetime('now'),
+                                roster_at_start = ?
+             WHERE id = ?`,
+        ).bind(rosterAtStart, this.lobbyId).run();
         this.startedAtMs = Date.now();
         const startsAtMs = this.startedAtMs + LobbyRoom.COUNTDOWN_MS;
         this.broadcast({
@@ -765,6 +805,22 @@ class LobbyRoom {
         }
     }
 
+    /**
+     * Send one frame to everyone in the room, from outside it.
+     *
+     * The single public door onto <c>broadcast</c>, which stays private. It exists
+     * for the match report: POST /matches has to tell the room the result BEFORE it
+     * closes the sockets, or the guest — who has no recording of their own — learns
+     * nothing and falls back to polling the history.
+     *
+     * Note that broadcasting also performs the idle kick, so publishing can close a
+     * socket that had already gone quiet. Harmless here: this frame is immediately
+     * followed by closing the room anyway.
+     */
+    publish(frame: object): void {
+        this.broadcast(frame, null);
+    }
+
     private send(ws: WebSocket, frame: object): void {
         try { ws.send(JSON.stringify(frame)); }
         catch { /* socket dying */ }
@@ -804,6 +860,15 @@ export class LobbyRoomRegistry {
      * host's REST /leave path (and from match-report close) so a
      * closed lobby doesn't keep its in-memory state forever.
      */
+    /**
+     * Broadcast into a room if it is still around. A no-op when it is not — a room
+     * whose last socket left has already been garbage-collected, and there is
+     * nobody to tell.
+     */
+    publish(lobbyId: string, frame: object): void {
+        this.rooms.get(lobbyId)?.publish(frame);
+    }
+
     close(lobbyId: string, code = 4006, reason = 'lobby_closed'): void {
         const room = this.rooms.get(lobbyId);
         if (!room) return;

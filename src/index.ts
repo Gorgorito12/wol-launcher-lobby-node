@@ -18,6 +18,7 @@ import { registerLobbiesRest } from './lobbies/rest';
 import { configure as configureDiscordAnnounce } from './lobbies/discordAnnounce';
 import { scheduleOrphanLobbySweep } from './lobbies/orphanSweep';
 import { registerMatchesRest } from './matches/rest';
+import { registerStatsRest } from './stats/rest';
 import { registerReplaysRest } from './replays/rest';
 
 const SERVICE_VERSION = '0.1.0';
@@ -174,6 +175,7 @@ async function main(): Promise<void> {
     registerLobbiesRest(app, ctx);
     registerMatchesRest(app, ctx);
     registerReplaysRest(app, ctx);
+    registerStatsRest(app, ctx);
 
     // /me — current user + ELO snapshot. Requires auth.
     app.get('/me', { preHandler: [requireAuth()] }, async (req, _reply) => {

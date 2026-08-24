@@ -12,7 +12,7 @@
     "dev": "tsx watch src/index.ts",
     "start": "tsx src/index.ts",
     "typecheck": "tsc --noEmit",
-    "migrate": "tsx src/cli/migrate.ts"
+    "test": "tsx --test src/elo/ratability.test.ts"
   },
   "dependencies": {
     "@fastify/cors": "^9.0.1",

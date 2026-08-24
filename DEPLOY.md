@@ -137,8 +137,9 @@ cd /opt/wol-lobby
 git pull
 # Only if package.json changed (new/updated deps):
 #   npm install --omit=dev
-# Only if a new file landed under migrations/ (DB schema change):
-#   npm run migrate
+# Migrations need NO step of their own: src/index.ts runs db.migrate() on every
+# start, inside a transaction, and records each file in the _migrations table so
+# a re-run is a no-op. The restart below applies anything new under migrations/.
 sudo systemctl restart wol-lobby
 sudo systemctl status wol-lobby --no-pager   # → active (running)
 curl http://127.0.0.1:8080/health            # → {"ok":true, ...}
@@ -164,6 +165,94 @@ curl -i -N -H "Connection: Upgrade" -H "Upgrade: websocket" \
   -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
   http://127.0.0.1:8080/global/ws
 # → HTTP/1.1 101 Switching Protocols   (404 = route not deployed)
+```
+
+## Resetting the ratings
+
+Only ever needed on purpose — this throws every player's ELO away. It exists
+because the ratings built before the ratability rule landed were mostly made of
+matches nobody won: `POST /matches` used to feed EVERY report to Glicko, and
+since AoE3 does not record by default almost every stored match has no winner.
+
+The match history is NOT touched: `matches` and `match_participants.result` stay
+whole. Only `elo_ratings` and the per-participant `rating_before`/`rating_after`
+go.
+
+```bash
+sudo systemctl stop wol-lobby
+# .backup, not cp: the database runs in WAL mode, so copying the .db without its
+# -wal sidecar can capture an inconsistent state.
+sudo -u wol-lobby sqlite3 /var/lib/wol-lobby/lobby.db     ".backup '/var/lib/wol-lobby/lobby-pre-elo-reset-$(date +%F).db'"
+cd /opt/wol-lobby && npx tsx scripts/reset-elo.ts
+sudo systemctl start wol-lobby
+```
+
+To roll back, restore that `.backup` file and start the service. This is
+deliberately a script and not a migration: a migration is remembered in the
+`_migrations` table of the database it ran against, so restoring the backup and
+starting up would re-run it and delete the ratings you had just restored.
+
+## Reading the match confirmations
+
+Only the host reports a result; the other player's launcher reads its own recording
+and sends that too, as **evidence only** — it gates nothing. The point of collecting
+it is to answer, with real numbers rather than a guess, whether requiring the two to
+agree would ever be viable.
+
+```bash
+sqlite3 /var/lib/wol-lobby/lobby.db "
+  SELECT CASE
+           WHEN c.user_id IS NULL          THEN 'no confirmation'
+           WHEN c.result = 0.5             THEN 'guest could not read it'
+           WHEN p.result = 0.5             THEN 'host could not read it'
+           WHEN (c.result >= 0.999) = (p.result >= 0.999) THEN 'agree'
+           ELSE 'DISAGREE'
+         END AS verdict,
+         COUNT(*)
+  FROM matches m
+  JOIN match_participants p ON p.match_id = m.id AND p.user_id <> m.host_user_id
+  LEFT JOIN match_confirmations c
+         ON c.match_id = m.id AND c.user_id = p.user_id
+  GROUP BY verdict;"
+```
+
+**"no confirmation" is the number that decides it.** If most matches have one, the
+readings can be required to agree; if most do not — the guest closed the launcher,
+or their game was not recording — requiring agreement would stop counting the very
+matches it was meant to protect.
+
+A `DISAGREE` is worth looking at one by one. Two honest recordings of the same match
+cannot contradict each other: the trailer names winner and loser by absolute slot.
+
+**Were they even reading the same match?** That is what the game fingerprint answers,
+and it is also the query that settles whether the host clock can be trusted across
+machines — the seed must be shared (both sides generate the same map from it), the
+clock is only assumed to be:
+
+```bash
+sqlite3 /var/lib/wol-lobby/lobby.db "
+  SELECT CASE
+           WHEN m.game_seed IS NULL OR c.game_seed IS NULL THEN 'no fingerprint'
+           WHEN m.game_seed <> c.game_seed                 THEN 'DIFFERENT GAME'
+           WHEN m.game_host_time = c.game_host_time        THEN 'same game, clock matches'
+           ELSE 'same game, clock differs'
+         END AS verdict,
+         COUNT(*)
+  FROM match_confirmations c
+  JOIN matches m ON m.id = c.match_id
+  GROUP BY verdict;"
+```
+
+If **`same game, clock differs`** never appears, `game_host_time` is common to both
+sides and may be promoted into the comparison in `tieConfirmations` — it is recorded
+but deliberately excluded from the verdict until then. If **`DIFFERENT GAME`**
+appears, somebody's launcher picked the wrong recording, which is the whole reason
+this fingerprint exists.
+
+The same lines are in the service log as they happen:
+
+```bash
+journalctl -u wol-lobby | grep 'match confirmation compared'
 ```
 
 ## Backups
