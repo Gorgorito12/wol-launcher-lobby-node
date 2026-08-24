@@ -452,8 +452,12 @@ export class GlobalChatRoom {
      * still work; an old client also just ignores the `status` field.
      */
     private async onlineUsers():
-        Promise<{ userId: string; login: string; avatarUrl: string | null; status: string }[]> {
+        Promise<{
+            userId: string; login: string; avatarUrl: string | null;
+            status: string; rating: number | null;
+        }[]> {
         const statusByUser = new Map<string, string>();
+        const ratingByUser = new Map<string, number>();
         try {
             if (this.ctx) {
                 const rows = await this.ctx.db
@@ -472,13 +476,39 @@ export class GlobalChatRoom {
             // Best-effort: on a query failure everyone falls back to 'idle'
             // (still listed, just uncategorised).
         }
-        const out: { userId: string; login: string; avatarUrl: string | null; status: string }[] = [];
+        // Ratings for whoever is connected. Queried here rather than cached on the
+        // socket at connect time so it cannot go stale after a match — and this runs
+        // only when somebody joins or leaves, never on a timer, so it is not a hot path.
+        // Best-effort like the status query above: a failure leaves everyone unrated
+        // (still listed) instead of emptying the panel.
+        try {
+            const ids = [...new Set([...this.attached.values()].map((a) => a.userId))];
+            if (this.ctx && ids.length > 0) {
+                const placeholders = ids.map(() => '?').join(',');
+                const rows = await this.ctx.db
+                    .prepare(
+                        `SELECT user_id, rating FROM elo_ratings
+                         WHERE mode = 'default' AND user_id IN (${placeholders})`,
+                    )
+                    .bind(...ids)
+                    .all<{ user_id: string; rating: number }>();
+                for (const r of rows.results) ratingByUser.set(r.user_id, r.rating);
+            }
+        } catch {
+            // See above.
+        }
+
+        const out: {
+            userId: string; login: string; avatarUrl: string | null;
+            status: string; rating: number | null;
+        }[] = [];
         for (const a of this.attached.values()) {
             out.push({
                 userId: a.userId,
                 login: a.login,
                 avatarUrl: a.avatarUrl,
                 status: statusByUser.get(a.userId) ?? 'idle',
+                rating: ratingByUser.get(a.userId) ?? null,
             });
         }
         return out;

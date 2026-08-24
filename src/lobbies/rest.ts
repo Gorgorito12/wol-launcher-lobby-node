@@ -48,9 +48,14 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
             `SELECT l.id, l.host_user_id, l.title, l.mod_id, l.mod_combined_hash,
                     l.max_players, l.current_players, l.is_private, l.status,
                     l.created_at, u.discord_username AS host_login, u.display_name AS host_name,
-                    u.avatar_url AS host_avatar
+                    u.avatar_url AS host_avatar, e.rating AS host_rating
              FROM lobbies l
              JOIN users u ON u.id = l.host_user_id
+             -- LEFT, and it has to stay LEFT. This is the rooms list: with an inner
+             -- join every room whose host has no rating row would VANISH from it, which
+             -- is a far worse bug than a missing number and a silent one. Same trap as
+             -- the membership query in LobbyRoom's hello.
+             LEFT JOIN elo_ratings e ON e.user_id = l.host_user_id AND e.mode = 'default'
              WHERE l.status IN ('open', 'locked', 'in_game')
              ORDER BY l.created_at DESC
              LIMIT 100`,
@@ -68,6 +73,7 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
             host_login: string;
             host_name: string;
             host_avatar: string | null;
+            host_rating: number | null;
         }>();
 
         reply.header('Cache-Control', 'public, max-age=5');
@@ -87,6 +93,10 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
                     discord_username: r.host_login,
                     display_name: r.host_name,
                     avatar_url: r.host_avatar,
+                    // Null when the player has no rating row yet. The launcher shows the
+                    // server's starting 1500 for that case itself; what it must never do
+                    // is invent a number, so nothing is substituted here.
+                    rating: r.host_rating,
                 },
             })),
         });
