@@ -207,19 +207,43 @@ go.
 
 ```bash
 sudo systemctl stop wol-lobby
-# .backup, not cp: the database runs in WAL mode, so copying the .db without its
-# -wal sidecar can capture an inconsistent state.
-sudo -u wol-lobby sqlite3 /var/lib/wol-lobby/lobby.db     ".backup '/var/lib/wol-lobby/lobby-pre-elo-reset-$(date +%F).db'"
-cd /opt/wol-lobby && npx tsx scripts/reset-elo.ts
+
+# Back up all THREE files, not just the .db. The database runs in WAL mode, so the
+# -wal sidecar can hold committed transactions the .db does not yet contain, and
+# copying the .db alone can capture a state that never existed. With the service
+# stopped nothing is writing, so copying the set together is consistent — and
+# unlike `sqlite3 .backup` it needs no extra package installed. (sqlite3 is NOT
+# part of this install: the service reaches SQLite through better-sqlite3 and
+# never shells out to it.)
+BK=/var/lib/wol-lobby/backup-$(date +%F)
+sudo mkdir -p "$BK"
+sudo cp -a /var/lib/wol-lobby/lobby.db* "$BK"/
+sudo ls -l "$BK"          # confirm there is something there before continuing
+
+# As the SERVICE's user, and with the tsx that is already installed — not npx.
+# Running it as your own login user fails twice over: it cannot read the service's
+# .env, and it cannot write the database.
+cd /opt/wol-lobby
+sudo -u wol-lobby ./node_modules/.bin/tsx scripts/reset-elo.ts
+
 sudo systemctl start wol-lobby
 ```
 
-To roll back, restore that `.backup` file and start the service. This is
+The script needs no secrets — only the database path, which it takes from `DB_PATH`
+(the environment, or the service's `.env`), or from an explicit first argument:
+`sudo -u wol-lobby ./node_modules/.bin/tsx scripts/reset-elo.ts /var/lib/wol-lobby/lobby.db`
+
+To roll back, copy the files out of that backup directory and start the service. This is
 deliberately a script and not a migration: a migration is remembered in the
 `_migrations` table of the database it ran against, so restoring the backup and
 starting up would re-run it and delete the ratings you had just restored.
 
 ## Reading the match confirmations
+
+> These queries need the `sqlite3` CLI, which is **not** installed by default —
+> nothing in the service uses it. `sudo apt install -y sqlite3` once, if you want
+> them.
+
 
 Only the host reports a result; the other player's launcher reads its own recording
 and sends that too, as **evidence only** — it gates nothing. The point of collecting

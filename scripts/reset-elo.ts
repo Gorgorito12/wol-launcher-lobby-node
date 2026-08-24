@@ -23,12 +23,29 @@
  * rollback destroy the thing it was for. A forgotten script leaves the ratings
  * wrong, which is recoverable; a migration here is not.
  */
+import 'dotenv/config';
 import { Db } from '../src/db';
-import { loadConfig } from '../src/env';
+
+/**
+ * Where the database is.
+ *
+ * Read straight from the environment rather than through `loadConfig()`, which was the
+ * first attempt and was wrong: that function hard-fails when JWT_SIGNING_KEY,
+ * DISCORD_CLIENT_ID and friends are missing, and this script has no business demanding
+ * OAuth secrets in order to delete rows from a table. It also made the script unrunnable
+ * by any user who cannot read the service's .env, which is exactly the user an operator
+ * is logged in as.
+ *
+ * Order: an explicit path on the command line, then DB_PATH (from the environment or a
+ * readable .env), then the same default env.ts uses.
+ */
+function resolveDbPath(): string {
+    return process.argv[2] || process.env.DB_PATH || './lobby.db';
+}
 
 function main(): void {
-    const cfg = loadConfig();
-    const db = new Db(cfg.dbPath);
+    const dbPath = resolveDbPath();
+    const db = new Db(dbPath);
     const raw = db.raw();
 
     const before = {
@@ -39,7 +56,7 @@ function main(): void {
         matches: (raw.prepare('SELECT COUNT(*) AS n FROM matches').get() as { n: number }).n,
     };
 
-    console.log(`Database : ${cfg.dbPath}`);
+    console.log(`Database : ${dbPath}`);
     console.log(`Before   : ${before.ratings} rating rows, ${before.stamped} stamped participants, ` +
                 `${before.matches} matches (kept)`);
 
