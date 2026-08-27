@@ -253,6 +253,44 @@ export class GlobalChatRoom {
         } catch { /* never break room creation on a broadcast hiccup */ }
     }
 
+    /**
+     * Tell the players of one match that it ended up rated after all.
+     *
+     * <p>Directed at the two participants rather than broadcast: it is nobody else's
+     * business, and the payload carries their rating change. It rides THIS socket and not
+     * the room's because by the time a correction exists the room has been closed for
+     * minutes — there is nowhere else for it to land, which is exactly why the match used
+     * to be corrected in silence and only discovered by someone who happened to open their
+     * History.</p>
+     *
+     * <p>Best-effort, like every other announcement here: a player who is offline simply
+     * sees it in their History instead. Never awaited, never allowed to throw.</p>
+     */
+    announceMatchRated(notice: {
+        matchId: string;
+        lobbyId: string;
+        modId: string;
+        mapName: string | null;
+        perUser: ReadonlyMap<string, { result: number; before: number | null; after: number | null }>;
+    }): void {
+        try {
+            for (const [ws, attached] of this.attached) {
+                const mine = notice.perUser.get(attached.userId);
+                if (!mine) continue;
+                this.send(ws, {
+                    type: 'match_rated',
+                    match_id: notice.matchId,
+                    lobby_id: notice.lobbyId,
+                    mod_id: notice.modId,
+                    map_name: notice.mapName,
+                    result: mine.result,
+                    rating_before: mine.before,
+                    rating_after: mine.after,
+                });
+            }
+        } catch { /* a correction that cannot be announced is still a correction */ }
+    }
+
     private async handleHello(
         ws: WebSocket,
         ctx: AppContext,

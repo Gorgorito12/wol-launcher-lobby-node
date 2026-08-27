@@ -325,3 +325,94 @@ journalctl -u wol-lobby -f                       # tail logs
 sqlite3 /var/lib/wol-lobby/lobby.db 'SELECT COUNT(*) FROM users'
                                                   # peek into the data
 ```
+
+## Matches decided by a late reading
+
+Since the correction path landed, a match stored with no result can be decided
+afterwards by **either** player's own reading of their own recording — the host's, if
+they found theirs seconds after reporting, or the other player's. Reporting is still
+host-only; this only corrects a row that already exists.
+
+Who is allowed to decide what is the rule in `src/elo/ratability.ts`
+(`canUpgradeFromConfirmation`), and its one anti-abuse clause is worth knowing when
+reading these numbers: **you may concede your own defeat freely, and claim your own
+victory only when the fingerprint the reporter already stored matches yours.** The
+server never reads the recording — `result` is a number the client sends — so the rule
+does not verify the claim, it removes the reason to invent one: a liar can only give
+points away.
+
+```bash
+# Matches decided after the fact, newest first.
+sqlite3 /var/lib/wol-lobby/lobby.db \
+  "SELECT id, mod_id, decided_by, created_at FROM matches
+   WHERE decided_by IS NOT NULL ORDER BY created_at DESC LIMIT 20"
+
+# Still waiting: stored undecided, nobody has managed to decide them.
+sqlite3 /var/lib/wol-lobby/lobby.db \
+  "SELECT COUNT(*) FROM matches WHERE unrated_reason = 'no_decided_result'"
+```
+
+```
+journalctl -u wol-lobby | grep 'match decided by a late reading'
+journalctl -u wol-lobby | grep 'late reading refused'      # and WHY, per attempt
+```
+
+### The number that decides whether agreement can be REQUIRED
+
+`match_confirmations.agreement` is now **stored**, not only logged — the log rotates and
+is gone, and this is the statistic migration 0004 created the table to collect. Three
+questions, three queries:
+
+```bash
+# 1. When both readings arrive, do they agree?
+sqlite3 /var/lib/wol-lobby/lobby.db \
+  "SELECT agreement, COUNT(*) FROM match_confirmations
+   WHERE agreement IS NOT NULL GROUP BY agreement"
+
+# 2. Were they even reading the same game?
+sqlite3 /var/lib/wol-lobby/lobby.db \
+  "SELECT same_game, COUNT(*) FROM match_confirmations
+   WHERE same_game IS NOT NULL GROUP BY same_game"
+
+# 3. THE one that actually decides it: how often does the second reading never arrive?
+#    No column needed — it is the absence of a row.
+sqlite3 /var/lib/wol-lobby/lobby.db \
+  "SELECT COUNT(*) AS matches_with_no_confirmation FROM matches m
+   WHERE m.lobby_id IS NOT NULL
+     AND NOT EXISTS (SELECT 1 FROM match_confirmations c WHERE c.match_id = m.id)"
+```
+
+If (3) is large, requiring both players to agree would leave most real matches unrated —
+which is what the evidence suggested at the time this was written, and why the rule
+accepts a single reading rather than demanding two.
+
+### Antes de reiniciar: dos cosas que muerden
+
+**1. La migración `0006` es todo-o-nada.** `Db.migrate` ejecuta el archivo entero dentro de
+una transacción, así que si UNA de sus cinco `ALTER TABLE` falla — por ejemplo porque alguien
+agregó `rated` a mano durante un diagnóstico — el archivo completo se revierte, `migrate()`
+lanza, y **el servicio no arranca**. Comprobalo antes:
+
+```bash
+sqlite3 /var/lib/wol-lobby/lobby.db 'PRAGMA table_info(matches)' | grep -E 'unrated_reason|rated|decided_by'
+sqlite3 /var/lib/wol-lobby/lobby.db 'PRAGMA table_info(match_confirmations)' | grep -E 'agreement|same_game'
+```
+
+Si no devuelven nada, `0006` va a aplicar limpio. Si devuelven algo, editá la migración para
+sacar esa columna antes de desplegar.
+
+**2. `npm ci` compila `better-sqlite3` desde el código fuente si tu Node no tiene binario
+precompilado.** Con Node 24 no lo hay para la versión fijada (`^11.3.0`) y `npm ci` falla
+entero en esa dependencia — medido. Node 20 y 22 sí tienen. Verificá `node --version` en el
+server antes de tocar nada; si algún día actualizás Node ahí, esto es lo que se va a romper.
+
+### Settling the backlog
+
+Matches played BEFORE this landed can still be decided from the confirmations already in
+the database. Dry run first — it changes history rows that people have already seen:
+
+```bash
+cd /opt/wol-lobby
+npx tsx scripts/upgrade-pending.ts            # lists what it would decide, writes nothing
+npx tsx scripts/upgrade-pending.ts --apply    # writes
+```

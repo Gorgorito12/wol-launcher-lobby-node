@@ -11,7 +11,13 @@
 -- WinnerSlot/LoserSlot. The guest reaches an independent verdict about the same
 -- fact and, until now, threw it away.
 --
--- This table keeps it. It GATES NOTHING: matches rate exactly as they did before.
+-- This table keeps it. It GATED NOTHING when it was written: matches rated exactly as they
+-- did before, and this table only recorded how the two readings compared.
+--
+-- THAT IS NO LONGER TRUE, and the comment is left standing rather than rewritten so the
+-- change is visible. Since migration 0006 a reading stored here can DECIDE a match the
+-- server stored without a result — see canUpgradeFromConfirmation in src/elo/ratability.ts.
+-- It still cannot overturn a match that already scored, and reporting is still host-only.
 -- It exists so that in a few weeks there is real data on how often the two
 -- readings disagree, and — the number that actually decides whether agreement can
 -- ever be required — how often the second reading simply never arrives.

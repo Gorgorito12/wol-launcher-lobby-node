@@ -5,7 +5,7 @@ import { requireAuth } from '../middleware/auth';
 import { ipRateLimit, Limits } from '../middleware/rateLimit';
 import { applyMatch, DEFAULT_RATING, DEFAULT_RD, DEFAULT_VOLATILITY,
          type ParticipantOutcome } from '../elo/glicko2';
-import { ratabilityReason, compareReadings,
+import { ratabilityReason, compareReadings, canUpgradeFromConfirmation, WIN_AT,
          type UnratedReason } from '../elo/ratability';
 import { finalizeRoom } from '../lobbies/discordAnnounce';
 import type { AppContext } from '../context';
@@ -99,9 +99,20 @@ async function tieConfirmations(
             ? 'not_reported'
             : compareReadings(reportedResult, row.result);
 
+        // Were the two of them even reading the same GAME? (See the note below on why the
+        // host clock is recorded but takes no part in the verdict.)
+        const sameGameEarly = fingerprint.seed === null || row.game_seed === null
+            ? 'unknown'
+            : String(fingerprint.seed === row.game_seed);
+
+        // Stored, not only logged. The log rotates and is gone, and this is the number that
+        // decides whether agreement between the two players can ever be REQUIRED — which is
+        // the entire reason match_confirmations exists (see migration 0004). Leaving it in a
+        // log meant it was never accumulating anywhere it could be counted.
         await ctx.db.prepare(
-            `UPDATE match_confirmations SET match_id = ? WHERE lobby_id = ? AND user_id = ?`,
-        ).bind(matchId, lobbyId, row.user_id).run();
+            `UPDATE match_confirmations SET match_id = ?, agreement = ?, same_game = ?
+             WHERE lobby_id = ? AND user_id = ?`,
+        ).bind(matchId, agreement, sameGameEarly, lobbyId, row.user_id).run();
 
         // Were the two of them even reading the same GAME? Decided on the seed alone:
         // both machines must generate the same map, so they must share it. The host
@@ -109,9 +120,7 @@ async function tieConfirmations(
         // verdict — only one side of a match was ever available to measure, so whether
         // the guest's recording carries the same value is plausible and unproven. When
         // the two-machine test settles it, this is the line that promotes it.
-        const sameGame = fingerprint.seed === null || row.game_seed === null
-            ? 'unknown'
-            : fingerprint.seed === row.game_seed;
+        const sameGame = sameGameEarly;
         const hostTimeMatches = fingerprint.hostTime === null || row.game_host_time === null
             ? 'unknown'
             : fingerprint.hostTime === row.game_host_time;
@@ -132,6 +141,201 @@ async function tieConfirmations(
             },
             'match confirmation compared',
         );
+    }
+}
+
+/**
+ * Decide a match that was stored WITHOUT a result, from one player's late reading.
+ *
+ * <p><b>The failure this closes.</b> Only the host reports, and only the host's reading of
+ * their own recording counted — so a match whose host could not read one stayed unrated
+ * forever even when the other player's recording named the winner perfectly. Two halves of
+ * one real incident had exactly that shape: in one the host's recording had no outcome
+ * trailer, in the other the host found no recording at all, and in BOTH the answer was
+ * sitting on the other player's disk, correctly read, and sent here — where it was filed as
+ * evidence and thrown away.</p>
+ *
+ * <p><b>Reporting stays host-only.</b> This is not a second reporter: the row already exists
+ * and this only corrects it. Who may correct it, and to what, is
+ * {@link canUpgradeFromConfirmation} — the short version being that you may concede your own
+ * defeat freely and claim your own victory only with a matching fingerprint, so a liar can
+ * only ever give points away.</p>
+ *
+ * <p><b>Double-rating is the worst outcome here and the guard is the conditional UPDATE.</b>
+ * Both call sites can fire for one match, and a client can resend. So the row is CLAIMED
+ * first — UPDATE ... WHERE unrated_reason = 'no_decided_result' — and a claim that changes
+ * zero rows means somebody else got there and this call must stop before touching Glicko. A
+ * read-then-write would not do: applyMatch awaits, and an await is where two requests
+ * interleave. If the rating itself then fails, the claim is rolled back rather than leaving a
+ * match marked rated with no ratings behind it.</p>
+ *
+ * <p>Best-effort in every direction: the caller wraps it, and a failure changes nothing about
+ * the report or the confirmation that triggered it.</p>
+ */
+async function maybeUpgradeFromConfirmation(
+    ctx: AppContext,
+    log: FastifyBaseLogger,
+    lobbyId: string,
+    matchId: string,
+): Promise<void> {
+    const match = await ctx.db.prepare(
+        `SELECT id, mod_id, map_name, unrated_reason, game_seed, game_host_time
+         FROM matches WHERE id = ?`,
+    ).bind(matchId).first<{
+        id: string; mod_id: string; map_name: string | null;
+        unrated_reason: string | null; game_seed: number | null; game_host_time: number | null;
+    }>();
+    if (!match || match.unrated_reason !== 'no_decided_result') return;
+
+    const roster = await ctx.db.prepare(
+        `SELECT roster_at_start FROM lobbies WHERE id = ?`,
+    ).bind(lobbyId).first<{ roster_at_start: string | null }>();
+    const frozen = parseRoster(roster?.roster_at_start ?? null);
+
+    const participants = await ctx.db.prepare(
+        `SELECT user_id FROM match_participants WHERE match_id = ?`,
+    ).bind(matchId).all<{ user_id: string }>();
+    const players = (participants.results ?? []).map((r) => r.user_id);
+    // Rule 3 of the resolver, restated here because the correction writes BOTH scores:
+    // "X lost" only names a winner when there are exactly two of them.
+    if (players.length !== 2) return;
+
+    const confirmations = await ctx.db.prepare(
+        `SELECT user_id, result, replay_sha256, game_seed, game_host_time
+         FROM match_confirmations WHERE lobby_id = ?`,
+    ).bind(lobbyId).all<ConfirmationRow>();
+
+    for (const row of confirmations.results ?? []) {
+        if (!players.includes(row.user_id)) continue;
+
+        // One game, one row: a recording that already decided some other match cannot decide
+        // this one as well. Only asked when we would actually adopt the fingerprint.
+        let fingerprintAlreadyUsed = false;
+        if (match.game_seed === null && row.game_seed !== null && row.game_host_time !== null) {
+            const clash = await ctx.db.prepare(
+                `SELECT 1 FROM matches WHERE game_seed = ? AND game_host_time = ? AND id <> ? LIMIT 1`,
+            ).bind(row.game_seed, row.game_host_time, matchId).first();
+            fingerprintAlreadyUsed = !!clash;
+        }
+
+        const decision = canUpgradeFromConfirmation({
+            storedReason: match.unrated_reason,
+            storedSeed: match.game_seed,
+            storedHostTime: match.game_host_time,
+            confirmResult: row.result,
+            confirmSeed: row.game_seed,
+            confirmHostTime: row.game_host_time,
+            confirmerInRoster: frozen !== null && frozen.has(row.user_id),
+            fingerprintAlreadyUsed,
+        });
+        if (!decision.ok) {
+            log.info({ match_id: matchId, user_id: row.user_id, reason: decision.reason },
+                'late reading refused');
+            continue;
+        }
+
+        // CLAIM the row. Zero changes means another path already decided this match.
+        const claim = await ctx.db.prepare(
+            `UPDATE matches SET unrated_reason = NULL, rated = 1, decided_by = ?
+             WHERE id = ? AND unrated_reason = 'no_decided_result'`,
+        ).bind(row.user_id, matchId).run();
+        if (!claim.changes) {
+            log.info({ match_id: matchId }, 'late reading lost the race; already decided');
+            return;
+        }
+
+        try {
+            // The confirmer's own score, and its mirror for the other player — the same
+            // 1 - x the launcher's resolver uses, so the two can never disagree about a
+            // match, and the pair still sums to N/2 as POST /matches validates.
+            //
+            // Narrowed to 0 | 1 rather than cast: `row.result` is a REAL straight out of
+            // SQLite, and a cast would quietly let a 0.5 through if that CHECK constraint
+            // were ever relaxed. canUpgradeFromConfirmation has already refused anything
+            // undecided, so collapsing to the two legal values here is honest, not lossy.
+            const ownResult: 0 | 1 = row.result >= WIN_AT ? 1 : 0;
+            const outcomes: ParticipantOutcome[] = players.map((id) => ({
+                userId: id,
+                result: id === row.user_id ? ownResult : ((1 - ownResult) as 0 | 1),
+            }));
+
+            const resultWrites = outcomes.map((o) => ctx.db.prepare(
+                `UPDATE match_participants SET result = ? WHERE match_id = ? AND user_id = ?`,
+            ).bind(o.result, matchId, o.userId));
+
+            if (decision.adoptFingerprint) {
+                // Gives the match the anti-duplicate protection it never had: a report with
+                // no recording sends these as null, which is precisely the case being fixed.
+                // The UNIQUE index is partial and can still collide with a row written since
+                // the check above, so adopting is a bonus, not a requirement — on a clash the
+                // decision stands and only the fingerprint is dropped.
+                try {
+                    await ctx.db.batch([
+                        ...resultWrites,
+                        ctx.db.prepare(
+                            `UPDATE matches SET game_seed = ?, game_host_time = ? WHERE id = ?`,
+                        ).bind(row.game_seed, row.game_host_time, matchId),
+                    ]);
+                } catch (err) {
+                    log.info({ match_id: matchId, err: String(err) },
+                        'fingerprint could not be adopted; deciding the match anyway');
+                    await ctx.db.batch(resultWrites);
+                }
+            } else {
+                await ctx.db.batch(resultWrites);
+            }
+
+            const diff = await applyMatch(ctx.db, outcomes);
+
+            const stamps = [];
+            for (const o of outcomes) {
+                const d = diff.get(o.userId);
+                if (!d) continue;
+                stamps.push(ctx.db.prepare(
+                    `UPDATE match_participants SET rating_before = ?, rating_after = ?
+                     WHERE match_id = ? AND user_id = ?`,
+                ).bind(d.before, d.after, matchId, o.userId));
+            }
+            if (stamps.length) await ctx.db.batch(stamps);
+
+            log.info(
+                { match_id: matchId, lobby_id: lobbyId, decided_by: row.user_id,
+                  reason: decision.reason, adopted_fingerprint: decision.adoptFingerprint },
+                'match decided by a late reading',
+            );
+
+            // The room closed minutes ago, so this is the only way either player learns it.
+            ctx.globalChat.announceMatchRated({
+                matchId,
+                lobbyId,
+                modId: match.mod_id,
+                mapName: match.map_name,
+                perUser: new Map(outcomes.map((o) => {
+                    const d = diff.get(o.userId);
+                    return [o.userId, { result: o.result, before: d?.before ?? null, after: d?.after ?? null }];
+                })),
+            });
+        } catch (err) {
+            // Put the row back rather than leave it marked rated with no ratings behind it —
+            // and the PARTICIPANT scores with it. The result writes land before applyMatch, so
+            // restoring only the match row would leave it reading "undecided" while its two
+            // participant rows carried a winner: a contradiction, and one that would then be
+            // shown in both players' History as a decided game nobody rated.
+            //
+            // 0.5 is the exact pre-upgrade state: the row was eligible precisely because
+            // 'no_decided_result' means no participant was decided.
+            await ctx.db.prepare(
+                `UPDATE matches SET unrated_reason = 'no_decided_result', rated = 0, decided_by = NULL
+                 WHERE id = ?`,
+            ).bind(matchId).run();
+            await ctx.db.prepare(
+                `UPDATE match_participants SET result = 0.5, rating_before = NULL, rating_after = NULL
+                 WHERE match_id = ?`,
+            ).bind(matchId).run();
+            log.error({ match_id: matchId, err: String(err) },
+                'late reading failed to apply; match left undecided');
+        }
+        return;
     }
 }
 
@@ -310,6 +514,18 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
             );
         }
 
+        // Kept on the row, not only in the response. Until now the verdict was computed,
+        // sent and logged but never stored, so a match that went down undecided could not be
+        // re-examined later — the row did not remember it was waiting for an answer, which is
+        // what made a correction impossible.
+        //
+        // Written AFTER the rating, not before: applyMatch can throw, and a row claiming
+        // `rated = 1` with no ratings behind it is exactly the inconsistency the correction
+        // path goes to some length to avoid creating.
+        await ctx.db.prepare(
+            `UPDATE matches SET unrated_reason = ?, rated = ? WHERE id = ?`,
+        ).bind(unratedReason, unratedReason === null ? 1 : 0, matchId).run();
+
         const updates = [];
         for (const p of body.participants) {
             const d = diff.get(p.user_id);
@@ -348,6 +564,20 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
             } catch (err) {
                 req.log.info({ match_id: matchId, err: String(err) },
                     'confirmations could not be tied');
+            }
+
+            // The guest routinely leaves before the host, so their reading is often already
+            // waiting here when the report lands. If this match went down undecided and one
+            // of them can decide it, do it now rather than leaving it unrated forever.
+            //
+            // The response has already been built from `diff`, so a correction made here is
+            // NOT in it — which is correct: the host's own card shows what their report said,
+            // and the announcement inside handles telling both players about the change.
+            try {
+                await maybeUpgradeFromConfirmation(ctx, req.log, body.lobby_id, matchId);
+            } catch (err) {
+                req.log.info({ match_id: matchId, err: String(err) },
+                    'late reading could not be applied');
             }
 
             await ctx.db.prepare(
@@ -456,6 +686,16 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
             } catch (err) {
                 req.log.info({ lobby_id: body.lobby_id, err: String(err) },
                     'confirmations could not be tied');
+            }
+
+            // The other direction: the report is already in, and THIS reading may be the one
+            // that can decide it. Same guard, same rule — the row is only eligible while it
+            // says 'no_decided_result', so this can never overturn a decided match.
+            try {
+                await maybeUpgradeFromConfirmation(ctx, req.log, body.lobby_id, match.id);
+            } catch (err) {
+                req.log.info({ lobby_id: body.lobby_id, err: String(err) },
+                    'late reading could not be applied');
             }
         }
 

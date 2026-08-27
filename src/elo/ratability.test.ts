@@ -13,7 +13,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ratabilityReason, timingIsPlausible, isDecided, compareReadings,
-         MIN_DURATION_SECONDS } from './ratability';
+         canUpgradeFromConfirmation, MIN_DURATION_SECONDS } from './ratability';
 
 const RANKED = ['wol'];
 
@@ -152,4 +152,110 @@ test('an unread recording is inconclusive, NOT a disagreement', () => {
     assert.equal(compareReadings(1, 0.5), 'inconclusive');
     assert.equal(compareReadings(0.5, 0), 'inconclusive');
     assert.equal(compareReadings(0.5, 0.5), 'inconclusive');
+});
+
+// ---------------------------------------------------------------------------
+// Deciding a match after it was stored
+// ---------------------------------------------------------------------------
+//
+// The REFUSALS are the point here even more than above, because one of them is the
+// only thing standing between "the other player can rescue a match nobody could read"
+// and "anyone can claim points from a player who reported honestly". The server never
+// reads the recording — `result` is a number the client sends — so there is no
+// verification to fall back on if this rule is wrong.
+
+/** A late reading that SHOULD be accepted: the confirmer conceding their own defeat. */
+function upgrade(over: Partial<Parameters<typeof canUpgradeFromConfirmation>[0]> = {}) {
+    return {
+        storedReason: 'no_decided_result' as string | null,
+        storedSeed: null as number | null,
+        storedHostTime: null as number | null,
+        confirmResult: 0,
+        confirmSeed: 3524 as number | null,
+        confirmHostTime: 1507369 as number | null,
+        confirmerInRoster: true,
+        fingerprintAlreadyUsed: false,
+        ...over,
+    };
+}
+
+test('a player conceding their own defeat decides the match', () => {
+    // The real case: the host found no recording at all, so the row has no fingerprint,
+    // and the guest's own recording says he lost. Nobody lies to lose.
+    const d = canUpgradeFromConfirmation(upgrade());
+    assert.equal(d.ok, true);
+    // With nothing stored, the confirmer's fingerprint is adopted — which also gives the
+    // match the anti-duplicate protection a recording-less report could never have.
+    assert.equal(d.adoptFingerprint, true);
+});
+
+test('a claimed VICTORY is refused when nothing corroborates it', () => {
+    // THE anti-abuse test. If this ever goes green the wrong way, any player can take
+    // points from an opponent who reported honestly, and no verification exists to catch
+    // it. A win has to be backed by the fingerprint the reporter already stored.
+    const d = canUpgradeFromConfirmation(upgrade({ confirmResult: 1 }));
+    assert.equal(d.ok, false);
+});
+
+test('a claimed victory is accepted when the stored fingerprint matches', () => {
+    const d = canUpgradeFromConfirmation(upgrade({
+        confirmResult: 1,
+        storedSeed: 3524,
+        storedHostTime: 1507369,
+    }));
+    assert.equal(d.ok, true);
+    // Nothing to adopt: the row already had it.
+    assert.equal(d.adoptFingerprint, false);
+});
+
+test('two readings of DIFFERENT games never decide anything', () => {
+    // Both sides have a fingerprint and they disagree, so one of them is reading somebody
+    // else's recording. True even for a conceded defeat.
+    assert.equal(canUpgradeFromConfirmation(upgrade({
+        storedSeed: 111, storedHostTime: 222, confirmSeed: 333, confirmHostTime: 444,
+    })).ok, false);
+});
+
+test('a match that already scored can never be re-decided', () => {
+    // null means it was rated (or predates the column). Either way: not this rule's
+    // business, and re-deciding it would move rating points a second time.
+    assert.equal(canUpgradeFromConfirmation(upgrade({ storedReason: null })).ok, false);
+});
+
+test('a refusal for a reason no recording can change is left alone', () => {
+    // A team game stays a team game however well anyone read it; same for an unranked mod
+    // and a duplicate. Only "nobody won" is a question a recording can answer.
+    for (const reason of ['not_1v1', 'mod_not_ranked', 'duplicate_recording',
+                          'participants_not_in_lobby', 'implausible_timing', 'no_lobby']) {
+        assert.equal(canUpgradeFromConfirmation(upgrade({ storedReason: reason })).ok, false, reason);
+    }
+});
+
+test('a reading that names no winner decides nothing', () => {
+    assert.equal(canUpgradeFromConfirmation(upgrade({ confirmResult: 0.5 })).ok, false);
+});
+
+test('somebody outside the frozen roster cannot decide a match', () => {
+    // The same check the report itself passes: whoever decides a match has to have been in
+    // it when it started.
+    assert.equal(canUpgradeFromConfirmation(upgrade({ confirmerInRoster: false })).ok, false);
+});
+
+test('a recording that already decided another match cannot decide this one too', () => {
+    assert.equal(canUpgradeFromConfirmation(upgrade({ fingerprintAlreadyUsed: true })).ok, false);
+});
+
+test('every refusal names its cause', () => {
+    // A bare false is undiagnosable in a log, and this path runs where nobody is watching.
+    for (const bad of [
+        upgrade({ storedReason: null }),
+        upgrade({ confirmResult: 0.5 }),
+        upgrade({ confirmerInRoster: false }),
+        upgrade({ confirmResult: 1 }),
+        upgrade({ fingerprintAlreadyUsed: true }),
+    ]) {
+        const d = canUpgradeFromConfirmation(bad);
+        assert.equal(d.ok, false);
+        assert.ok(d.reason.length > 0);
+    }
 });

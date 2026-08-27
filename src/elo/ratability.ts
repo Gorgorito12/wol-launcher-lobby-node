@@ -163,3 +163,95 @@ export function ratabilityReason(input: RatabilityInput): UnratedReason | null {
 
     return null;
 }
+
+// ---------------------------------------------------------------------------
+// Deciding a match AFTER it was stored
+// ---------------------------------------------------------------------------
+
+/** What a late reading is allowed to do to a match that was stored without a result. */
+export interface UpgradeInput {
+    /** `matches.unrated_reason` as stored. Only one value is ever eligible. */
+    storedReason: string | null;
+    /** The match's recorded game fingerprint, or null when the reporter had no recording. */
+    storedSeed: number | null;
+    storedHostTime: number | null;
+    /** The late reader's own score for themselves: 0 lost, 1 won, 0.5 could not tell. */
+    confirmResult: number;
+    confirmSeed: number | null;
+    confirmHostTime: number | null;
+    /** Whether they are in the roster frozen when the match started. */
+    confirmerInRoster: boolean;
+    /** Whether this fingerprint is already claimed by some OTHER stored match. */
+    fingerprintAlreadyUsed: boolean;
+}
+
+export interface UpgradeDecision {
+    ok: boolean;
+    /** Always populated, so a refusal can be logged with its cause rather than as a bare false. */
+    reason: string;
+    /** Whether to copy the confirmer's fingerprint onto the match row. */
+    adoptFingerprint: boolean;
+}
+
+/**
+ * Whether one player's late reading of their own recording may DECIDE a match that was
+ * stored without a result.
+ *
+ * <p><b>Why this exists.</b> Only the host reports, and only the host's reading counted — so
+ * a match where the host's recording was unreadable stayed unrated forever even when the
+ * other player's recording named the winner perfectly. Both halves of a real reported
+ * incident had that exact shape: in one the host's recording had no outcome trailer, in the
+ * other the host found no recording at all, and in BOTH the other player was holding the
+ * answer. Reporting stays host-only (N reporters would insert N copies of one match); this
+ * is a correction to a row that already exists.</p>
+ *
+ * <p><b>The anti-abuse rule is rule 4, and it does the work of a verification the server
+ * cannot perform.</b> The server never reads the recording — `result` is a number the client
+ * sends, and `replay_sha256` / `game_seed` are anti-duplicate keys, not proof — so nothing
+ * here can tell a true reading from an invented one. What it CAN do is remove the reason to
+ * invent: <b>you may declare your own DEFEAT freely, and your own victory only when the
+ * fingerprint the reporter already stored backs you up.</b> A liar can then only give points
+ * away. That costs almost no coverage, because the player who can read the recording is
+ * usually the one who lost it — in both the incident's readable recordings the recorder and
+ * the loser were the same slot.</p>
+ */
+export function canUpgradeFromConfirmation(input: UpgradeInput): UpgradeDecision {
+    const no = (reason: string): UpgradeDecision => ({ ok: false, reason, adoptFingerprint: false });
+
+    // Only ever the "nobody won" case. A match refused for being a team game, an unranked
+    // mod or a duplicate is refused for a reason no recording can change, and one that was
+    // RATED must never be re-decided by anybody.
+    if (input.storedReason !== 'no_decided_result') return no(`stored reason is ${input.storedReason ?? 'none'}`);
+
+    if (!isDecided(input.confirmResult)) return no('the confirmation does not name a winner either');
+
+    // The same roster check the report itself passes. Whoever decides a match has to have
+    // been in it when it started.
+    if (!input.confirmerInRoster) return no('the confirmer was not in the roster at start');
+
+    const hasStoredFingerprint = input.storedSeed !== null && input.storedHostTime !== null;
+    const claimsVictory = input.confirmResult >= WIN_AT;
+
+    if (claimsVictory) {
+        // See the anti-abuse note above. A claimed win needs corroboration; a claimed loss
+        // never does, because nobody lies to lose.
+        if (!hasStoredFingerprint) return no('a claimed victory needs the reporter fingerprint to match, and none was stored');
+        if (input.confirmSeed !== input.storedSeed || input.confirmHostTime !== input.storedHostTime)
+            return no('a claimed victory does not match the stored fingerprint');
+    } else if (hasStoredFingerprint) {
+        // Even for a declared defeat: if BOTH sides have a fingerprint they must be the same
+        // game, or one of the two is reading somebody else's recording.
+        if (input.confirmSeed !== input.storedSeed || input.confirmHostTime !== input.storedHostTime)
+            return no('the two readings are of different games');
+    }
+
+    // Nothing stored, so the confirmer's fingerprint becomes the match's — which also gives
+    // it the anti-duplicate protection it never had, since a report with no recording sends
+    // these as null. Refused when some other match already claims it: one game, one row.
+    const adoptFingerprint =
+        !hasStoredFingerprint && input.confirmSeed !== null && input.confirmHostTime !== null;
+    if (adoptFingerprint && input.fingerprintAlreadyUsed)
+        return no('that recording has already decided another match');
+
+    return { ok: true, reason: claimsVictory ? 'own victory, fingerprint matches' : 'own defeat', adoptFingerprint };
+}
