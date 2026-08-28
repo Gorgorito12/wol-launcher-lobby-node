@@ -137,7 +137,7 @@ because the app never ran.** That has happened once, from a single stray newline
 inside a regex literal in `env.ts`.
 
 ```bash
-node scripts/syntax-check.mjs src
+node scripts/syntax-check.mjs src scripts
 ```
 
 It needs no dependencies. On a Windows machine with no Node installed, VS Code's
@@ -325,6 +325,92 @@ journalctl -u wol-lobby -f                       # tail logs
 sqlite3 /var/lib/wol-lobby/lobby.db 'SELECT COUNT(*) FROM users'
                                                   # peek into the data
 ```
+
+## Operator commands
+
+`scripts/admin.ts` is the tool for looking at and repairing rooms, matches, ratings and
+players. **Dry run by default** — it prints what it would do and writes nothing until
+`--apply`.
+
+```bash
+cd /opt/wol-lobby
+sudo -u wol-lobby ./node_modules/.bin/tsx scripts/admin.ts help
+```
+
+Run it as the **service user**, exactly like `reset-elo.ts`: as your own login user it can
+read neither the service's `.env` nor the database. (`npm run admin -- <command>` is the same
+thing, if you are already that user.)
+
+```
+status                                    rooms, today's matches, unrated breakdown
+rooms:list [--stale]                      open rooms; --stale flags the suspicious ones
+rooms:close <id>                          close it and release its members
+rooms:prune --older-than <6h>             the same, in bulk
+match:list [--unrated] [--since D] [--limit N]
+match:show <id>                           participants, verdict, confirmations, elo
+match:decide <id> --winner <player>       settle a stuck match, then replay the ladder
+match:void <id>                           stop it counting, then replay the ladder
+elo:recompute                             replay the ladder; run it alone to self-check
+player:show <player>                      rating, ban state, stale memberships
+player:history <player> [--limit N]
+player:reset <player>                     one player back to 1500
+player:ban <player> --reason "..."   |    player:unban <player>
+player:unstick <player>                   clear rows that bar them from every room
+```
+
+A player is matched by internal id, Discord username or display name; an ambiguous name
+prints the candidates and refuses rather than guessing.
+
+### What it cannot do
+
+The server holds live state **in memory**: attached sockets, the room registry, the
+global-chat ring and its mutes, and each room's Discord message. A script writes SQLite and
+nothing else. So `rooms:close` frees the row, the slot and the members, but it cannot hang up
+a socket that is still open or repaint the Discord embed — those wait for the sockets to drop
+or for a restart. The usual ghost (a room created and never connected to) has no sockets at
+all, and for that one the command is a complete fix.
+
+Purging a message from global chat is not possible from here either. It never was: the ring
+is memory-only, so a restart is still the only way.
+
+### The corrections, and why they are safe
+
+`applyMatch` has no inverse and nothing snapshots a player's prior rating, so "undo this
+match" cannot be subtracted. `match:decide` and `match:void` instead change the row and
+**replay the whole ladder** from match history, in report order. The result is the ladder as
+though the match had always read the way it now reads.
+
+That also repairs a corruption nothing else detects: if anything throws after `applyMatch`
+inside the late-reading path, the rollback there restores the match and participant rows but
+**not** `elo_ratings` — both players keep the points and the match becomes eligible to be
+rated again. A replay cannot express that state.
+
+**Check the tool before trusting it.** On untouched data a replay must reproduce the ratings
+already stored:
+
+```bash
+sudo -u wol-lobby ./node_modules/.bin/tsx scripts/admin.ts elo:recompute
+# → "(no rating moved)". Anything else means the replay is not faithful;
+#   stop and work out why before using match:decide or match:void.
+```
+
+The dry run of a rating command does the real work on a `VACUUM INTO` snapshot and prints the
+actual movement, so what you see is what `--apply` will do.
+
+There is also a harness, which needs the dev dependencies:
+
+```bash
+npx tsx scripts/test-admin.ts        # PASS/FAIL per property, exit 1 on failure
+```
+
+### Bans now bite immediately
+
+`users.is_banned` used to be read only at the OAuth callback, so a banned player kept using
+their existing 7-day JWT — creating rooms, chatting and reporting matches for up to a week.
+It is now checked on every authenticated request and on both WebSocket `hello` handlers
+(close code `4009`). Their currently-open sockets stay up until they drop; everything they
+try afterwards is refused.
+
 
 ## Matches decided by a late reading
 

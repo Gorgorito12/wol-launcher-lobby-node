@@ -1,6 +1,6 @@
 // Syntax-check every .ts in the backend WITHOUT installing anything.
 //
-// Run:  node scripts/syntax-check.mjs src
+// Run:  node scripts/syntax-check.mjs src scripts
 //
 // On a Windows box with no Node of its own, VS Code's Electron IS one:
 //   $env:ELECTRON_RUN_AS_NODE = "1"
@@ -25,24 +25,33 @@ import { join, relative } from 'node:path';
 import { stripTypeScriptTypes } from 'node:module';
 import { execFileSync } from 'node:child_process';
 
-const root = process.argv[2];
+// One or more roots. `scripts/` is checked too: admin.ts is the tool that moves ratings,
+// and a syntax error in it fails at the worst possible moment — halfway through an operator
+// repairing something.
+const roots = process.argv.slice(2);
+if (roots.length === 0) {
+    console.log('usage: node scripts/syntax-check.mjs <dir> [dir...]');
+    process.exit(2);
+}
 const tmp = join(process.env.TEMP || '/tmp', 'tscheck-out');
 rmSync(tmp, { recursive: true, force: true });
 mkdirSync(tmp, { recursive: true });
 
 const files = [];
-(function walk(dir) {
-    for (const name of readdirSync(dir)) {
-        if (name === 'node_modules' || name === '.git') continue;
-        const p = join(dir, name);
-        if (statSync(p).isDirectory()) walk(p);
-        else if (p.endsWith('.ts')) files.push(p);
-    }
-})(root);
+for (const root of roots) {
+    (function walk(dir) {
+        for (const name of readdirSync(dir)) {
+            if (name === 'node_modules' || name === '.git') continue;
+            const p = join(dir, name);
+            if (statSync(p).isDirectory()) walk(p);
+            else if (p.endsWith('.ts')) files.push(p);
+        }
+    })(root);
+}
 
 let bad = 0;
 for (const f of files) {
-    const rel = relative(root, f);
+    const rel = relative(process.cwd(), f);
     let js;
     try {
         js = stripTypeScriptTypes(readFileSync(f, 'utf8'), { mode: 'strip' });

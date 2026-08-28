@@ -1,6 +1,7 @@
 import type { WebSocket } from 'ws';
 import { randomUUID } from 'node:crypto';
 import { verifyJwt } from '../lib/jwt';
+import { isBanned } from '../middleware/auth';
 import { DEFAULT_RATING } from '../elo/glicko2';
 import type { AppContext } from '../context';
 
@@ -311,6 +312,14 @@ export class GlobalChatRoom {
         }
         const userId = payload.sub;
         const login = payload.du ?? '';
+
+        // A valid token is not the same as a welcome one: the JWT lives seven days and says
+        // nothing about a ban applied since it was issued.
+        if (await isBanned(ctx, userId)) {
+            this.sendError(ws, 'user_banned', 'This account is banned from multiplayer.');
+            ws.close(4009, 'banned');
+            return;
+        }
 
         // The JWT carries no avatar, so do ONE cheap indexed read here (per
         // connection, not per message) to show real Discord avatars in chat.

@@ -1,6 +1,7 @@
 import type { WebSocket } from 'ws';
 import { randomUUID } from 'node:crypto';
 import { verifyJwt } from '../lib/jwt';
+import { isBanned } from '../middleware/auth';
 import { notifyRoomChanged, finalizeRoom } from './discordAnnounce';
 import { DEFAULT_RATING, DEFAULT_RD } from '../elo/glicko2';
 import type { AppContext } from '../context';
@@ -286,6 +287,14 @@ class LobbyRoom {
         } else {
             this.sendError(ws, 'unauthenticated', 'hello frame needs join_token or token');
             ws.close(4001, 'unauthenticated');
+            return;
+        }
+
+        // Checked after BOTH branches above, because a join token is just as old a claim as
+        // a JWT — it was minted before the ban too.
+        if (await isBanned(ctx, userId)) {
+            this.sendError(ws, 'user_banned', 'This account is banned from multiplayer.');
+            ws.close(4009, 'banned');
             return;
         }
 
