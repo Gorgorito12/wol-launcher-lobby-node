@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { Errors } from '../lib/errors';
 import { shortId, sha256Hex, uuid } from '../lib/ids';
-import { requireAuth } from '../middleware/auth';
+import { requireAuth, requireLauncherVersion } from '../middleware/auth';
 import { ipRateLimit, userRateLimit, Limits } from '../middleware/rateLimit';
 import { announceLobbyCreated, finalizeRoom } from './discordAnnounce';
 import { DEFAULT_RATING } from '../elo/glicko2';
@@ -121,6 +121,8 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
     app.post('/lobbies', {
         preHandler: [
             requireAuth(),
+            // Entry only. See Config.minLauncherVersion for what is deliberately NOT gated.
+            requireLauncherVersion(ctx),
             ipRateLimit(ctx, Limits.LobbyCreateIp),
             userRateLimit(ctx, Limits.LobbyCreateUser),
         ],
@@ -300,6 +302,7 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
     app.post('/lobbies/:id/join', {
         preHandler: [
             requireAuth(),
+            requireLauncherVersion(ctx),
             ipRateLimit(ctx, Limits.LobbyJoinIp),
             userRateLimit(ctx, Limits.LobbyJoinUser),
         ],

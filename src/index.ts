@@ -1,4 +1,6 @@
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
+import { meetsMinimum } from './lib/launcherVersion.js';
+import { launcherVersionOf } from './middleware/auth.js';
 import cors from '@fastify/cors';
 import websocket from '@fastify/websocket';
 import { join } from 'node:path';
@@ -206,6 +208,14 @@ async function main(): Promise<void> {
 
         if (!lobby || lobby.status === 'closed') {
             try { socket.close(4404, 'lobby_not_found'); } catch { /* */ }
+            return;
+        }
+
+        // Refused here, before the room ever sees the socket, so LobbyRoom stays unaware of
+        // versions entirely. 4010 is the launcher's cue to say WHICH version is needed rather
+        // than reporting a nameless disconnect.
+        if (!meetsMinimum(launcherVersionOf(req), config.minLauncherVersion)) {
+            try { socket.close(4010, 'launcher_too_old'); } catch { /* */ }
             return;
         }
 

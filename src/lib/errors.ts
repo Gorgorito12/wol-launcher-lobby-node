@@ -67,6 +67,14 @@ export const Errors = {
         details,
     ),
     UserBanned:      () => new HttpError(403, 'user_banned',    'This account is banned from multiplayer.'),
+    // Carries the required version in the payload so the launcher can name it instead of
+    // telling somebody they are "too old" and leaving them to work out what to do.
+    LauncherTooOld:  (minVersion: string) => new HttpError(
+        426,
+        'launcher_too_old',
+        'This launcher is too old for multiplayer. Update it and try again.',
+        { min_version: minVersion },
+    ),
     Conflict:        (msg: string) => new HttpError(409, 'conflict', msg),
     Internal:        (msg = 'Unexpected server error.') =>
         new HttpError(500, 'internal', msg),

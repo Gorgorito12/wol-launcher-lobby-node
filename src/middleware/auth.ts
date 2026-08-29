@@ -1,6 +1,7 @@
 import type { FastifyReply, FastifyRequest, preHandlerHookHandler } from 'fastify';
 import { Errors } from '../lib/errors';
 import { verifyJwt } from '../lib/jwt';
+import { meetsMinimum } from '../lib/launcherVersion';
 import type { AppContext } from '../context';
 
 declare module 'fastify' {
@@ -11,6 +12,8 @@ declare module 'fastify' {
         authenticated?: boolean;
         /** Set by <c>readAuth</c> when the authenticated user is banned. */
         banned?: boolean;
+        /** The launcher build that sent this request, from X-Launcher-Version. */
+        launcherVersion?: string;
         /** Set by <c>safeRead</c> so the circuit breaker lets the request through in degraded mode. */
         safeRead?: boolean;
     }
@@ -22,9 +25,55 @@ declare module 'fastify' {
  * anonymous requests — that's the job of <c>requireAuth</c>. Mounted
  * globally so per-user rate limits can see the user id for any route.
  */
+/** Header the launcher reports its own build in, e.g. "v1.0.14". */
+export const LAUNCHER_VERSION_HEADER = 'x-launcher-version';
+
+/** Read it off a request, or "" when the client did not send one. */
+export function launcherVersionOf(req: { headers: Record<string, unknown> }): string {
+    const raw = req.headers[LAUNCHER_VERSION_HEADER];
+    const v = Array.isArray(raw) ? raw[0] : raw;
+    return typeof v === 'string' ? v.trim().slice(0, 32) : '';
+}
+
+/**
+ * Remember which launcher build each player is on, so an operator can see what setting a
+ * minimum would actually cost before setting it.
+ *
+ * <p>Kept honest about the write cost: the value changes only when somebody updates, so a
+ * per-process memo means one UPDATE per user per new version rather than one per request.
+ * Losing the memo on restart costs one extra write each; getting it wrong would cost a
+ * database write on every authenticated call.</p>
+ */
+const lastSeenVersion = new Map<string, string>();
+
+function rememberLauncherVersion(ctx: AppContext, userId: string, version: string): void {
+    if (!version || lastSeenVersion.get(userId) === version) return;
+    lastSeenVersion.set(userId, version);
+    void ctx.db.prepare(
+        `UPDATE users SET last_launcher_version = ? WHERE id = ?`,
+    ).bind(version, userId).run().catch(() => { /* best-effort telemetry, never a blocker */ });
+}
+
+/**
+ * Refuse multiplayer ENTRY to a launcher older than Config.minLauncherVersion.
+ *
+ * <p>Deliberately not applied to everything: match reports, history, stats and the global chat
+ * stay open. A client that already played should still be able to report it, and somebody being
+ * turned away should still be able to ask why.</p>
+ */
+export function requireLauncherVersion(ctx: AppContext): preHandlerHookHandler {
+    return async (req: FastifyRequest, _reply: FastifyReply): Promise<void> => {
+        const min = ctx.config.minLauncherVersion;
+        if (!min) return;                     // off by default
+        if (meetsMinimum(req.launcherVersion, min)) return;
+        throw Errors.LauncherTooOld(min);
+    };
+}
+
 export function readAuth(ctx: AppContext): preHandlerHookHandler {
     return async (req: FastifyRequest, _reply: FastifyReply): Promise<void> => {
         const cfg = ctx.config;
+        req.launcherVersion = launcherVersionOf(req as unknown as { headers: Record<string, unknown> });
         if (cfg.devAuthBypass) {
             const header = req.headers['x-dev-user'];
             const v = Array.isArray(header) ? header[0] : header;
@@ -48,6 +97,7 @@ export function readAuth(ctx: AppContext): preHandlerHookHandler {
             req.discordUsername = payload.du;
             req.authenticated = true;
             req.banned = await isBanned(ctx, payload.sub);
+            rememberLauncherVersion(ctx, payload.sub, req.launcherVersion ?? '');
         }
     };
 }

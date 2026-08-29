@@ -85,6 +85,22 @@ export interface Config {
     // opening phase of an AoE3 1v1. Policy, like rankedModIds — tune it with a
     // restart, not a deploy.
     competitiveAbandonSeconds: number;
+
+    /**
+     * The oldest launcher allowed into multiplayer, e.g. "v1.0.14". EMPTY (the
+     * default) means no requirement at all — the check is off.
+     *
+     * <p>Only entry is gated: creating a room, joining one, and the room socket.
+     * Reporting a match, the global chat, history and stats stay open, so a client
+     * that already played is never punished for it and nobody is cut off from
+     * asking for help.</p>
+     *
+     * <p><b>Never set this above a version that has actually shipped.</b> A client
+     * that reports no version at all fails the check by design — it can only be a
+     * build from before clients reported one — so setting a minimum before that
+     * release is out locks every player out at once. See DEPLOY.md.</p>
+     */
+    minLauncherVersion: string;
 }
 
 function intEnv(name: string, fallback: number): number {
@@ -208,6 +224,7 @@ export function loadConfig(): Config {
         rankedModIds: idListEnv('RANKED_MOD_IDS', ['wol']),
 
         competitiveAbandonSeconds: intEnv('COMPETITIVE_ABANDON_SECONDS', 300),
+        minLauncherVersion: strEnv('MIN_LAUNCHER_VERSION', ''),
     };
 
     // Hard fail on missing secrets — we don't want the service to start

@@ -343,6 +343,8 @@ thing, if you are already that user.)
 
 ```
 status                                    rooms, today's matches, unrated breakdown
+versions [<version>]                      launcher builds in use; with a version, what
+                                          requiring it would cost
 rooms:list [--stale]                      open rooms; --stale flags the suspicious ones
 rooms:close <id>                          close it and release its members
 rooms:prune --older-than <6h>             the same, in bulk
@@ -411,6 +413,53 @@ It is now checked on every authenticated request and on both WebSocket `hello` h
 (close code `4009`). Their currently-open sockets stay up until they drop; everything they
 try afterwards is refused.
 
+
+## Requiring a launcher update
+
+Sometimes a release has to be mandatory — a protocol change, a rating bug. `MIN_LAUNCHER_VERSION`
+turns away launchers older than it, **from multiplayer only**.
+
+```
+MIN_LAUNCHER_VERSION=v1.0.14      # empty (default) = no requirement, check is off
+```
+
+Then `systemctl restart wol-lobby`. No rebuild.
+
+**What is gated:** creating a room, joining one, and the room WebSocket (closed with `4010`).
+**What is not:** reporting a match, the global chat, history, stats. Somebody who already played
+can still report it, and somebody turned away can still ask why. Nothing outside multiplayer is
+touched — mods, updates and single-player keep working, so a player is never left with a
+launcher that does nothing.
+
+### Check the cost before you set it
+
+```bash
+sudo -u wol-lobby ./node_modules/.bin/tsx scripts/admin.ts versions
+sudo -u wol-lobby ./node_modules/.bin/tsx scripts/admin.ts versions v1.0.14
+#   → "Requiring v1.0.14 would block 12 of 40 player(s) from multiplayer."
+```
+
+The launcher reports its build in `X-Launcher-Version`, and it is remembered per user
+(`users.last_launcher_version`, migration `0009`), so this is who is really playing rather than
+who once registered.
+
+### The trap, and it is a bad one
+
+**A client that reports no version fails the check on purpose** — it can only be a build from
+before launchers reported one, which is exactly the population a minimum exists to exclude. So:
+
+> **Never set a minimum above a version that has actually shipped and spread.** Set it before the
+> first release that reports a version is out, and you lock out *everybody* at once. `versions`
+> shows those clients as `(not reported — an older build)`.
+
+Undoing it is one line and a restart, but the complaints arrive faster than you will read them.
+
+### Version ordering
+
+Tags carry a letter suffix: `1.0.5 < 1.0.5a < 1.0.5b < 1.0.6`. The comparison lives in
+`src/lib/launcherVersion.ts` and **mirrors the launcher's own `TryParseSemVer`** — the two answer
+the same question from opposite ends, and if they disagree a player is told they are up to date
+and refused entry in the same breath. `npm test` pins the ordering.
 
 ## Competitive rooms, and the ladder gate
 

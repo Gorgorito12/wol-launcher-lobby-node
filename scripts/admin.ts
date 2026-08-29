@@ -30,6 +30,7 @@
  * sockets at all, and for that one this is a complete fix.</p>
  */
 import 'dotenv/config';
+import { meetsMinimum } from '../src/lib/launcherVersion.js';
 import { rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -357,6 +358,58 @@ async function withRatingChange(
 }
 
 // ---------------------------------------------------------------- commands
+
+/**
+ * Which launcher builds are out there, and what a minimum would cost.
+ *
+ * <p><b>The reason this exists.</b> `MIN_LAUNCHER_VERSION` locks people out of multiplayer, and
+ * without this the only way to learn how many is to set it and wait for complaints. The column
+ * is written whenever somebody makes an authenticated request, so this is a real picture of who
+ * is actually playing rather than of who once registered.</p>
+ *
+ * <p>Players with no recorded version are counted separately and shown as WOULD BE BLOCKED,
+ * because that is exactly how the check treats them: a client that reports nothing can only be a
+ * build from before clients reported one.</p>
+ */
+async function cmdVersions(db: Db): Promise<void> {
+    const min = positionals()[0] ?? '';
+
+    const rows = await db.prepare(
+        `SELECT COALESCE(u.last_launcher_version, '') AS version, COUNT(*) AS n
+           FROM users u
+          WHERE EXISTS (SELECT 1 FROM elo_ratings e WHERE e.user_id = u.id)
+             OR u.last_launcher_version IS NOT NULL
+          GROUP BY version
+          ORDER BY n DESC`,
+    ).bind().all<{ version: string; n: number }>();
+
+    const list = rows.results ?? [];
+    if (list.length === 0) { console.log('No players seen yet.'); return; }
+
+    const total = list.reduce((a, r) => a + r.n, 0);
+    console.log(`Launcher versions in use (${total} player(s) seen)`);
+    for (const r of list) {
+        const label = r.version || '(not reported — an older build)';
+        console.log(`  ${pad(label, 34)} ${r.n}`);
+    }
+
+    if (!min) {
+        console.log('');
+        console.log('Pass a version to see what requiring it would cost, e.g.:');
+        console.log('  admin.ts versions v1.0.14');
+        return;
+    }
+
+    let blocked = 0;
+    for (const r of list) if (!meetsMinimum(r.version, min)) blocked += r.n;
+
+    console.log('');
+    console.log(`Requiring ${min} would block ${blocked} of ${total} player(s) from multiplayer.`);
+    if (blocked > 0) {
+        console.log('They keep single-player, mods and match reporting; only entering a room is refused.');
+    }
+    console.log('Set it with MIN_LAUNCHER_VERSION in /opt/wol-lobby/.env, then restart the service.');
+}
 
 async function cmdStatus(db: Db): Promise<void> {
     const rooms = await db.prepare(
@@ -856,6 +909,7 @@ const KNOWN = new Set([
     'match:list', 'match:show', 'match:decide', 'match:void',
     'elo:recompute',
     'player:show', 'player:history', 'player:reset',
+    'versions',
     'player:ban', 'player:unban', 'player:unstick',
 ]);
 
@@ -892,6 +946,7 @@ async function main(): Promise<void> {
             case 'player:ban': return await cmdPlayerBan(db, true);
             case 'player:unban': return await cmdPlayerBan(db, false);
             case 'player:unstick': return await cmdPlayerUnstick(db);
+            case 'versions': return await cmdVersions(db);
         }
     } finally {
         db.close();
