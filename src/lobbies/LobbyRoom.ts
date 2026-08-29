@@ -322,6 +322,14 @@ class LobbyRoom {
             ws.close(4004, 'not_in_lobby');
             return;
         }
+        // They are back, so whatever we noted when their socket died is void. Fire and
+        // forget: the room must not wait on it, and a failure only leaves a stale row that
+        // decideByAbandon would weigh against them — which is why the write is also
+        // narrowly scoped in the first place.
+        void ctx.db.prepare(
+            `DELETE FROM lobby_abandons WHERE lobby_id = ? AND user_id = ?`,
+        ).bind(this.lobbyId, userId).run().catch(() => { /* best-effort */ });
+
         const avatarUrl = member.avatar_url ?? undefined;
         // No row means unrated, and unrated IS the starting rating — see the note on
         // Member.rating. One place covers both frames below, since room_state sends
@@ -709,6 +717,21 @@ class LobbyRoom {
                         SELECT COUNT(*) FROM lobby_members WHERE lobby_id = ?
                      ) WHERE id = ?`,
                 ).bind(this.lobbyId, this.lobbyId),
+                // Note that somebody's connection died while a COMPETITIVE match was
+                // running. On its own the row decides nothing — decideByAbandon still has
+                // to find it old enough, and only ever for a match no recording could
+                // settle. This is simply the one moment the fact is observable, and the
+                // server is the only witness.
+                //
+                // Both conditions are in the SELECT rather than read into memory first:
+                // one statement, no extra round trip on a hot path, and it asks the
+                // authoritative row instead of this object's in-memory startedAtMs, which
+                // a server restart would have cleared while the game carried on.
+                ctx.db.prepare(
+                    `INSERT OR IGNORE INTO lobby_abandons (lobby_id, user_id)
+                     SELECT ?, ? FROM lobbies
+                      WHERE id = ? AND status = 'in_game' AND competitive = 1`,
+                ).bind(this.lobbyId, userId, this.lobbyId),
             ]);
         } catch {
             // Best-effort: a transient DB hiccup mustn't crash the close handler.

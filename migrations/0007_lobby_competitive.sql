@@ -1,0 +1,16 @@
+-- Whether a room was created as COMPETITIVE, and therefore whether its match may score.
+--
+-- Until now every 1v1 on a ranked mod moved the ladder, and nothing in the room said so:
+-- a practice game cost real rating, and the host had no way to declare that one was
+-- serious. This column is that declaration, and it is what authorises the launcher to be
+-- strict (confirm Record Game, hold the room open until the result is in) and the server
+-- to punish an abandonment.
+--
+-- It lives on the LOBBY, not on the match, for two reasons. The client must never be able
+-- to claim a match was competitive — POST /matches already reads this row to validate the
+-- reporter, so reading one more column costs nothing and keeps the claim on our side of
+-- the wire. And it must be decided BEFORE the game, or a host could create a casual room,
+-- play, and mark it competitive only after seeing that he won.
+--
+-- Existing rooms get 0, which is right: nobody agreed to anything when they were created.
+ALTER TABLE lobbies ADD COLUMN competitive INTEGER NOT NULL DEFAULT 0;

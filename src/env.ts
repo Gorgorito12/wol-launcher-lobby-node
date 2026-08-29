@@ -74,6 +74,17 @@ export interface Config {
     // mod with a real ladder. Widening it needs no code change and no deploy of a
     // new build, only a restart.
     rankedModIds: string[];
+
+    // How long a competitive game must have been running before walking out of it
+    // counts as a forfeit. Below this, a player who leaves has almost certainly hit
+    // the wrong settings rather than dodged a loss, and the ladder should not care.
+    //
+    // The floor is not arbitrary: ratability already refuses to score anything under
+    // MIN_DURATION_SECONDS (180), so a shorter abandonment could not produce a rated
+    // match anyway. 300 leaves two minutes of margin above that and is still the
+    // opening phase of an AoE3 1v1. Policy, like rankedModIds — tune it with a
+    // restart, not a deploy.
+    competitiveAbandonSeconds: number;
 }
 
 function intEnv(name: string, fallback: number): number {
@@ -195,6 +206,8 @@ export function loadConfig(): Config {
         discordPlayersRoleIds: roleIdListEnv('DISCORD_PLAYERS_ROLE_ID', ['1088344884882194563']),
 
         rankedModIds: idListEnv('RANKED_MOD_IDS', ['wol']),
+
+        competitiveAbandonSeconds: intEnv('COMPETITIVE_ABANDON_SECONDS', 300),
     };
 
     // Hard fail on missing secrets — we don't want the service to start

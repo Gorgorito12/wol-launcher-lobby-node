@@ -236,6 +236,7 @@ export class GlobalChatRoom {
         hostUserId: string;
         hostName: string;
         hostAvatar: string | null;
+        competitive: boolean;
     }): void {
         try {
             this.broadcast(
@@ -246,6 +247,7 @@ export class GlobalChatRoom {
                         title: lobby.title,
                         modId: lobby.modId,
                         maxPlayers: lobby.maxPlayers,
+                        competitive: lobby.competitive,
                         host: { userId: lobby.hostUserId, login: lobby.hostName, avatarUrl: lobby.hostAvatar },
                     },
                 },

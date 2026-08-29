@@ -19,6 +19,7 @@ interface LobbyRow {
     password_hash: string | null;
     status: 'open' | 'locked' | 'in_game' | 'closed';
     created_at: string;
+    competitive: number;
 }
 
 interface CreateLobbyBody {
@@ -27,6 +28,8 @@ interface CreateLobbyBody {
     mod_combined_hash: string;
     max_players?: number;
     password?: string;
+    /** Whether the host is putting rating on this match. Clamped below — see the insert. */
+    competitive?: boolean;
 }
 
 interface JoinLobbyBody {
@@ -47,7 +50,7 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
     }, async (_req, reply) => {
         const rows = await ctx.db.prepare(
             `SELECT l.id, l.host_user_id, l.title, l.mod_id, l.mod_combined_hash,
-                    l.max_players, l.current_players, l.is_private, l.status,
+                    l.max_players, l.current_players, l.is_private, l.status, l.competitive,
                     l.created_at, u.discord_username AS host_login, u.display_name AS host_name,
                     u.avatar_url AS host_avatar, e.rating AS host_rating
              FROM lobbies l
@@ -70,6 +73,7 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
             current_players: number;
             is_private: number;
             status: 'open' | 'locked' | 'in_game';
+            competitive: number;
             created_at: string;
             host_login: string;
             host_name: string;
@@ -88,6 +92,9 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
                 current_players: r.current_players,
                 is_private: r.is_private === 1,
                 status: r.status,
+                // Before joining, not after: this is what tells a player their rating is
+                // on the line and that leaving the room will not be free.
+                competitive: r.competitive === 1,
                 created_at: r.created_at,
                 host: {
                     id: r.host_user_id,
@@ -160,6 +167,16 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
             throw Errors.Conflict('Server full — max concurrent lobbies reached.');
         }
 
+        // Competitive is a PROMISE — only this room's matches score, and the launcher
+        // holds the player to it (confirming Record Game, refusing to let the host leave
+        // before the result is in). A mod with no ladder cannot keep that promise, so the
+        // room is created casual instead of failing. The 201 echoes the EFFECTIVE value,
+        // which is how the launcher explains the downgrade without holding a copy of the
+        // ranked-mod list — that policy lives here and nowhere else.
+        const askedCompetitive = body.competitive === true;
+        const modKey = body.mod_id.trim().toLowerCase();
+        const competitive = askedCompetitive && cfg.rankedModIds.some((m) => m === modKey) ? 1 : 0;
+
         const lobbyId = shortId(8);
         const passwordHash = body.password ? await sha256Hex(body.password) : null;
         const isPrivate = passwordHash ? 1 : 0;
@@ -167,11 +184,12 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
         await ctx.db.batch([
             ctx.db.prepare(
                 `INSERT INTO lobbies (id, host_user_id, title, mod_id, mod_combined_hash,
-                                      max_players, current_players, is_private, password_hash, status)
-                 VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, 'open')`,
+                                      max_players, current_players, is_private, password_hash,
+                                      status, competitive)
+                 VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, 'open', ?)`,
             ).bind(
                 lobbyId, userId, title, body.mod_id, body.mod_combined_hash,
-                maxPlayers, isPrivate, passwordHash,
+                maxPlayers, isPrivate, passwordHash, competitive,
             ),
             ctx.db.prepare(
                 `INSERT INTO lobby_members (lobby_id, user_id, role) VALUES (?, ?, 'player')`,
@@ -205,6 +223,7 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
             ctx.globalChat.announceLobbyCreated({
                 id: lobbyId, title, modId: body.mod_id, maxPlayers,
                 hostUserId: userId, hostName, hostAvatar,
+                competitive: competitive === 1,
             });
 
             // Discord webhook (only when configured).
@@ -212,6 +231,7 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
                 void announceLobbyCreated({
                     id: lobbyId, title, modId: body.mod_id, maxPlayers,
                     isPrivate: false, hostName, hostAvatar,
+                    competitive: competitive === 1,
                 });
             }
         }
@@ -225,6 +245,7 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
             current_players: 1,
             is_private: isPrivate === 1,
             status: 'open',
+            competitive: competitive === 1,
         });
     });
 
@@ -262,6 +283,7 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
             current_players: lobby.current_players,
             is_private: lobby.is_private === 1,
             status: lobby.status,
+            competitive: lobby.competitive === 1,
             host_user_id: lobby.host_user_id,
             members: (members.results ?? []).map((m) => ({
                 id: m.user_id,

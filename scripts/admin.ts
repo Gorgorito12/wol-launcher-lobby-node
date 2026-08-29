@@ -406,11 +406,12 @@ interface LobbyRow {
     host: string | null;
     members: number;
     age_min: number;
+    competitive: number;
 }
 
 async function selectLobbies(db: Db, where: string, params: unknown[]): Promise<LobbyRow[]> {
     const rows = await db.prepare(
-        `SELECT l.id, l.host_user_id, l.title, l.status, l.created_at,
+        `SELECT l.id, l.host_user_id, l.title, l.status, l.created_at, l.competitive,
                 u.display_name AS host,
                 (SELECT COUNT(*) FROM lobby_members m WHERE m.lobby_id = l.id) AS members,
                 CAST((julianday('now') - julianday(l.created_at)) * 1440 AS INTEGER) AS age_min
@@ -435,11 +436,12 @@ async function cmdRoomsList(db: Db): Promise<void> {
 
     console.log(`${shown.length} room(s)${onlyStale ? ' flagged stale' : ' open'}.`);
     if (shown.length === 0) return;
-    console.log(`  ${pad('ID', 10)} ${pad('STATUS', 9)} ${pad('HOST', 20)} ${pad('AGE', 8)} ${pad('MEM', 4)} TITLE`);
+    console.log(`  ${pad('ID', 10)} ${pad('STATUS', 9)} ${pad('MODE', 5)} ${pad('HOST', 20)} ${pad('AGE', 8)} ${pad('MEM', 4)} TITLE`);
     for (const r of shown) {
         const age = r.age_min >= 60 ? `${Math.floor(r.age_min / 60)}h${r.age_min % 60}m` : `${r.age_min}m`;
         console.log(
-            `  ${pad(r.id, 10)} ${pad(r.status, 9)} ${pad(r.host ?? r.host_user_id, 20)}` +
+            `  ${pad(r.id, 10)} ${pad(r.status, 9)} ${pad(r.competitive === 1 ? 'COMP' : '-', 5)}` +
+            ` ${pad(r.host ?? r.host_user_id, 20)}` +
             ` ${pad(age, 8)} ${pad(r.members, 4)} ${r.title ?? ''}${isStale(r) ? '   <- stale' : ''}`,
         );
     }
@@ -536,6 +538,31 @@ async function cmdMatchShow(db: Db): Promise<void> {
     console.log(`  reported   ${m.created_at}      lobby ${m.lobby_id ?? '-'}`);
     console.log(`  rated      ${m.rated === 1 ? 'yes' : m.rated === 0 ? 'no' : 'unknown (pre-migration)'}`);
     console.log(`  reason     ${m.unrated_reason ?? '-'}        decided_by ${m.decided_by ?? '-'}`);
+    if (m.decided_by === 'abandon') {
+        console.log('             ^ decided because one player walked out, not by the recording.');
+    }
+
+    // The first question anyone asks about a match that did not score. Reading it from the
+    // room rather than the match row on purpose: the match never carried the flag, and the
+    // room is where the decision was actually made.
+    if (m.lobby_id) {
+        const room = await db.prepare(
+            `SELECT competitive, started_at FROM lobbies WHERE id = ?`,
+        ).bind(m.lobby_id).first<{ competitive: number; started_at: string | null }>();
+        if (room) {
+            console.log(`  room mode  ${room.competitive === 1 ? 'COMPETITIVE' : 'casual (never scores)'}`);
+        }
+        const abandons = await db.prepare(
+            `SELECT a.user_id, a.disconnected_at, u.display_name
+               FROM lobby_abandons a LEFT JOIN users u ON u.id = a.user_id
+              WHERE a.lobby_id = ?`,
+        ).bind(m.lobby_id).all<{
+            user_id: string; disconnected_at: string; display_name: string | null;
+        }>();
+        for (const a of abandons.results ?? []) {
+            console.log(`  walked out ${pad(a.display_name ?? a.user_id, 22)} at ${a.disconnected_at}`);
+        }
+    }
     console.log(`  seed       ${m.game_seed ?? '-'}   hostTime ${m.game_host_time ?? '-'}`);
     console.log(`  replay     ${m.replay_sha256 ?? '-'}`);
 

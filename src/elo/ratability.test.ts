@@ -17,7 +17,7 @@ import { ratabilityReason, timingIsPlausible, isDecided, compareReadings,
 
 const RANKED = ['wol'];
 
-/** A clean, ranked, decided 1v1 — the only shape that scores. */
+/** A clean, ranked, decided, COMPETITIVE 1v1 — the only shape that scores. */
 function ok(over: Partial<Parameters<typeof ratabilityReason>[0]> = {}) {
     const startedAt = '2026-08-24T18:00:00Z';
     return {
@@ -25,6 +25,7 @@ function ok(over: Partial<Parameters<typeof ratabilityReason>[0]> = {}) {
         rankedModIds: RANKED,
         participants: [{ result: 1 }, { result: 0 }],
         hasLobby: true,
+        roomIsCompetitive: true,
         allParticipantsInLobby: true,
         startedAt,
         endedAt: '2026-08-24T18:20:00Z',
@@ -44,6 +45,27 @@ test('a mod with no ladder never scores', () => {
 
 test('the mod id is matched case-insensitively', () => {
     assert.equal(ratabilityReason(ok({ modId: 'WoL' })), null);
+});
+
+test('a room that was not created competitive never scores', () => {
+    assert.equal(ratabilityReason(ok({ roomIsCompetitive: false })), 'not_competitive');
+});
+
+// THE ONE THAT MATTERS. `null` means there was no room to ask, which is a different and
+// more useful complaint than "it was not competitive" — and answering `not_competitive`
+// there would also be a lie. Only an explicit false refuses.
+test('a report with no room still says so, rather than blaming competitiveness', () => {
+    assert.equal(
+        ratabilityReason(ok({ roomIsCompetitive: null, hasLobby: false })),
+        'no_lobby',
+    );
+});
+
+test('an unranked mod outranks competitiveness — it is what you would have to change first', () => {
+    assert.equal(
+        ratabilityReason(ok({ modId: 'improvement-mod', roomIsCompetitive: false })),
+        'mod_not_ranked',
+    );
 });
 
 test('a team game never scores, however decided it looks', () => {

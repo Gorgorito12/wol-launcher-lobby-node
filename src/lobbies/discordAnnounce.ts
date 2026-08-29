@@ -1,4 +1,5 @@
 import { fetch } from 'undici';
+import { normaliseSqliteTimestamp } from '../lib/time';
 import type { FastifyBaseLogger } from 'fastify';
 import type { Config } from '../env';
 import type { Db } from '../db';
@@ -123,6 +124,13 @@ interface RoomAnnounceState {
     hostAvatar: string | null;
     players: number;
     status: RoomStatus;
+    /**
+     * Whether this room puts rating on the line. Fixed at creation and never changes,
+     * so it is deliberately NOT part of renderKey — but it IS read back in rehydrate,
+     * because a state rebuilt after a restart without it would silently drop the badge
+     * from the embed on the very next edit.
+     */
+    competitive: boolean;
     createdAt: string;
     targets: Target[];
     /** players+status of the last render, to skip no-op edits. */
@@ -186,6 +194,7 @@ export interface NewRoom {
     isPrivate: boolean;
     hostName: string;
     hostAvatar?: string | null;
+    competitive?: boolean;
 }
 
 /**
@@ -206,6 +215,7 @@ export async function announceLobbyCreated(room: NewRoom): Promise<void> {
         hostAvatar: room.hostAvatar ?? null,
         players: 1,
         status: 'open',
+        competitive: room.competitive === true,
         createdAt: new Date().toISOString(),
         targets: [],
         lastKey: '',
@@ -299,7 +309,7 @@ async function rehydrate(lobbyId: string): Promise<RoomAnnounceState | null> {
     try {
         const row = await database.prepare(
             `SELECT l.id, l.title, l.mod_id, l.max_players, l.current_players, l.status,
-                    l.created_at, l.discord_targets,
+                    l.competitive, l.created_at, l.discord_targets,
                     u.display_name, u.discord_username, u.avatar_url
              FROM lobbies l JOIN users u ON u.id = l.host_user_id
              WHERE l.id = ?`,
@@ -310,6 +320,7 @@ async function rehydrate(lobbyId: string): Promise<RoomAnnounceState | null> {
             max_players: number;
             current_players: number;
             status: string;
+            competitive: number;
             created_at: string;
             discord_targets: string | null;
             display_name: string | null;
@@ -343,6 +354,7 @@ async function rehydrate(lobbyId: string): Promise<RoomAnnounceState | null> {
             status: (row.status === 'in_game' ? 'in_game'
                 : row.status === 'closed' ? 'closed'
                     : 'open') as RoomStatus,
+            competitive: row.competitive === 1,
             createdAt,
             targets,
             lastKey: '',
@@ -354,17 +366,6 @@ async function rehydrate(lobbyId: string): Promise<RoomAnnounceState | null> {
         log?.warn({ err, lobbyId }, 'Discord announce rehydrate failed');
         return null;
     }
-}
-
-/**
- * SQLite's datetime('now') yields 'YYYY-MM-DD HH:MM:SS' in UTC with no zone
- * marker, which Date.parse reads as LOCAL time. Convert to ISO-8601 UTC. An
- * already-ISO value (what announceLobbyCreated stores in memory) passes through.
- */
-function normaliseSqliteTimestamp(ts: string): string {
-    if (!ts) return new Date().toISOString();
-    if (ts.includes('T')) return ts;
-    return `${ts.replace(' ', 'T')}Z`;
 }
 
 /**
@@ -573,6 +574,11 @@ function buildEmbed(state: RoomAnnounceState): Record<string, unknown> {
             { name: 'Players', value: `${state.players} / ${state.maxPlayers}`, inline: true },
             { name: 'Status', value: `${meta.dot} ${meta.label}`, inline: true },
             uptimeField,
+            // Only for a competitive room, so a casual one's embed is byte-for-byte
+            // what it has always been. It is the reason to click: this one moves rating.
+            ...(state.competitive
+                ? [{ name: 'Mode', value: '⚔️ Ranked match', inline: true }]
+                : []),
         ],
         thumbnail: { url: `${MOD_ICON_BASE}/${encodeURIComponent(state.modId)}/icon.png` },
         footer: {

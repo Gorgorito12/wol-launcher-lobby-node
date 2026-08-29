@@ -412,6 +412,63 @@ It is now checked on every authenticated request and on both WebSocket `hello` h
 try afterwards is refused.
 
 
+## Competitive rooms, and the ladder gate
+
+A room is created **competitive** or it is not, and only a competitive room's match can score.
+The flag lives on `lobbies.competitive` (migration `0007`), is set once at creation and never
+again, and the launcher only ever *asks* for it: `POST /lobbies` refuses `competitive: true` for
+a mod outside `RANKED_MOD_IDS` and creates a casual room instead, echoing what it actually made
+on the 201. That echo is what lets the launcher explain the downgrade without holding its own
+copy of the ranked-mod list.
+
+Everything else follows from the flag: the launcher confirms Record Game before every
+competitive start, holds the host in the room until the result is sent, and looks harder for the
+recording afterwards. `ratabilityReason` answers `not_competitive` for the rest.
+
+**The first thing to check when someone says their match did not count:**
+
+```bash
+sudo -u wol-lobby ./node_modules/.bin/tsx scripts/admin.ts match:show <matchId>
+#   room mode  casual (never scores)      <- there is your answer
+```
+
+### Walking out counts as a loss
+
+After `COMPETITIVE_ABANDON_SECONDS` (default **300**), a player whose connection dies and does
+not come back forfeits a competitive match the recording could not settle. This is the only rule
+here that moves rating from an *absence* of evidence, so it is fenced in hard — the decision is
+the pure `src/elo/abandon.ts` and its refusals are what the tests pin:
+
+- competitive rooms only, and only when ratability said `no_decided_result` — **a recording that
+  names a winner always wins**;
+- exactly two players, and exactly one of them gone (both gone is a draw: the usual cause is the
+  host's connection dying and taking the room with it);
+- the walkout must be at least **90 s** old — closing the launcher the moment a match ends is
+  normal and drops the socket exactly like a rage-quit does;
+- the report must have carried a recording, or farming is "open a room, wait, alt-F4, repeat";
+- at most **one per pair of players per 24 h**.
+
+Such a match is stored with `decided_by = 'abandon'`, which `match:show` prints along with the
+room's mode and any walkouts.
+
+**If it ever gets one wrong** — a power cut is indistinguishable from a dodge, and always will
+be — that is what the corrections are for:
+
+```bash
+sudo -u wol-lobby ./node_modules/.bin/tsx scripts/admin.ts match:void <matchId>          # dry run
+sudo -u wol-lobby ./node_modules/.bin/tsx scripts/admin.ts match:void <matchId> --apply
+```
+
+### Tuning it
+
+```
+COMPETITIVE_ABANDON_SECONDS=300     # how long a game must run before walking out forfeits
+RANKED_MOD_IDS=wol                  # which mods have a ladder at all
+```
+
+Both are policy, not capability: change either in `/opt/wol-lobby/.env` and
+`systemctl restart wol-lobby`. No rebuild.
+
 ## Matches decided by a late reading
 
 Since the correction path landed, a match stored with no result can be decided

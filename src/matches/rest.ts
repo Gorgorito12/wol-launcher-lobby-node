@@ -7,6 +7,8 @@ import { applyMatch, DEFAULT_RATING, DEFAULT_RD, DEFAULT_VOLATILITY,
          type ParticipantOutcome } from '../elo/glicko2';
 import { ratabilityReason, compareReadings, canUpgradeFromConfirmation, WIN_AT,
          type UnratedReason } from '../elo/ratability';
+import { decideByAbandon, PAIR_COOLDOWN_MS } from '../elo/abandon';
+import { sqliteTimestampToMs } from '../lib/time';
 import { finalizeRoom } from '../lobbies/discordAnnounce';
 import type { AppContext } from '../context';
 
@@ -358,6 +360,56 @@ function normaliseSha256(value: string | undefined): string | null {
     return /^[0-9a-f]{64}$/.test(v) ? v : null;
 }
 
+/**
+ * The I/O half of the abandonment rule; the decision itself is the pure
+ * <c>decideByAbandon</c>. Never throws — a match must not fail to report because this
+ * could not be answered.
+ */
+async function abandonVerdict(
+    ctx: AppContext,
+    lobbyId: string,
+    participantIds: string[],
+    roomStartedAtMs: number | null,
+    reportHasRecording: boolean,
+): Promise<ReturnType<typeof decideByAbandon>> {
+    const rows = await ctx.db.prepare(
+        `SELECT user_id, disconnected_at FROM lobby_abandons WHERE lobby_id = ?`,
+    ).bind(lobbyId).all<{ user_id: string; disconnected_at: string }>();
+
+    const abandons: Array<{ userId: string; disconnectedAtMs: number }> = [];
+    for (const r of rows.results ?? []) {
+        const ms = sqliteTimestampToMs(r.disconnected_at);
+        if (ms !== null) abandons.push({ userId: r.user_id, disconnectedAtMs: ms });
+    }
+
+    // The widest anti-farm brake: real disconnections are rare and scattered, farming is
+    // the same two accounts over and over. Derived from the constant rather than written
+    // as SQLite's '-1 day' so there is one number, not two that can drift.
+    let pairDecidedRecently = false;
+    if (participantIds.length === 2) {
+        const since = new Date(Date.now() - PAIR_COOLDOWN_MS)
+            .toISOString().replace('T', ' ').slice(0, 19);
+        const seen = await ctx.db.prepare(
+            `SELECT 1 FROM matches m
+               JOIN match_participants a ON a.match_id = m.id AND a.user_id = ?
+               JOIN match_participants b ON b.match_id = m.id AND b.user_id = ?
+              WHERE m.decided_by = 'abandon' AND m.created_at >= ?
+              LIMIT 1`,
+        ).bind(participantIds[0], participantIds[1], since).first();
+        pairDecidedRecently = !!seen;
+    }
+
+    return decideByAbandon({
+        participantIds,
+        abandons,
+        startedAtMs: roomStartedAtMs,
+        nowMs: Date.now(),
+        abandonAfterSeconds: ctx.config.competitiveAbandonSeconds,
+        reportHasRecording,
+        pairDecidedRecently,
+    });
+}
+
 export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void {
     // POST /matches — host reports a finished game.
     app.post('/matches', {
@@ -377,13 +429,29 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
         }
 
         let rosterAtStart: string | null = null;
+        // Read from the ROOM, never from the report: a client must not be able to promote
+        // its own match into the ladder, and this row is already being fetched to validate
+        // the reporter. Null when there was no room at all — see RatabilityInput.
+        let roomIsCompetitive: boolean | null = null;
+        let roomStartedAtMs: number | null = null;
         if (body.lobby_id) {
             const lobby = await ctx.db.prepare(
-                `SELECT host_user_id, roster_at_start FROM lobbies WHERE id = ?`,
-            ).bind(body.lobby_id).first<{ host_user_id: string; roster_at_start: string | null }>();
+                `SELECT host_user_id, roster_at_start, competitive, started_at
+                   FROM lobbies WHERE id = ?`,
+            ).bind(body.lobby_id).first<{
+                host_user_id: string;
+                roster_at_start: string | null;
+                competitive: number;
+                started_at: string | null;
+            }>();
             if (!lobby) throw Errors.NotFound('Lobby');
+            // Whoever is host NOW. After a mid-match host migration that is the player the
+            // server promoted, and letting them report is what stops a host dodging a loss
+            // by closing his launcher — see the abandonment rule below.
             if (lobby.host_user_id !== userId) throw Errors.Forbidden();
             rosterAtStart = lobby.roster_at_start;
+            roomIsCompetitive = lobby.competitive === 1;
+            roomStartedAtMs = sqliteTimestampToMs(lobby.started_at);
         } else {
             const self = body.participants.find((p) => p.user_id === userId);
             if (!self) throw Errors.Forbidden();
@@ -489,6 +557,7 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
             rankedModIds: ctx.config.rankedModIds,
             participants: body.participants,
             hasLobby: !!body.lobby_id,
+            roomIsCompetitive,
             allParticipantsInLobby,
             startedAt: body.started_at,
             endedAt: body.ended_at,
@@ -497,6 +566,53 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
         });
         if (unratedReason === null && replaySha !== null && duplicateRecording) {
             unratedReason = 'duplicate_recording';
+        }
+
+        // Nobody won — but somebody may simply have walked out. This is the only rule in
+        // the project that moves rating from an ABSENCE of evidence, so it is fenced in
+        // hard: competitive rooms only, only when the recording could not answer (a
+        // recording that names a winner always outranks an inference), and only through
+        // the brakes in decideByAbandon. Best-effort: a failure here leaves the match
+        // exactly as it was.
+        let decidedBy: string | null = null;
+        if (unratedReason === 'no_decided_result' && roomIsCompetitive && body.lobby_id) {
+            try {
+                const verdict = await abandonVerdict(
+                    ctx,
+                    body.lobby_id,
+                    body.participants.map((p) => p.user_id),
+                    roomStartedAtMs,
+                    replaySha !== null || gameSeed !== null,
+                );
+                if (verdict.winnerId && verdict.loserId) {
+                    // Rewrite the results in the parsed body, which is what feeds
+                    // applyMatch AND the payload sent to both players — so the guest's
+                    // end-of-match card shows the same outcome the ladder was given.
+                    for (const part of body.participants) {
+                        part.result = part.user_id === verdict.winnerId ? 1 : 0;
+                    }
+                    await ctx.db.batch(body.participants.map((part) => ctx.db.prepare(
+                        `UPDATE match_participants SET result = ? WHERE match_id = ? AND user_id = ?`,
+                    ).bind(part.result, matchId, part.user_id)));
+
+                    unratedReason = null;
+                    // A sentinel, not a user id: every other writer of this column stores
+                    // the player whose late reading decided the match, and no user id can
+                    // collide with this (they are uuids). It is what makes an abandonment
+                    // findable afterwards — by `admin.ts`, and by anyone disputing one.
+                    decidedBy = 'abandon';
+                    req.log.info(
+                        { match_id: matchId, winner: verdict.winnerId, loser: verdict.loserId },
+                        'match decided by abandonment',
+                    );
+                } else {
+                    req.log.info({ match_id: matchId, reason: verdict.reason },
+                        'abandonment did not decide the match');
+                }
+            } catch (err) {
+                req.log.info({ match_id: matchId, err: String(err) },
+                    'abandonment check failed');
+            }
         }
 
         let diff = new Map<string, { before: number; after: number; rdBefore: number; rdAfter: number }>();
@@ -523,8 +639,8 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
         // `rated = 1` with no ratings behind it is exactly the inconsistency the correction
         // path goes to some length to avoid creating.
         await ctx.db.prepare(
-            `UPDATE matches SET unrated_reason = ?, rated = ? WHERE id = ?`,
-        ).bind(unratedReason, unratedReason === null ? 1 : 0, matchId).run();
+            `UPDATE matches SET unrated_reason = ?, rated = ?, decided_by = ? WHERE id = ?`,
+        ).bind(unratedReason, unratedReason === null ? 1 : 0, decidedBy, matchId).run();
 
         const updates = [];
         for (const p of body.participants) {

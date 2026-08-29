@@ -15,6 +15,8 @@
 export type UnratedReason =
     /** The mod has no ladder. See Config.rankedModIds. */
     | 'mod_not_ranked'
+    /** The room was not created as competitive, so nobody agreed to put rating on it. */
+    | 'not_competitive'
     /** Not exactly two players. A recording names one loser, which says nothing
      *  about the other three in a team game. */
     | 'not_1v1'
@@ -102,6 +104,16 @@ export interface RatabilityInput {
     participants: readonly { result: number }[];
     /** Whether the report named a room at all. */
     hasLobby: boolean;
+    /**
+     * Whether the ROOM was created competitive — read from `lobbies.competitive`, never
+     * from the report, so a patched client cannot promote its own match.
+     *
+     * <p><b>Null means "there was no room to ask", and that is not the same as false.</b>
+     * A report with no lobby_id has a more specific and more useful thing wrong with it
+     * (`no_lobby`), and collapsing the two would answer every such report with a reason
+     * that is both worse and untrue. Only an explicit `false` refuses here.</p>
+     */
+    roomIsCompetitive: boolean | null;
     /** Whether every reported player is a member of that room. The caller does
      *  the lookup; this stays pure. Ignored when hasLobby is false. */
     allParticipantsInLobby: boolean;
@@ -143,6 +155,11 @@ export function timingIsPlausible(input: RatabilityInput): boolean {
 export function ratabilityReason(input: RatabilityInput): UnratedReason | null {
     const mod = (input.modId || '').trim().toLowerCase();
     if (!input.rankedModIds.some((m) => m === mod)) return 'mod_not_ranked';
+
+    // Second, because it is the next most fundamental fact and the one the host chose.
+    // Note the `=== false`: see RatabilityInput.roomIsCompetitive for why null falls
+    // through to `no_lobby` below instead of being refused here.
+    if (input.roomIsCompetitive === false) return 'not_competitive';
 
     // Exactly two, not "at least one decided result". The launcher can only ever
     // resolve a winner for a 1v1 (MatchResultResolver refuses anything else), so a
