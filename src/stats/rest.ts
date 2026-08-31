@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { ipRateLimit, Limits } from '../middleware/rateLimit';
-import { PROVISIONAL_RD, WIN_AT, LOSS_AT } from '../elo/ratability';
+import { WIN_AT, LOSS_AT } from '../elo/ratability';
 import { attachParticipants } from '../matches/rest';
 import type { AppContext } from '../context';
 
@@ -14,10 +14,28 @@ import type { AppContext } from '../context';
  * route, and a client that only knows about `leaderboard` keeps working.
  */
 
-/** Fewest decided games before a player is ranked at all. Nearly implied by the
- *  deviation filter, but it also keeps the win-percentage column from being
- *  computed over a single game, where it can only read 0 % or 100 %. */
-const MIN_DECIDED = 3;
+/**
+ * Fewest RATED games before a player is on the table. One: the table lists the best by
+ * rating, and anybody whose rating has moved has a rating worth listing.
+ *
+ * <p>It used to be 3, alongside a `rd <= 110` filter, and TOGETHER they left the table empty
+ * for a community that had been playing for weeks. The deviation was the one doing it: each
+ * match is its own Glicko rating period, so RD falls slowly — measured against the library
+ * this repo installs, 290 / 256 / 230 after one, two and three matches, first crossing 110
+ * around the FOURTEENTH, and never at all for a player who keeps winning, because a growing
+ * rating re-inflates RD as fast as the update shrinks it. The best player in the community
+ * was the one who could never appear.</p>
+ *
+ * <p>The comment here used to say the games bar was "nearly implied by the deviation filter".
+ * It was the other way round: the deviation was about five times stricter, and the payload
+ * advertised only this weaker number, which is why the launcher's empty-state promised entry
+ * at three matches while something else was refusing everybody.</p>
+ *
+ * <p>What replaced it is `e.games_played >= MIN_DECIDED`, a column `applyMatch` already
+ * maintains — so it counts RATED matches only, and no subquery decides who is eligible. The
+ * win/loss tally below stays, but purely to fill the DECIDED column.</p>
+ */
+const MIN_DECIDED = 1;
 
 const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 50;
@@ -95,11 +113,10 @@ async function ladder(ctx: AppContext, mode: 'default' | 'team', limit: number) 
          ) w ON w.user_id = e.user_id
          WHERE e.mode = ?
            AND u.is_banned = 0
-           AND e.rd <= ?
-           AND (COALESCE(w.wins, 0) + COALESCE(w.losses, 0)) >= ?
+           AND e.games_played >= ?
          ORDER BY e.rating DESC
          LIMIT ?`,
-    ).bind(WIN_AT, LOSS_AT, mode, mode, PROVISIONAL_RD, MIN_DECIDED, limit).all<LeaderRow>();
+    ).bind(WIN_AT, LOSS_AT, mode, mode, MIN_DECIDED, limit).all<LeaderRow>();
 
     // The rank is decided HERE, by the same ordering that produced the list. A client
     // filtering its copy must not renumber: the third row is the third player, not the

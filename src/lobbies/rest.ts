@@ -4,7 +4,7 @@ import { shortId, sha256Hex, uuid } from '../lib/ids';
 import { requireAuth, requireLauncherVersion } from '../middleware/auth';
 import { ipRateLimit, userRateLimit, Limits } from '../middleware/rateLimit';
 import { announceLobbyCreated, finalizeRoom } from './discordAnnounce';
-import { DEFAULT_RATING } from '../elo/glicko2';
+import { DEFAULT_RATING, DEFAULT_RD } from '../elo/glicko2';
 import type { AppContext } from '../context';
 
 interface LobbyRow {
@@ -52,7 +52,7 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
             `SELECT l.id, l.host_user_id, l.title, l.mod_id, l.mod_combined_hash,
                     l.max_players, l.current_players, l.is_private, l.status, l.competitive,
                     l.created_at, u.discord_username AS host_login, u.display_name AS host_name,
-                    u.avatar_url AS host_avatar, e.rating AS host_rating
+                    u.avatar_url AS host_avatar, e.rating AS host_rating, e.rd AS host_rd
              FROM lobbies l
              JOIN users u ON u.id = l.host_user_id
              -- LEFT, and it has to stay LEFT. This is the rooms list: with an inner
@@ -79,6 +79,7 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
             host_name: string;
             host_avatar: string | null;
             host_rating: number | null;
+            host_rd: number | null;
         }>();
 
         reply.header('Cache-Control', 'public, max-age=5');
@@ -112,6 +113,11 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
                     // Filling it in on the client would be wrong anyway — it cannot tell
                     // an unrated player from a server that did not send the field.
                     rating: r.host_rating ?? DEFAULT_RATING,
+                    // The deviation goes WITH it, and without it the rating is ambiguous: the
+                    // client had no way to tell a 1500 nobody has played for from one somebody
+                    // landed on, so both read the same. Same default as the rating, for the
+                    // same reason — a player with no row is unrated, which is what 350 means.
+                    rd: r.host_rd ?? DEFAULT_RD,
                 },
             })),
         });

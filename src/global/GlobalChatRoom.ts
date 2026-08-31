@@ -2,7 +2,7 @@ import type { WebSocket } from 'ws';
 import { randomUUID } from 'node:crypto';
 import { verifyJwt } from '../lib/jwt';
 import { isBanned } from '../middleware/auth';
-import { DEFAULT_RATING } from '../elo/glicko2';
+import { DEFAULT_RATING, DEFAULT_RD } from '../elo/glicko2';
 import type { AppContext } from '../context';
 
 /**
@@ -538,18 +538,25 @@ export class GlobalChatRoom {
         // would either hide every rating (what happened after the reset) or invent one for
         // a player we failed to look up.
         let ratingsKnown = false;
+        const rdByUser = new Map<string, number>();
         try {
             const ids = [...new Set([...this.attached.values()].map((a) => a.userId))];
             if (this.ctx && ids.length > 0) {
                 const placeholders = ids.map(() => '?').join(',');
                 const rows = await this.ctx.db
                     .prepare(
-                        `SELECT user_id, rating FROM elo_ratings
+                        `SELECT user_id, rating, rd FROM elo_ratings
                          WHERE mode = 'default' AND user_id IN (${placeholders})`,
                     )
                     .bind(...ids)
-                    .all<{ user_id: string; rating: number }>();
-                for (const r of rows.results) ratingByUser.set(r.user_id, r.rating);
+                    .all<{ user_id: string; rating: number; rd: number }>();
+                for (const r of rows.results) {
+                    ratingByUser.set(r.user_id, r.rating);
+                    // The deviation goes with the rating, and without it the number is
+                    // ambiguous: the client could not tell a 1500 nobody has played for from
+                    // one somebody landed on, so the panel showed both the same.
+                    rdByUser.set(r.user_id, r.rd);
+                }
                 // Set only here: without a ctx no query ran at all, and an empty
                 // roster has nobody to report either way.
                 ratingsKnown = true;
@@ -560,7 +567,7 @@ export class GlobalChatRoom {
 
         const out: {
             userId: string; login: string; avatarUrl: string | null;
-            status: string; rating: number | null;
+            status: string; rating: number | null; rd: number | null;
         }[] = [];
         for (const a of this.attached.values()) {
             out.push({
@@ -569,6 +576,9 @@ export class GlobalChatRoom {
                 avatarUrl: a.avatarUrl,
                 status: statusByUser.get(a.userId) ?? 'idle',
                 rating: ratingsKnown ? (ratingByUser.get(a.userId) ?? DEFAULT_RATING) : null,
+                // Same null rule as the rating: a query that threw says nothing about anyone,
+                // and no row means unrated, which is exactly what the default deviation means.
+                rd: ratingsKnown ? (rdByUser.get(a.userId) ?? DEFAULT_RD) : null,
             });
         }
         return out;
