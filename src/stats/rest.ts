@@ -34,8 +34,31 @@ import type { AppContext } from '../context';
  * <p>What replaced it is `e.games_played >= MIN_DECIDED`, a column `applyMatch` already
  * maintains — so it counts RATED matches only, and no subquery decides who is eligible. The
  * win/loss tally below stays, but purely to fill the DECIDED column.</p>
+ *
+ * <p><b>Raised to 5, and it is NOT what fixes the newcomer problem — the ORDER BY is.</b> The
+ * complaint was a player sitting first with three rated matches above one with thirteen, and
+ * measured against the live table a threshold could not answer it: he had exactly 3, so a bar
+ * of 3 still crowned him, and a bar of 5 left the whole table with TWO names. This is a floor
+ * against a lucky first night, nothing more; the confidence-adjusted ordering below is the
+ * mechanism. Keep it low for the same reason it was lowered before — this community plays
+ * about 35 rated matches a month, and a table nobody is on teaches nobody anything.</p>
  */
-const MIN_DECIDED = 1;
+export const MIN_DECIDED = 5;
+
+/**
+ * How good a player is AT LEAST — Glicko-2's conservative estimate, the number the ladder is
+ * ordered by. Exported as BOTH the SQL fragment and the same arithmetic in JS so the query and
+ * the test that pins it cannot drift apart; the string is a module constant, never user input.
+ *
+ * <p>Two, not one: measured on the live table, a single deviation still put the three-match
+ * player second instead of third. Two is also what Glicko-2's own write-up recommends.</p>
+ */
+export const LADDER_ORDER_BY = '(e.rating - 2 * e.rd) DESC';
+
+/** The same rule as {@link LADDER_ORDER_BY}, for tests and for anything that has to explain it. */
+export function conservativeRating(row: { rating: number; rd: number }): number {
+    return row.rating - 2 * row.rd;
+}
 
 const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 50;
@@ -94,6 +117,25 @@ interface TopMapRow { map_name: string; n: number }
  * appears and is then filtered by the predicate, rather than vanishing for a reason the
  * query does not state. SUM() over no rows is NULL, not 0 — hence the COALESCEs — and
  * aliases cannot be used in WHERE, so the predicate repeats the expression.</p>
+ *
+ * <p><b>The order is `rating - 2 * rd`, not `rating` — the CONSERVATIVE rating, and it is the
+ * whole answer to "somebody wins three games on his first night and lands above the regulars".
+ * </b> It is Glicko-2's own recommendation: how good the player is AT LEAST, at roughly 95%
+ * confidence. A newcomer carries an enormous deviation, so the number he is ranked by is
+ * heavily discounted no matter how well he starts, and he climbs on his own as it shrinks —
+ * which is exactly what "he has not proved it yet" means, expressed in the units the rating
+ * system already keeps. Measured on the live table the day this changed: rating alone gave
+ * Gommiustan (1626, rd 248, 3 matches) > Aluclown (1604, rd 125, 13); this gives Aluclown
+ * (1353) > Geaf (1244) > Gommiustan (1130).</p>
+ *
+ * <p>The trade-off, and the client has to carry it: the rating SHOWN is still `rating`, so the
+ * displayed numbers no longer descend down the table. That is why the launcher's rows print
+ * the match count beside the name — it is what makes the order legible — and mark a high
+ * deviation as provisional. Emitting the adjusted number instead was rejected: it would
+ * contradict the rating the same player is shown in his profile and in every room.</p>
+ *
+ * <p>Note `idx_elo_rating (mode, rating DESC)` no longer serves this ORDER BY. Irrelevant at
+ * this size; if the table ever grows, the index to add is on the expression.</p>
  */
 async function ladder(ctx: AppContext, mode: 'default' | 'team', limit: number) {
     const rows = await ctx.db.prepare(
@@ -114,7 +156,7 @@ async function ladder(ctx: AppContext, mode: 'default' | 'team', limit: number) 
          WHERE e.mode = ?
            AND u.is_banned = 0
            AND e.games_played >= ?
-         ORDER BY e.rating DESC
+         ORDER BY ${LADDER_ORDER_BY}
          LIMIT ?`,
     ).bind(WIN_AT, LOSS_AT, mode, mode, MIN_DECIDED, limit).all<LeaderRow>();
 
