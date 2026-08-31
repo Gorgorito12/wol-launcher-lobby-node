@@ -138,6 +138,9 @@ interface MatchRow {
 interface ParticipantRow {
     match_id: string;
     user_id: string;
+    /** Which side they played on. 0 for everyone in a 1v1 and in every match stored before the
+     *  launcher could work teams out — so it is only interesting when the numbers differ. */
+    team: number;
     result: number;
     rating_before: number | null;
     rating_after: number | null;
@@ -231,17 +234,24 @@ async function withSnapshot<T>(dbPath: string, fn: (snap: Db) => Promise<T>): Pr
  * row at all.</p>
  */
 export async function recomputeLadder(db: Db): Promise<{ matches: number; players: number }> {
+    // rating_mode travels with each match so the replay can feed it to the ladder it
+    // actually belongs to. NULL means a row written before migration 0010, all of which
+    // were 1v1 — so it reads as 'default' rather than as unknown.
     const rated = await db.prepare(
-        `SELECT id FROM matches
+        `SELECT id, COALESCE(rating_mode, 'default') AS rating_mode FROM matches
           WHERE rated = 1
              OR (rated IS NULL AND EXISTS (
                     SELECT 1 FROM match_participants p
                      WHERE p.match_id = matches.id AND p.rating_after IS NOT NULL))
           ORDER BY created_at ASC, id ASC`,
-    ).bind().all<{ id: string }>();
+    ).bind().all<{ id: string; rating_mode: string }>();
 
-    const ids = (rated.results ?? []).map((r) => r.id);
+    const ids = (rated.results ?? []).map((r) => ({ id: r.id, mode: r.rating_mode }));
 
+    // No WHERE mode: BOTH ladders are being replayed below, so both are reset here. This
+    // is correct only because the loop feeds every match back into its own mode — if this
+    // function is ever narrowed to one ladder, this statement has to be narrowed with it,
+    // or recomputing 1v1 would flatten the team ratings on its way past.
     await db.prepare(
         `UPDATE elo_ratings
             SET rating = ?, rd = ?, volatility = ?, games_played = 0, updated_at = datetime('now')`,
@@ -254,19 +264,23 @@ export async function recomputeLadder(db: Db): Promise<{ matches: number; player
     ).bind().run();
 
     const touched = new Set<string>();
-    for (const matchId of ids) {
+    for (const { id: matchId, mode } of ids) {
         const parts = await db.prepare(
-            `SELECT match_id, user_id, result FROM match_participants
+            `SELECT match_id, user_id, team, result FROM match_participants
               WHERE match_id = ? ORDER BY user_id ASC`,
-        ).bind(matchId).all<ParticipantRow>();
+        ).bind(matchId).all<ParticipantRow & { team: number }>();
 
+        const isTeam = mode === 'team';
         const outcomes: ParticipantOutcome[] = (parts.results ?? []).map((p) => ({
             userId: p.user_id,
             result: p.result as 0 | 0.5 | 1,
+            // Only for a team match. Handing applyMatch the 0 that every 1v1 carries
+            // would put both players on the same side and skip their only pairing.
+            team: isTeam ? (p.team | 0) : undefined,
         }));
         if (outcomes.length < 2) continue;
 
-        const diff = await applyMatch(db, outcomes);
+        const diff = await applyMatch(db, outcomes, isTeam ? 'team' : 'default');
         const stamps = [];
         for (const o of outcomes) {
             touched.add(o.userId);
@@ -619,17 +633,26 @@ async function cmdMatchShow(db: Db): Promise<void> {
     console.log(`  seed       ${m.game_seed ?? '-'}   hostTime ${m.game_host_time ?? '-'}`);
     console.log(`  replay     ${m.replay_sha256 ?? '-'}`);
 
+    // Ordered by TEAM first, then result: for a team match this is the only place anybody can
+    // see who was on whose side, and "four names sorted by result" answers a different question
+    // than the one being asked when a team match is disputed.
     const parts = await db.prepare(
-        `SELECT p.match_id, p.user_id, p.result, p.rating_before, p.rating_after,
+        `SELECT p.match_id, p.user_id, p.team, p.result, p.rating_before, p.rating_after,
                 u.display_name
            FROM match_participants p LEFT JOIN users u ON u.id = p.user_id
-          WHERE p.match_id = ? ORDER BY p.result DESC`,
+          WHERE p.match_id = ? ORDER BY p.team, p.result DESC`,
     ).bind(id).all<ParticipantRow>();
 
+    const players = parts.results ?? [];
+    // Printed only when the sides actually differ, so a 1v1 reads exactly as it always has.
+    const showTeams = new Set(players.map((p) => p.team)).size > 1;
+
     console.log('  participants');
-    for (const p of parts.results ?? []) {
+    for (const p of players) {
         console.log(
-            `    ${pad(p.display_name ?? p.user_id, 22)} result ${p.result}` +
+            `    ${pad(p.display_name ?? p.user_id, 22)}` +
+            (showTeams ? ` team ${p.team}` : '') +
+            ` result ${p.result}` +
             `   elo ${pad(num(p.rating_before, 1), 8)} -> ${num(p.rating_after, 1)}`,
         );
     }

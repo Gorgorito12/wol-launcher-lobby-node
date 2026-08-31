@@ -61,7 +61,18 @@ export interface AbandonInput {
     /** `lobbies.started_at`, i.e. when the host pressed Start. Null when unknown. */
     startedAtMs: number | null;
     nowMs: number;
-    /** Config.competitiveAbandonSeconds. */
+    /**
+     * How far into the match a walkout must happen to count, i.e.
+     * Config.competitiveAbandonSeconds.
+     *
+     * <p><b>Measured from the room's start to the moment the socket DROPPED</b> — not to
+     * the moment the report arrives. Those are wildly different numbers: the report lands
+     * when the HOST closes his game, so measuring against it means a player who left at
+     * 4:40 of a match the host kept open for fifteen minutes is judged as though he had
+     * played fifteen. He forfeits, and so would he have done leaving at thirty seconds.
+     * That was the behaviour, it cost a real player 176 points, and it contradicted the
+     * text he agreed to in the create-room dialog.</p>
+     */
     abandonAfterSeconds: number;
     /**
      * Whether the report carried a recording fingerprint.
@@ -104,21 +115,53 @@ export function decideByAbandon(input: AbandonInput): AbandonDecision {
     if (input.pairDecidedRecently) return no('these two already had one decided this way today');
 
     if (input.startedAtMs === null) return no('the room never recorded when it started');
-    const ranForSeconds = (input.nowMs - input.startedAtMs) / 1000;
-    if (!Number.isFinite(ranForSeconds)) return no('the room start time is unreadable');
-    if (ranForSeconds < input.abandonAfterSeconds) {
-        return no(`the game only ran ${Math.max(0, Math.round(ranForSeconds))}s`);
-    }
+    const startedAtMs = input.startedAtMs;
 
-    // Measured against NOW — the report lands within seconds of the real end — rather than
-    // against the reported ended_at, which is a number the client chose.
-    const graceMs = RECONNECT_GRACE_SECONDS * 1000;
-    const walkedOut = input.participantIds.filter((id) =>
-        input.abandons.some((a) => a.userId === id && input.nowMs - a.disconnectedAtMs >= graceMs));
+    // Each walkout is judged on its OWN timestamp against two independent limits, and the
+    // two are counted separately so a refusal can say which one applied. `reason` is what
+    // the server logs and what `admin.ts match:show` prints, and it is the only account
+    // anyone disputing a forfeit will ever get.
+    const walkedOut: string[] = [];
+    let tooRecent = 0;
+    let latestTooEarlySeconds: number | null = null;
+
+    for (const id of input.participantIds) {
+        // At most one row per (lobby, user) — that is the table's primary key — and it is
+        // deleted the moment its owner says hello again.
+        const row = input.abandons.find((a) => a.userId === id);
+        if (row === undefined) continue;
+
+        const secondsSinceDrop = (input.nowMs - row.disconnectedAtMs) / 1000;
+        const secondsIntoMatch = (row.disconnectedAtMs - startedAtMs) / 1000;
+        // A timestamp that will not read decides nothing, the same refusal the room's own
+        // start time gets two lines up. This rule already moves rating on an absence of
+        // evidence; it must not also move it on a number it could not read.
+        if (!Number.isFinite(secondsSinceDrop) || !Number.isFinite(secondsIntoMatch)) continue;
+
+        // Too RECENT to be a departure: the LobbyWebSocket reconnects on its own.
+        if (secondsSinceDrop < RECONNECT_GRACE_SECONDS) { tooRecent++; continue; }
+
+        // Too EARLY to be a forfeit: inside the grace the host agreed to in writing. A
+        // negative value lands here too, which is the safe direction — it means the clocks
+        // disagree about a room that started after somebody left it.
+        if (secondsIntoMatch < input.abandonAfterSeconds) {
+            latestTooEarlySeconds = Math.max(latestTooEarlySeconds ?? secondsIntoMatch, secondsIntoMatch);
+            continue;
+        }
+
+        walkedOut.push(id);
+    }
 
     // Nobody left: this match is undecided for some ordinary reason, and inventing a winner
     // is exactly what the rest of the system refuses to do.
-    if (walkedOut.length === 0) return no('nobody abandoned');
+    if (walkedOut.length === 0) {
+        if (latestTooEarlySeconds !== null) {
+            return no(`the latest walkout was ${Math.round(latestTooEarlySeconds)}s into the match, `
+                + `inside the first ${input.abandonAfterSeconds}s`);
+        }
+        if (tooRecent > 0) return no('the dropped socket is still inside the reconnect grace');
+        return no('nobody abandoned');
+    }
 
     // BOTH left — the usual cause is the host's connection dying and taking the room with
     // it, which is nobody's forfeit. A draw is the honest answer.

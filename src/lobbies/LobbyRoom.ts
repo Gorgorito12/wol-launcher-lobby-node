@@ -60,6 +60,19 @@ interface MemberEntry {
      * reported (the client often isn't on Radmin yet at join time).
      */
     radminIp?: string;
+    /**
+     * The member's AoE3 profile name, reported via set_ingame_name.
+     *
+     * It is the ONLY thing that joins a slot in a recorded game to a Discord account, and so
+     * the only way a team match can be stored with real teams instead of everyone on team 0.
+     * Self-reported because it cannot be inferred: the name is per MOD and routinely nothing
+     * like the account — one measured machine has the same person as Gorgorito12 on Discord
+     * and Gorgorito / gorgorito / sdfs across three mods.
+     *
+     * Undefined until reported, and from any launcher older than the frame; the client's team
+     * map then refuses and the match is reported with no teams, exactly as before.
+     */
+    ingameName?: string;
     /** The member's Discord avatar URL, so the roster can show their real photo
      * (read from users.avatar_url on join). Undefined when unknown. */
     avatarUrl?: string;
@@ -230,6 +243,9 @@ class LobbyRoom {
             case 'set_radmin_ip':
                 this.handleSetRadminIp(attached, f);
                 break;
+            case 'set_ingame_name':
+                this.handleSetInGameName(attached, f);
+                break;
             case 'kick':
                 this.handleKick(ws, attached, f);
                 break;
@@ -351,6 +367,7 @@ class LobbyRoom {
             ready: existing?.ready ?? false,
             login,
             radminIp: existing?.radminIp,
+            ingameName: existing?.ingameName,
             avatarUrl: avatarUrl ?? existing?.avatarUrl,
             rating,
             rd,
@@ -455,6 +472,36 @@ class LobbyRoom {
             type: 'member_net',
             user_id: attached.userId,
             radmin_ip: ip,
+        }, null);
+    }
+
+    /** How long an AoE3 profile name may be. Generous — the game imposes its own, shorter
+     *  limit; this only stops a client parking a novel on the member object. */
+    private static readonly MAX_INGAME_NAME = 64;
+
+    /**
+     * A member tells the room which AoE3 profile they play under, so the host can work out who
+     * was on which team when the match is reported.
+     *
+     * Relayed, never interpreted: the server does not know or care what a valid profile name
+     * looks like, and the only thing it enforces is that the string is short enough to keep and
+     * that a member is announcing about THEMSELVES — `attached.userId`, never a field from the
+     * frame, so nobody can rename anybody else into the wrong team.
+     */
+    private handleSetInGameName(
+        attached: AttachedSocket,
+        frame: { type: string } & Record<string, unknown>,
+    ): void {
+        const name = typeof frame.name === 'string' ? frame.name.trim() : '';
+        if (name.length === 0 || name.length > LobbyRoom.MAX_INGAME_NAME) return;
+        const existing = this.members[attached.userId];
+        if (!existing) return;
+        if (existing.ingameName === name) return;   // no change → no broadcast
+        existing.ingameName = name;
+        this.broadcast({
+            type: 'member_ingame_name',
+            user_id: attached.userId,
+            ingame_name: name,
         }, null);
     }
 

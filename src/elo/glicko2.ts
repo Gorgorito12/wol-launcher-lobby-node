@@ -36,7 +36,24 @@ export const DEFAULT_VOLATILITY = 0.06;
 export interface ParticipantOutcome {
     userId: string;
     result: 0 | 0.5 | 1;
+    /**
+     * Which side this player was on, for a team match. Absent (or the same value for
+     * everyone) means there are no sides, which is every 1v1 and every match reported
+     * before teams existed.
+     *
+     * It is what stops two teammates being fed to Glicko as a game against each other —
+     * see the pairing loop, where it is the whole difference.
+     */
+    team?: number;
 }
+
+/**
+ * The ladder a match belongs to. `elo_ratings` is keyed by (user_id, mode) and has
+ * carried this since 0001_initial for exactly this purpose; 2v2 and 3v3 share
+ * `'team'` because splitting a scarce category would leave both halves permanently
+ * provisional against the leaderboard's `rd <= 110`.
+ */
+export type RatingMode = 'default' | 'team';
 
 interface EloRow {
     user_id: string;
@@ -46,9 +63,29 @@ interface EloRow {
     games_played: number;
 }
 
+/**
+ * Whether two participants were on opposite sides.
+ *
+ * <b>This is the fix for the one thing in this file that was actively wrong.</b> The
+ * pairing loop below used to face everybody against everybody and decide each pair by
+ * comparing `result` — so two teammates, who by definition carry the SAME result, were
+ * handed to Glicko as a draw between themselves. Measured: 1900 + 1100 beating
+ * 1500 + 1500 gave the 1100 **+354** and the 1900 **−36**, because the 1100 had
+ * "drawn" with a 1900.
+ *
+ * A match with no sides — every 1v1, and every row written before teams existed —
+ * answers true for every pair, so its pairing is byte-for-byte what it always was.
+ * That equivalence is the property to protect.
+ */
+function areOpponents(a: ParticipantOutcome, b: ParticipantOutcome): boolean {
+    if (a.team === undefined || b.team === undefined) return true;
+    return a.team !== b.team;
+}
+
 export async function applyMatch(
     db: Db,
     outcomes: ParticipantOutcome[],
+    mode: RatingMode = 'default',
 ): Promise<Map<string, { before: number; after: number; rdBefore: number; rdAfter: number }>> {
     if (outcomes.length < 2) return new Map();
 
@@ -58,8 +95,8 @@ export async function applyMatch(
     const placeholders = ids.map(() => '?').join(',');
     const existing = await db.prepare(
         `SELECT user_id, rating, rd, volatility, games_played
-         FROM elo_ratings WHERE user_id IN (${placeholders}) AND mode = 'default'`,
-    ).bind(...ids).all<EloRow>();
+         FROM elo_ratings WHERE user_id IN (${placeholders}) AND mode = ?`,
+    ).bind(...ids, mode).all<EloRow>();
 
     const byId = new Map<string, EloRow>();
     for (const row of existing.results ?? []) byId.set(row.user_id, row);
@@ -80,6 +117,10 @@ export async function applyMatch(
         for (let j = i + 1; j < outcomes.length; j++) {
             const a = outcomes[i]!;
             const b = outcomes[j]!;
+            // Teammates are not opponents. Skipping them is the entire team fix: what is
+            // left is each player facing every player on the other side, which in a 2v2
+            // is two games per person in one rating period.
+            if (!areOpponents(a, b)) continue;
             const ra = players.get(a.userId)!;
             const rb = players.get(b.userId)!;
             let outcomeForA: number;
@@ -102,14 +143,14 @@ export async function applyMatch(
         diff.set(o.userId, { before: bf.rating, after, rdBefore: bf.rd, rdAfter });
         writes.push(db.prepare(
             `INSERT INTO elo_ratings (user_id, mode, rating, rd, volatility, games_played, updated_at)
-             VALUES (?, 'default', ?, ?, ?, 1, datetime('now'))
+             VALUES (?, ?, ?, ?, ?, 1, datetime('now'))
              ON CONFLICT (user_id, mode) DO UPDATE SET
                rating = excluded.rating,
                rd = excluded.rd,
                volatility = excluded.volatility,
                games_played = elo_ratings.games_played + 1,
                updated_at = datetime('now')`,
-        ).bind(o.userId, after, rdAfter, volAfter));
+        ).bind(o.userId, mode, after, rdAfter, volAfter));
     }
 
     await db.batch(writes);

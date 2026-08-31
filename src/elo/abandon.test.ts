@@ -45,10 +45,42 @@ test('a socket gone for less than the reconnect grace is not a departure', () =>
 });
 
 test('leaving before the threshold decides nothing', () => {
-    // Four minutes in, with the threshold at five: almost certainly wrong settings
+    // Two minutes in, with the threshold at five: almost certainly wrong settings
     // rather than a dodge.
     const d = decideByAbandon(ok({ startedAtMs: NOW - 240 * 1000 }));
     assert.equal(d.winnerId, null);
+});
+
+test('a walkout inside the first five minutes is not rescued by a long match', () => {
+    // THE REGRESSION, from a real incident. A player left at 4:40; the host kept his game
+    // open and reported at fifteen minutes. The check measured `now - started` — the
+    // REPORT, not the walkout — so it read fifteen minutes, forfeited him, and took 176
+    // points. He would have been forfeited leaving at thirty seconds just the same, and
+    // the create-room dialog he never saw promised the opposite.
+    const started = NOW - 900 * 1000;
+    const d = decideByAbandon(ok({
+        startedAtMs: started,
+        abandons: [{ userId: 'beto', disconnectedAtMs: started + 280 * 1000 }],
+    }));
+
+    assert.equal(d.winnerId, null);
+    assert.equal(d.loserId, null);
+    // And it must say WHICH limit refused it: "the game only ran 900s" would be a lie
+    // twice over — the game ran fine, and it is not the game being measured.
+    assert.match(d.reason, /280s into the match/);
+});
+
+test('a walkout past the threshold still decides, promptly', () => {
+    // The other side of the same change: six minutes in, reported two minutes later. This
+    // is the dodge the rule exists for, and it must not have become harder to catch.
+    const started = NOW - 480 * 1000;
+    const d = decideByAbandon(ok({
+        startedAtMs: started,
+        abandons: [{ userId: 'beto', disconnectedAtMs: started + 360 * 1000 }],
+    }));
+
+    assert.equal(d.loserId, 'beto');
+    assert.equal(d.winnerId, 'ana');
 });
 
 test('both players gone is a draw, not a win for whoever dropped second', () => {
@@ -92,6 +124,8 @@ test('every refusal names its cause', () => {
         ok({ reportHasRecording: false }),
         ok({ startedAtMs: null }),
         ok({ pairDecidedRecently: true }),
+        ok({ abandons: [{ userId: 'beto', disconnectedAtMs: NOW - 10 * 1000 }] }),
+        ok({ startedAtMs: NOW - 60 * 1000 }),
     ]) {
         const d = decideByAbandon(bad);
         assert.equal(d.winnerId, null);

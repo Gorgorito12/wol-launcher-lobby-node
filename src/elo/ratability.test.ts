@@ -13,7 +13,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ratabilityReason, timingIsPlausible, isDecided, compareReadings,
-         canUpgradeFromConfirmation, MIN_DURATION_SECONDS } from './ratability';
+         canUpgradeFromConfirmation, matchShape, teamEvidenceMet,
+         MIN_DURATION_SECONDS } from './ratability';
 
 const RANKED = ['wol'];
 
@@ -280,4 +281,132 @@ test('every refusal names its cause', () => {
         assert.equal(d.ok, false);
         assert.ok(d.reason.length > 0);
     }
+});
+
+// ---------------------------------------------------------------------------
+// The shape of a rateable match
+// ---------------------------------------------------------------------------
+//
+// This replaced a bare `participants.length !== 2`. The refusals are what matter: a
+// shape that reaches Glicko when nothing can read its winner would rate an invention.
+
+/** Two sides of `perSide`, alternating, the way a report arrives. */
+function sides(perSide: number) {
+    const out: { result: number; team: number }[] = [];
+    for (let i = 0; i < perSide; i++) out.push({ result: 1, team: 0 });
+    for (let i = 0; i < perSide; i++) out.push({ result: 0, team: 1 });
+    return out;
+}
+
+test('a 1v1 is the default ladder, teams or no teams', () => {
+    assert.equal(matchShape([{ team: 0 }, { team: 0 }]), 'default');
+    assert.equal(matchShape([{}, {}]), 'default');
+    // Even nonsense sides: with two players there is exactly one pairing either way.
+    assert.equal(matchShape([{ team: 3 }, { team: 7 }]), 'default');
+});
+
+test('two equal sides of 2 or 3 are the team ladder', () => {
+    assert.equal(matchShape(sides(2)), 'team');
+    assert.equal(matchShape(sides(3)), 'team');
+});
+
+test('a shape whose winner cannot be read is refused', () => {
+    // A free-for-all: four players, four sides. One named loser says nothing about
+    // the other three, which is the whole reason the old rule existed.
+    assert.equal(matchShape([{ team: 0 }, { team: 1 }, { team: 2 }, { team: 3 }]), null);
+    // Uneven sides — a 1v3 in a room that promised 2v2.
+    assert.equal(matchShape([{ team: 0 }, { team: 1 }, { team: 1 }, { team: 1 }]), null);
+    // Four players with no sides at all: every pre-team report carries team 0, and
+    // collapsing to one side must NOT be read as a team game.
+    assert.equal(matchShape([{}, {}, {}, {}]), null);
+    // Sizes nothing has measured a recording for.
+    assert.equal(matchShape(sides(4)), null);
+    assert.equal(matchShape([{ team: 0 }, { team: 1 }, { team: 1 }]), null);
+});
+
+test('a team match reaches the evidence rule instead of not_1v1', () => {
+    // The point of the change: a well-formed 2v2 is no longer refused for its shape.
+    // Whether it RATES is then decided by teamEvidenceMet, which lives elsewhere.
+    assert.equal(ratabilityReason(ok({ participants: sides(2) })), null);
+    assert.equal(ratabilityReason(ok({ participants: sides(3) })), null);
+});
+
+test('a free-for-all is still not_1v1', () => {
+    assert.equal(
+        ratabilityReason(ok({
+            participants: [
+                { result: 1, team: 0 }, { result: 0, team: 1 },
+                { result: 0, team: 2 }, { result: 0, team: 3 },
+            ],
+        })),
+        'not_1v1',
+    );
+});
+
+// ---------------------------------------------------------------------------
+// One reading from EACH side
+// ---------------------------------------------------------------------------
+
+const TEAMS = new Map([['a1', 0], ['a2', 0], ['b1', 1], ['b2', 1]]);
+
+function evidence(over: Partial<Parameters<typeof teamEvidenceMet>[0]> = {}) {
+    return {
+        teams: TEAMS,
+        reporterTeam: 0,
+        confirmations: [{ userId: 'b1', agreement: 'agree', sameGame: 'true' }],
+        ...over,
+    };
+}
+
+test('one agreeing reading from the other side is enough', () => {
+    assert.equal(teamEvidenceMet(evidence()), true);
+});
+
+test('readings from the reporter own side corroborate nothing', () => {
+    // THE case this rule exists for. Two teammates saying the same thing is one claim
+    // twice; a whole winning team saying it is still one claim.
+    assert.equal(teamEvidenceMet(evidence({
+        confirmations: [
+            { userId: 'a1', agreement: 'agree', sameGame: 'true' },
+            { userId: 'a2', agreement: 'agree', sameGame: 'true' },
+        ],
+    })), false);
+});
+
+test('a reading that does not agree, or is of another game, is not evidence', () => {
+    for (const c of [
+        { userId: 'b1', agreement: 'disagree', sameGame: 'true' },
+        { userId: 'b1', agreement: 'inconclusive', sameGame: 'true' },
+        { userId: 'b1', agreement: 'not_reported', sameGame: 'true' },
+        { userId: 'b1', agreement: null, sameGame: 'true' },
+        { userId: 'b1', agreement: 'agree', sameGame: 'false' },
+        // 'unknown' means one of the two had no seed to compare. Accepting it would let
+        // two readings of DIFFERENT games corroborate each other by coincidence.
+        { userId: 'b1', agreement: 'agree', sameGame: 'unknown' },
+        { userId: 'b1', agreement: 'agree', sameGame: null },
+    ]) {
+        assert.equal(teamEvidenceMet(evidence({ confirmations: [c] })), false);
+    }
+});
+
+test('a reading from somebody who was not in the match is not evidence', () => {
+    assert.equal(teamEvidenceMet(evidence({
+        confirmations: [{ userId: 'stranger', agreement: 'agree', sameGame: 'true' }],
+    })), false);
+});
+
+test('no confirmations, and an unknown reporter side, are both refusals', () => {
+    assert.equal(teamEvidenceMet(evidence({ confirmations: [] })), false);
+    // The reporter is not among the participants — nothing can be "the other side".
+    assert.equal(teamEvidenceMet(evidence({ reporterTeam: null })), false);
+});
+
+test('one good reading among bad ones still counts', () => {
+    assert.equal(teamEvidenceMet(evidence({
+        confirmations: [
+            { userId: 'a1', agreement: 'agree', sameGame: 'true' },
+            { userId: 'b1', agreement: 'inconclusive', sameGame: 'true' },
+            { userId: 'b2', agreement: 'agree', sameGame: 'true' },
+        ],
+    })), true);
 });

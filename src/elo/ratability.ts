@@ -17,9 +17,15 @@ export type UnratedReason =
     | 'mod_not_ranked'
     /** The room was not created as competitive, so nobody agreed to put rating on it. */
     | 'not_competitive'
-    /** Not exactly two players. A recording names one loser, which says nothing
-     *  about the other three in a team game. */
+    /** No shape this server rates: not a 1v1, and not two equal sides of 2 or 3.
+     *  A free-for-all, or teams that do not pair up — a recording names ONE loser,
+     *  which decides a side only when there are exactly two of them. */
     | 'not_1v1'
+    /** A team match with a winner, waiting for the other side to send its reading.
+     *  See `teamEvidenceMet`: one side's word is the reporter's own, and only a
+     *  witness from the opposing side corroborates it. Unlike every other reason
+     *  here this one is TEMPORARY — a confirmation can clear it. */
+    | 'awaiting_confirmation'
     /** Nobody won: no recording, or one that could not be read. */
     | 'no_decided_result'
     /** Reported without a room, so there is nothing to check the players against. */
@@ -98,10 +104,49 @@ export const DURATION_SLACK_SECONDS = 120;
 export const FUTURE_SKEW_MS = 5 * 60 * 1000;
 export const MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
+/**
+ * Which ladder a match belongs to, or null when its shape is not one this server rates.
+ *
+ * <p>Deliberately derived from the PARTICIPANTS rather than from the room's declared
+ * format: the room's promise is checked on the launcher side
+ * (`RoomFormats.TeamsAgreeWithFormat`, which drops contradicting teams before they are
+ * sent), and what actually has to be rateable is the report in hand. A room that said
+ * 2v2 and arrives as a 1v3 has no shape here and is refused, which is the same answer
+ * from the other direction.</p>
+ *
+ * <p>The 1v1 rule is unchanged and comes first, so every existing match — all of which
+ * report team 0 for everybody — keeps answering exactly what it answered before.</p>
+ */
+export type MatchShape = 'default' | 'team';
+
+export function matchShape(
+    participants: readonly { team?: number }[],
+): MatchShape | null {
+    if (participants.length === 2) return 'default';
+
+    // Two sides, equal size, and only the sizes this server knows how to read a winner
+    // for. A 4v4 is not refused because it is unfair — it is refused because nothing has
+    // measured whether its recording names a loser, and rating on an unmeasured guess is
+    // the one thing the whole ELO section refuses to do.
+    if (participants.length !== 4 && participants.length !== 6) return null;
+
+    const sides = new Map<number, number>();
+    for (const p of participants) {
+        // A missing team is team 0 — which is what every pre-team report carries, so a
+        // four-player match with no sides collapses to ONE side and is refused below.
+        const t = p.team ?? 0;
+        sides.set(t, (sides.get(t) ?? 0) + 1);
+    }
+    if (sides.size !== 2) return null;
+
+    const counts = [...sides.values()];
+    return counts[0] === counts[1] ? 'team' : null;
+}
+
 export interface RatabilityInput {
     modId: string;
     rankedModIds: readonly string[];
-    participants: readonly { result: number }[];
+    participants: readonly { result: number; team?: number }[];
     /** Whether the report named a room at all. */
     hasLobby: boolean;
     /**
@@ -161,11 +206,12 @@ export function ratabilityReason(input: RatabilityInput): UnratedReason | null {
     // through to `no_lobby` below instead of being refused here.
     if (input.roomIsCompetitive === false) return 'not_competitive';
 
-    // Exactly two, not "at least one decided result". The launcher can only ever
-    // resolve a winner for a 1v1 (MatchResultResolver refuses anything else), so a
-    // three-player match claiming a decided result did not come from a launcher we
-    // wrote — and this is the cheapest place to say no to it.
-    if (input.participants.length !== 2) return 'not_1v1';
+    // A shape whose winner can actually be read: a 1v1, or two equal sides of 2 or 3.
+    // This used to be a bare `length !== 2`, back when the launcher could not resolve a
+    // winner for anything else. It can now — the recording names one loser and the team
+    // map says which side that is — so the refusal narrowed to the shapes that still
+    // cannot be read: a free-for-all, and sides that do not pair up.
+    if (matchShape(input.participants) === null) return 'not_1v1';
 
     // Without a room there is no roster to check the names against, and the
     // fallback branch of POST /matches only asks that the reporter be one of the
@@ -179,6 +225,63 @@ export function ratabilityReason(input: RatabilityInput): UnratedReason | null {
     if (!input.participants.some((p) => isDecided(p.result))) return 'no_decided_result';
 
     return null;
+}
+
+// ---------------------------------------------------------------------------
+// The evidence a TEAM match needs before it may move anyone's rating
+// ---------------------------------------------------------------------------
+
+/** One player's own reading of a match, as `match_confirmations` stores it. */
+export interface ConfirmationEvidence {
+    userId: string;
+    /** `match_confirmations.agreement` — 'agree' | 'disagree' | 'inconclusive' | 'not_reported'. */
+    agreement: string | null;
+    /** `match_confirmations.same_game` — 'true' | 'false' | 'unknown'. */
+    sameGame: string | null;
+}
+
+export interface TeamEvidenceInput {
+    /** Every participant's side, keyed by user id, exactly as reported. */
+    teams: ReadonlyMap<string, number>;
+    /** The reporter's own side. Their report IS that side's reading. */
+    reporterTeam: number | null;
+    /** Everyone who sent their own reading of this match. */
+    confirmations: readonly ConfirmationEvidence[];
+}
+
+/**
+ * Whether a team match has a reading from BOTH sides that agree on the same game.
+ *
+ * <p><b>Why one from each side, and not "N readings".</b> What has to be prevented is a
+ * side lying about its own result. Three readings from the winning team corroborate
+ * nothing — they are the same claim three times — while a single reading from the
+ * losing side breaks it, because nobody concedes a defeat they did not suffer. So the
+ * rule counts SIDES, not readings, and the number of players per side is irrelevant:
+ * 2v2 and 3v3 need the same evidence.</p>
+ *
+ * <p><b>The reporter's own side is already covered by the report itself</b>, so what
+ * this looks for is one witness from the opposing side. That makes the achievable
+ * minimum two readings for any format — one player per team with the launcher still
+ * open when the game closes.</p>
+ *
+ * <p>`same_game` must be an explicit `'true'`. `'unknown'` means one of the two had no
+ * seed to compare, and accepting it would let two readings of DIFFERENT games
+ * corroborate each other by coincidence. Being this strict is affordable precisely
+ * because the team ladder starts empty: a slow fill costs nobody a rating they already
+ * had, which was not true of 1v1 when the same question was asked of it.</p>
+ */
+export function teamEvidenceMet(input: TeamEvidenceInput): boolean {
+    if (input.reporterTeam === null) return false;
+
+    return input.confirmations.some((c) => {
+        const team = input.teams.get(c.userId);
+        // Somebody the report did not list as a player. `tieConfirmations` already marks
+        // those 'not_reported'; this is the second guard, because a reading from outside
+        // the match is not a witness to it.
+        if (team === undefined) return false;
+        if (team === input.reporterTeam) return false;
+        return c.agreement === 'agree' && c.sameGame === 'true';
+    });
 }
 
 // ---------------------------------------------------------------------------

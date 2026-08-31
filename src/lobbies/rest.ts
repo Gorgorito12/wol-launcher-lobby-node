@@ -177,7 +177,20 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
         // ranked-mod list — that policy lives here and nowhere else.
         const askedCompetitive = body.competitive === true;
         const modKey = body.mod_id.trim().toLowerCase();
-        const competitive = askedCompetitive && cfg.rankedModIds.some((m) => m === modKey) ? 1 : 0;
+        // A competitive room's SIZE is what names its format — 2 seats is 1v1, 4 is 2v2, 6 is
+        // 3v3 — so the launcher reads the format off it instead of sending one. That only holds
+        // if no other size can be competitive, and enforcing it is this side's job: the client
+        // is exactly what an attacker controls, and a competitive room of 8 would leave a match
+        // whose format nothing can name.
+        //
+        // Downgraded to casual rather than refused, the same way a mod with no ladder is: the
+        // room is still perfectly playable, the 201 echoes the effective value, and the launcher
+        // already tells the host in the room chat.
+        const COMPETITIVE_SIZES = [2, 4, 6];
+        const competitive = askedCompetitive
+            && cfg.rankedModIds.some((m) => m === modKey)
+            && COMPETITIVE_SIZES.includes(maxPlayers)
+            ? 1 : 0;
 
         const lobbyId = shortId(8);
         const passwordHash = body.password ? await sha256Hex(body.password) : null;
@@ -185,12 +198,15 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
 
         await ctx.db.batch([
             ctx.db.prepare(
-                `INSERT INTO lobbies (id, host_user_id, title, mod_id, mod_combined_hash,
+                // created_by is written once and never updated — that is the whole point of
+                // it. host_user_id moves to whoever inherits the room, so it is the only
+                // record of who actually opened it, which is what the Discord embed names.
+                `INSERT INTO lobbies (id, host_user_id, created_by, title, mod_id, mod_combined_hash,
                                       max_players, current_players, is_private, password_hash,
                                       status, competitive)
-                 VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, 'open', ?)`,
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'open', ?)`,
             ).bind(
-                lobbyId, userId, title, body.mod_id, body.mod_combined_hash,
+                lobbyId, userId, userId, title, body.mod_id, body.mod_combined_hash,
                 maxPlayers, isPrivate, passwordHash, competitive,
             ),
             ctx.db.prepare(

@@ -1,0 +1,39 @@
+-- Two unrelated columns that happen to ship together.
+--
+-- ---------------------------------------------------------------------------
+-- 1. lobbies.created_by — who OPENED the room, as opposed to who hosts it now.
+-- ---------------------------------------------------------------------------
+-- host_user_id is mutated in place by reassignHost when the host walks out
+-- (GameRanger-style migration), so after the first migration nothing on the row
+-- remembers who created the room. That is fine for every question the server
+-- asks — permission to report a match, permission to start — because those are
+-- all about the CURRENT host.
+--
+-- It is not fine for the Discord announcement. The embed names the creator, and
+-- keeps naming them for the life of the room... until the process restarts, at
+-- which point discordAnnounce's rehydrate() rebuilds its state from this table
+-- by joining host_user_id and silently starts crediting whoever inherited the
+-- room. Since every deploy restarts the service, that is a frequent switch of
+-- author on a message people are reading.
+--
+-- NULL on every existing row, and the reader falls back to host_user_id for
+-- those — i.e. exactly today's behaviour for rooms that predate this.
+ALTER TABLE lobbies ADD COLUMN created_by TEXT;
+
+-- ---------------------------------------------------------------------------
+-- 2. matches.rating_mode — WHICH ladder this match moved.
+-- ---------------------------------------------------------------------------
+-- elo_ratings has carried `mode` since 0001_initial ("per-mode ratings later
+-- (1v1 / team / FFA)"), with PRIMARY KEY (user_id, mode) and an index that
+-- already leads with mode — so a second ladder needs no schema change there.
+-- What was missing is the record of which one a given match belongs to.
+--
+-- Without it, a match's rating_before/rating_after on match_participants cannot
+-- be attributed: 2v2 and 3v3 share the 'team' ladder while 1v1 stays on
+-- 'default', and a history row showing "+18" would not say which number moved.
+-- It is also what lets an operator recompute ONE ladder without replaying the
+-- other through it.
+--
+-- NULL means a row written before this existed, all of which were 'default' —
+-- readers must treat NULL as 'default' rather than as unknown.
+ALTER TABLE matches ADD COLUMN rating_mode TEXT;

@@ -483,10 +483,11 @@ sudo -u wol-lobby ./node_modules/.bin/tsx scripts/admin.ts match:show <matchId>
 
 ### Walking out counts as a loss
 
-After `COMPETITIVE_ABANDON_SECONDS` (default **300**), a player whose connection dies and does
-not come back forfeits a competitive match the recording could not settle. This is the only rule
-here that moves rating from an *absence* of evidence, so it is fenced in hard — the decision is
-the pure `src/elo/abandon.ts` and its refusals are what the tests pin:
+A player whose connection dies **more than `COMPETITIVE_ABANDON_SECONDS` into the match**
+(default **300**) and does not come back forfeits a competitive match the recording could not
+settle. This is the only rule here that moves rating from an *absence* of evidence, so it is
+fenced in hard — the decision is the pure `src/elo/abandon.ts` and its refusals are what the
+tests pin:
 
 - competitive rooms only, and only when ratability said `no_decided_result` — **a recording that
   names a winner always wins**;
@@ -494,6 +495,11 @@ the pure `src/elo/abandon.ts` and its refusals are what the tests pin:
   host's connection dying and taking the room with it);
 - the walkout must be at least **90 s** old — closing the launcher the moment a match ends is
   normal and drops the socket exactly like a rage-quit does;
+- the walkout must be **at least `COMPETITIVE_ABANDON_SECONDS` after the room started**, measured
+  from the moment the socket dropped. It used to be measured from the moment the host REPORTED,
+  which is when the host closed *his* game and says nothing about when the other player left: a
+  real player who left at 4:40 of a match the host kept open for fifteen minutes was forfeited
+  176 points, and would have been forfeited leaving at thirty seconds just the same;
 - the report must have carried a recording, or farming is "open a room, wait, alt-F4, repeat";
 - at most **one per pair of players per 24 h**.
 
@@ -511,7 +517,7 @@ sudo -u wol-lobby ./node_modules/.bin/tsx scripts/admin.ts match:void <matchId> 
 ### Tuning it
 
 ```
-COMPETITIVE_ABANDON_SECONDS=300     # how long a game must run before walking out forfeits
+COMPETITIVE_ABANDON_SECONDS=300     # how far into a match a walkout must be to forfeit
 RANKED_MOD_IDS=wol                  # which mods have a ladder at all
 ```
 

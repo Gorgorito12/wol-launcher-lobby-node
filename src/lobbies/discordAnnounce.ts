@@ -308,10 +308,23 @@ async function rehydrate(lobbyId: string): Promise<RoomAnnounceState | null> {
     if (!database || webhookUrls().length === 0) return null;
     try {
         const row = await database.prepare(
+            // COALESCE(created_by, host_user_id) — the embed names whoever OPENED the room,
+            // for the life of the room.
+            //
+            // This used to join host_user_id, and that was the one path through which a host
+            // migration reached Discord. In normal operation it cannot: notifyRoomChanged only
+            // accepts players/status/title, renderKey ignores the host, and reflectToDiscord has
+            // no case for host_changed — so the state captured at announce time keeps the
+            // creator. But this function rebuilds that state from scratch after a restart, and
+            // every deploy is a restart, so a room that had changed hands silently switched
+            // author on a message people were reading.
+            //
+            // The COALESCE is what makes it safe for rooms opened before migration 0010: their
+            // created_by is NULL and they fall back to exactly the old behaviour.
             `SELECT l.id, l.title, l.mod_id, l.max_players, l.current_players, l.status,
                     l.competitive, l.created_at, l.discord_targets,
                     u.display_name, u.discord_username, u.avatar_url
-             FROM lobbies l JOIN users u ON u.id = l.host_user_id
+             FROM lobbies l JOIN users u ON u.id = COALESCE(l.created_by, l.host_user_id)
              WHERE l.id = ?`,
         ).bind(lobbyId).first<{
             id: string;

@@ -4,8 +4,9 @@ import { uuid } from '../lib/ids';
 import { requireAuth } from '../middleware/auth';
 import { ipRateLimit, Limits } from '../middleware/rateLimit';
 import { applyMatch, DEFAULT_RATING, DEFAULT_RD, DEFAULT_VOLATILITY,
-         type ParticipantOutcome } from '../elo/glicko2';
+         type ParticipantOutcome, type RatingMode } from '../elo/glicko2';
 import { ratabilityReason, compareReadings, canUpgradeFromConfirmation, WIN_AT,
+         matchShape, teamEvidenceMet,
          type UnratedReason } from '../elo/ratability';
 import { decideByAbandon, PAIR_COOLDOWN_MS } from '../elo/abandon';
 import { sqliteTimestampToMs } from '../lib/time';
@@ -342,6 +343,169 @@ async function maybeUpgradeFromConfirmation(
 }
 
 /**
+ * Whether a team match has the reading from the OTHER side that lets it rate.
+ *
+ * <p>The I/O half of {@link teamEvidenceMet}. It recomputes `agreement` and `same_game`
+ * in memory with exactly the rules `tieConfirmations` writes to the row, rather than
+ * reading the stored columns — <b>because at report time they are not written yet</b>.
+ * The player who just lost usually leaves first, so their confirmation routinely lands
+ * before the match row exists, and `tieConfirmations` only runs once it does. Reading
+ * the columns here would therefore report "no evidence" for precisely the ordering that
+ * is most common.</p>
+ *
+ * <p>The stored columns remain the durable record; this is the same question asked a few
+ * milliseconds earlier.</p>
+ */
+async function teamEvidenceForMatch(
+    ctx: AppContext,
+    lobbyId: string | null,
+    participants: readonly { user_id: string; team: number; result: number }[],
+    reporterUserId: string,
+    fingerprint: GameFingerprint,
+): Promise<boolean> {
+    if (!lobbyId) return false;
+
+    const teams = new Map(participants.map((p) => [p.user_id, p.team | 0] as [string, number]));
+    const reported = new Map(participants.map((p) => [p.user_id, p.result] as [string, number]));
+
+    const rows = await ctx.db.prepare(
+        `SELECT user_id, result, game_seed FROM match_confirmations WHERE lobby_id = ?`,
+    ).bind(lobbyId).all<{ user_id: string; result: number; game_seed: number | null }>();
+
+    const confirmations = (rows.results ?? []).map((r) => {
+        const reportedResult = reported.get(r.user_id);
+        return {
+            userId: r.user_id,
+            agreement: reportedResult === undefined
+                ? 'not_reported'
+                : compareReadings(reportedResult, r.result),
+            // Seed alone, the same rule tieConfirmations uses — both machines must
+            // generate the same map, so they must share it.
+            sameGame: fingerprint.seed === null || r.game_seed === null
+                ? 'unknown'
+                : String(fingerprint.seed === r.game_seed),
+        };
+    });
+
+    return teamEvidenceMet({
+        teams,
+        reporterTeam: teams.get(reporterUserId) ?? null,
+        confirmations,
+    });
+}
+
+/**
+ * Rate a team match that was stored waiting for the opposing side's reading, now that
+ * one may have arrived.
+ *
+ * <p>The team counterpart of {@link maybeUpgradeFromConfirmation}, and deliberately a
+ * separate function rather than a branch inside it: that one exists to DECIDE a match
+ * nobody could read, and every clause in it is about trusting a single late reading. This
+ * one decides nothing — the winner was already read and stored by the report — it only
+ * releases a result that was always there once the corroboration rule is satisfied.</p>
+ *
+ * <p>Same two safety properties as its sibling. The row is CLAIMED with a conditional
+ * update, so two callers racing cannot rate one match twice; and a failure puts the row
+ * back rather than leaving it marked rated with no ratings behind it. It does NOT touch
+ * `match_participants.result`, because unlike the late-reading path it never changes who
+ * won.</p>
+ */
+async function maybeRateAwaitingTeamMatch(
+    ctx: AppContext,
+    log: FastifyBaseLogger,
+    lobbyId: string,
+    matchId: string,
+): Promise<void> {
+    const match = await ctx.db.prepare(
+        `SELECT unrated_reason, rating_mode, game_seed, game_host_time,
+                host_user_id, mod_id, map_name
+         FROM matches WHERE id = ?`,
+    ).bind(matchId).first<{
+        unrated_reason: string | null;
+        rating_mode: string | null;
+        game_seed: number | null;
+        game_host_time: number | null;
+        host_user_id: string;
+        mod_id: string;
+        map_name: string | null;
+    }>();
+    if (!match || match.unrated_reason !== 'awaiting_confirmation') return;
+
+    const rows = await ctx.db.prepare(
+        `SELECT user_id, team, result FROM match_participants WHERE match_id = ?`,
+    ).bind(matchId).all<{ user_id: string; team: number; result: number }>();
+    const participants = rows.results ?? [];
+    if (participants.length < 2) return;
+
+    const met = await teamEvidenceForMatch(
+        ctx, lobbyId, participants, match.host_user_id,
+        { seed: match.game_seed, hostTime: match.game_host_time },
+    );
+    if (!met) return;
+
+    const claim = await ctx.db.prepare(
+        `UPDATE matches SET unrated_reason = NULL, rated = 1
+         WHERE id = ? AND unrated_reason = 'awaiting_confirmation'`,
+    ).bind(matchId).run();
+    if (!claim.changes) {
+        log.info({ match_id: matchId }, 'team match already rated by another path');
+        return;
+    }
+
+    const mode: RatingMode = match.rating_mode === 'team' ? 'team' : 'default';
+
+    try {
+        const outcomes: ParticipantOutcome[] = participants.map((p) => ({
+            userId: p.user_id,
+            result: p.result as 0 | 0.5 | 1,
+            team: p.team | 0,
+        }));
+
+        const diff = await applyMatch(ctx.db, outcomes, mode);
+
+        const stamps = [];
+        for (const o of outcomes) {
+            const d = diff.get(o.userId);
+            if (!d) continue;
+            stamps.push(ctx.db.prepare(
+                `UPDATE match_participants SET rating_before = ?, rating_after = ?
+                 WHERE match_id = ? AND user_id = ?`,
+            ).bind(d.before, d.after, matchId, o.userId));
+        }
+        if (stamps.length) await ctx.db.batch(stamps);
+
+        log.info({ match_id: matchId, lobby_id: lobbyId, mode },
+            'team match rated once both sides had read it');
+
+        // The room closed when the host reported, so this is the only way anybody learns
+        // the match ended up counting.
+        ctx.globalChat.announceMatchRated({
+            matchId,
+            lobbyId,
+            modId: match.mod_id,
+            mapName: match.map_name,
+            perUser: new Map(outcomes.map((o) => {
+                const d = diff.get(o.userId);
+                return [o.userId, { result: o.result, before: d?.before ?? null, after: d?.after ?? null }];
+            })),
+        });
+    } catch (err) {
+        // Back to waiting. The results are untouched by design, so only the rating state
+        // has to be undone — and leaving it 'awaiting_confirmation' means a later
+        // confirmation can try again, which is the right outcome for a transient failure.
+        await ctx.db.prepare(
+            `UPDATE matches SET unrated_reason = 'awaiting_confirmation', rated = 0 WHERE id = ?`,
+        ).bind(matchId).run();
+        await ctx.db.prepare(
+            `UPDATE match_participants SET rating_before = NULL, rating_after = NULL
+             WHERE match_id = ?`,
+        ).bind(matchId).run();
+        log.error({ match_id: matchId, err: String(err) },
+            'team match failed to rate; left waiting');
+    }
+}
+
+/**
  * Accept a fingerprint half only if it is a positive integer.
  *
  * <p>0 and absent mean the same thing — the recording did not carry it — and both
@@ -408,6 +572,77 @@ async function abandonVerdict(
         reportHasRecording,
         pairDecidedRecently,
     });
+}
+
+/**
+ * Fill in WHO played each of these matches, and what each of them scored.
+ *
+ * A history row is the caller's OWN <c>match_participants</c> row joined to the match,
+ * so on its own it can say "2 players" and never a name — which is the one thing a
+ * history of games against real people most needs. Both halves were always in the
+ * database and simply never joined: the names live in <c>users</c>, the win/loss in
+ * <c>match_participants.result</c>.
+ *
+ * ONE extra query for the whole page, never one per match: fifty ids go into a single
+ * IN and the rows are grouped here.
+ */
+export async function attachParticipants(
+    ctx: AppContext,
+    matches: Array<Record<string, unknown> & { id: string }>,
+): Promise<void> {
+    if (matches.length === 0) return;
+
+    const ids = matches.map((m) => m.id);
+    const parts = await ctx.db.prepare(
+        `SELECT mp.match_id, mp.user_id, mp.team, mp.result,
+                mp.rating_before, mp.rating_after,
+                u.discord_username, u.display_name, u.avatar_url
+         FROM match_participants mp
+         -- INNER, and unlike the two LEFT JOINs on elo_ratings elsewhere in this codebase
+         -- that is right here: match_participants.user_id is a FK to users(id) ON DELETE
+         -- CASCADE, so a participant cannot outlive its user. A LEFT could only add a
+         -- nameless row nothing could render.
+         JOIN users u ON u.id = mp.user_id
+         WHERE mp.match_id IN (${ids.map(() => '?').join(',')})
+         -- Winner first. The tiebreaks are for the COMMON case, not an edge one: most
+         -- stored matches are all-0.5 because the outcome could not be read, and without
+         -- them those rosters come back in whatever order SQLite happens to produce,
+         -- reshuffling the same match between two visits to the tab.
+         ORDER BY mp.result DESC, mp.team, u.display_name`,
+    ).bind(...ids).all<{
+        match_id: string;
+        user_id: string;
+        team: number;
+        result: number;
+        rating_before: number | null;
+        rating_after: number | null;
+        discord_username: string;
+        display_name: string;
+        avatar_url: string | null;
+    }>();
+
+    const byMatch = new Map<string, unknown[]>();
+    for (const p of parts.results ?? []) {
+        let list = byMatch.get(p.match_id);
+        if (!list) {
+            list = [];
+            byMatch.set(p.match_id, list);
+        }
+        // Same shape the rooms list already uses for a lobby host, so the launcher parses
+        // one convention rather than a third one invented here.
+        list.push({
+            user_id: p.user_id,
+            discord_username: p.discord_username,
+            display_name: p.display_name,
+            avatar_url: p.avatar_url,
+            team: p.team,
+            result: p.result,
+            rating_before: p.rating_before,
+            rating_after: p.rating_after,
+        });
+    }
+
+    for (const m of matches) m.participants = byMatch.get(m.id) ?? [];
 }
 
 export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void {
@@ -568,6 +803,28 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
             unratedReason = 'duplicate_recording';
         }
 
+        // Which ladder this belongs to. Derived from the report's own shape, so it can
+        // never disagree with the participants that are about to be rated; null here only
+        // for a shape ratabilityReason already refused with `not_1v1`.
+        const shape = matchShape(body.participants);
+        const ratingMode: RatingMode = shape === 'team' ? 'team' : 'default';
+
+        // A TEAM match is not rated on the reporter's word alone. His report is his own
+        // side's reading; the ladder waits for one from the other side that agrees, on the
+        // same game (`teamEvidenceMet`). Unlike every other reason this one is temporary —
+        // POST /matches/confirm clears it when the witness arrives.
+        //
+        // Checked HERE as well as there because the order is not guaranteed: the player
+        // who just lost usually leaves first, so their confirmation routinely lands before
+        // the host has reported at all.
+        if (unratedReason === null && shape === 'team') {
+            const met = await teamEvidenceForMatch(
+                ctx, body.lobby_id ?? null, body.participants, userId,
+                { seed: gameSeed, hostTime: gameHostTime },
+            );
+            if (!met) unratedReason = 'awaiting_confirmation';
+        }
+
         // Nobody won — but somebody may simply have walked out. This is the only rule in
         // the project that moves rating from an ABSENCE of evidence, so it is fenced in
         // hard: competitive rooms only, only when the recording could not answer (a
@@ -620,8 +877,13 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
             const outcomes: ParticipantOutcome[] = body.participants.map((p) => ({
                 userId: p.user_id,
                 result: p.result,
+                // Only for a real team shape. Sending `team` for a 1v1 would change
+                // nothing (two players on different sides face each other either way),
+                // but sending the 0 that every pre-team report carries would put both
+                // players on the SAME side and skip the only pairing there is.
+                team: shape === 'team' ? (p.team | 0) : undefined,
             }));
-            diff = await applyMatch(ctx.db, outcomes);
+            diff = await applyMatch(ctx.db, outcomes, ratingMode);
         } else {
             req.log.info(
                 { match_id: matchId, mod_id: body.mod_id, players: body.participants.length,
@@ -639,8 +901,15 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
         // `rated = 1` with no ratings behind it is exactly the inconsistency the correction
         // path goes to some length to avoid creating.
         await ctx.db.prepare(
-            `UPDATE matches SET unrated_reason = ?, rated = ?, decided_by = ? WHERE id = ?`,
-        ).bind(unratedReason, unratedReason === null ? 1 : 0, decidedBy, matchId).run();
+            `UPDATE matches SET unrated_reason = ?, rated = ?, decided_by = ?, rating_mode = ?
+             WHERE id = ?`,
+        ).bind(
+            unratedReason, unratedReason === null ? 1 : 0, decidedBy,
+            // Stored even when the match did not rate, and that is deliberate: a row
+            // waiting on a confirmation has to remember which ladder it is waiting FOR,
+            // or the upgrade below would have to guess.
+            ratingMode, matchId,
+        ).run();
 
         const updates = [];
         for (const p of body.participants) {
@@ -694,6 +963,17 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
             } catch (err) {
                 req.log.info({ match_id: matchId, err: String(err) },
                     'late reading could not be applied');
+            }
+
+            // The team counterpart: this match may have gone down 'awaiting_confirmation'
+            // a moment ago while the opposing side's reading was ALREADY on file — the
+            // usual ordering, since the losing side leaves first. tieConfirmations has
+            // just run, so by now the evidence is written down as well as computable.
+            try {
+                await maybeRateAwaitingTeamMatch(ctx, req.log, body.lobby_id, matchId);
+            } catch (err) {
+                req.log.info({ match_id: matchId, err: String(err) },
+                    'team match could not be rated');
             }
 
             await ctx.db.prepare(
@@ -807,6 +1087,14 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
             // The other direction: the report is already in, and THIS reading may be the one
             // that can decide it. Same guard, same rule — the row is only eligible while it
             // says 'no_decided_result', so this can never overturn a decided match.
+            // A team match stored waiting for exactly this reading.
+            try {
+                await maybeRateAwaitingTeamMatch(ctx, req.log, body.lobby_id, match.id);
+            } catch (err) {
+                req.log.info({ match_id: match.id, err: String(err) },
+                    'team match could not be rated');
+            }
+
             try {
                 await maybeUpgradeFromConfirmation(ctx, req.log, body.lobby_id, match.id);
             } catch (err) {
@@ -832,8 +1120,11 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
              WHERE mp.user_id = ?
              ORDER BY m.started_at DESC
              LIMIT 50`,
-        ).bind(userId).all();
-        return reply.send({ matches: rows.results ?? [] });
+        ).bind(userId).all<Record<string, unknown> & { id: string }>();
+
+        const matches = rows.results ?? [];
+        await attachParticipants(ctx, matches);
+        return reply.send({ matches });
     });
 
     app.get('/matches/elo/:userId', {
