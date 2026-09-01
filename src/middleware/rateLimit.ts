@@ -125,6 +125,13 @@ export const Limits = {
     // its budget. Cached for a minute server-side, so this ceiling is never reached
     // by honest use anyway.
     StatsPublicIp:    { scope: 'statsp',    keyKind: 'ip',   perMinute: 30,  perDay: 2000 } as const,
+    // Civilization balance. Its OWN scope for the same reason StatsPublicIp has one: the
+    // community strip already polls /stats/community once a minute while the tab is focused,
+    // which is most of that 2000/day from a single launcher, and behind one Radmin NAT two
+    // machines share the count. A table nobody has open must not be able to starve the one
+    // everybody does. Fetched lazily and cached a minute on both sides, so this ceiling is
+    // never reached by honest use either.
+    StatsCivsIp:      { scope: 'statsc',    keyKind: 'ip',   perMinute: 20,  perDay: 600  } as const,
     LobbyCreateUser:  { scope: 'lcreate-u', keyKind: 'user', perMinute: 10,  perDay: 100  } as const,
     LobbyJoinUser:    { scope: 'ljoin-u',   keyKind: 'user', perMinute: 50,  perDay: 200  } as const,
     ReportUser:       { scope: 'report-u',  keyKind: 'user', perMinute: 5,   perDay: 20   } as const,

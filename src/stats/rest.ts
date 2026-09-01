@@ -99,6 +99,19 @@ const CACHE_TTL_MS = 60_000;
 interface CacheEntry { at: number; limit: number; payload: unknown }
 let cache: CacheEntry | null = null;
 
+/** The civilization table's own memo. Same TTL, its own slot: it is fetched by a different
+ *  page and a different set of clients, so sharing one would evict the busy one constantly. */
+let civCache: { at: number; payload: unknown } | null = null;
+
+/** A civilization is listed once it has been played this many RATED 1v1s. One is enough to be
+ *  a fact; what needs a sample is the win RATE, and that bar lives in the launcher, next to the
+ *  card that decides whether to print one. */
+const CIV_MIN_PLAYED = 1;
+
+/** How many rows the table carries. Wars of Liberty ships 188 civilizations and this is per mod
+ *  AND per version, so the cap is what stops one payload from growing without bound. */
+const CIV_LIMIT = 400;
+
 interface LeaderRow {
     id: string;
     discord_username: string;
@@ -345,6 +358,94 @@ export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
         };
 
         cache = { at: now, limit, payload };
+        reply.header('Cache-Control', 'public, max-age=60');
+        return payload;
+    });
+
+    /**
+     * How each civilization is doing — the community's balance table, and the reason the
+     * launcher started resolving civilization names at all.
+     *
+     * Grouped by mod AND by VERSION. `mod_combined_hash` has been stored on every match since
+     * migration 0005 and read by nobody; it pins the exact build, so 1.2.0e and 1.2.0f do not
+     * average together. Mixing them would make the number useless at exactly the moment a modder
+     * changes something, which is the moment it exists for.
+     *
+     * Only RATED 1v1s. `rating_mode` is NULL for every match stored before migration 0010 and
+     * those were all 'default', so NULL has to be read as 1v1 rather than skipped. Team games are
+     * excluded because a civilization's record in a 2v2 answers a different question, and unrated
+     * ones because they were never judged.
+     *
+     * The launcher decides what to SHOW: the record and the count always, a percentage only past
+     * its own bar, and never an ordering by that percentage. This endpoint only counts.
+     */
+    app.get('/stats/civs', {
+        preHandler: [ipRateLimit(ctx, Limits.StatsCivsIp)],
+    }, async (_req, reply) => {
+        const now = Date.now();
+        if (civCache && now - civCache.at < CACHE_TTL_MS) {
+            reply.header('Cache-Control', 'public, max-age=60');
+            return civCache.payload;
+        }
+
+        const rows = await ctx.db.prepare(
+            `SELECT m.mod_id, m.mod_combined_hash, mp.civ,
+                    COUNT(*) AS played,
+                    SUM(CASE WHEN mp.result >= 0.999 THEN 1 ELSE 0 END) AS wins,
+                    SUM(CASE WHEN mp.result <= 0.001 THEN 1 ELSE 0 END) AS losses,
+                    AVG(m.duration_seconds) AS avg_seconds
+               FROM match_participants mp
+               JOIN matches m ON m.id = mp.match_id
+              WHERE mp.civ IS NOT NULL AND TRIM(mp.civ) <> ''
+                AND m.rated = 1
+                AND (m.rating_mode IS NULL OR m.rating_mode = 'default')
+              GROUP BY m.mod_id, m.mod_combined_hash, mp.civ
+             HAVING played >= ?
+              ORDER BY played DESC, mp.civ ASC
+              LIMIT ?`,
+        ).bind(CIV_MIN_PLAYED, CIV_LIMIT).all<{
+            mod_id: string;
+            mod_combined_hash: string;
+            civ: string;
+            played: number;
+            wins: number;
+            losses: number;
+            avg_seconds: number | null;
+        }>();
+
+        const civs = (rows.results ?? []).map((r) => ({
+            mod_id: r.mod_id,
+            mod_version: r.mod_combined_hash,
+            civ: r.civ,
+            played: r.played,
+            wins: r.wins,
+            losses: r.losses,
+            avg_seconds: r.avg_seconds == null ? null : Math.round(r.avg_seconds),
+        }));
+
+        // Counted, not derived. Summing the rows and halving them would assume BOTH players'
+        // civilizations resolved, and one of them failing is ordinary — a mod that ships its civ
+        // list inside Data.bar resolves neither, and a roster that could not be joined resolves
+        // none. The launcher prints this figure above the table, so it has to be the real one.
+        const matched = await ctx.db.prepare(
+            `SELECT COUNT(DISTINCT m.id) AS n
+               FROM match_participants mp
+               JOIN matches m ON m.id = mp.match_id
+              WHERE mp.civ IS NOT NULL AND TRIM(mp.civ) <> ''
+                AND m.rated = 1
+                AND (m.rating_mode IS NULL OR m.rating_mode = 'default')`,
+        ).bind().first<{ n: number }>();
+
+        const payload = {
+            generated_at: new Date(now).toISOString(),
+            // How many matches contributed anything at all. The launcher says it out loud above
+            // the table: with civilizations only reported from one build onwards, "nothing here
+            // yet" is the honest state for a while and a blank table would read as broken.
+            rated_matches_with_civ: matched?.n ?? 0,
+            civs,
+        };
+
+        civCache = { at: now, payload };
         reply.header('Cache-Control', 'public, max-age=60');
         return payload;
     });
