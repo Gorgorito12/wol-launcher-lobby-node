@@ -1132,7 +1132,20 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
              LIMIT 50`,
         ).bind(userId).all<Record<string, unknown> & { id: string }>();
 
-        const matches = rows.results ?? [];
+        // `rated` is coerced to a real boolean here, and this is not cosmetic: SQLite has no
+        // boolean type, the column is INTEGER, and better-sqlite3 hands it back as a JS number.
+        // Sent raw it goes out as `1`, and a client that declares the field a boolean cannot
+        // bind it — System.Text.Json throws, the exception aborts the WHOLE array, and one row
+        // takes the entire history page down. That is exactly what shipped in launcher 1.0.13l:
+        // the page sat on "Loading..." for ever.
+        //
+        // NULL is PRESERVED rather than folded into false. A row from before migration 0006 has
+        // no answer, and "we don't know" is not "it did not count" — flattening it would make
+        // every old match claim it was unrated.
+        const matches = (rows.results ?? []).map((m) => ({
+            ...m,
+            rated: m.rated == null ? null : Boolean(m.rated),
+        }));
         await attachParticipants(ctx, matches);
         return reply.send({ matches });
     });
