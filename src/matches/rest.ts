@@ -18,6 +18,8 @@ interface ReportMatchBody {
     mod_id: string;
     mod_combined_hash: string;
     map_name?: string;
+    /** The map POOL the map was drawn from ("ESOC Maps"), not the map itself. */
+    map_pool?: string;
     started_at: string;
     ended_at: string;
     duration_seconds: number;
@@ -594,7 +596,7 @@ export async function attachParticipants(
 
     const ids = matches.map((m) => m.id);
     const parts = await ctx.db.prepare(
-        `SELECT mp.match_id, mp.user_id, mp.team, mp.result,
+        `SELECT mp.match_id, mp.user_id, mp.team, mp.civ, mp.result,
                 mp.rating_before, mp.rating_after,
                 u.discord_username, u.display_name, u.avatar_url
          FROM match_participants mp
@@ -613,6 +615,7 @@ export async function attachParticipants(
         match_id: string;
         user_id: string;
         team: number;
+        civ: string | null;
         result: number;
         rating_before: number | null;
         rating_after: number | null;
@@ -636,6 +639,11 @@ export async function attachParticipants(
             display_name: p.display_name,
             avatar_url: p.avatar_url,
             team: p.team,
+            // Everyone's civilization, not just the caller's. The history select has always
+            // carried mp.civ for the requesting user's own row, so without this a match could
+            // say which civ YOU played and never which one you played against -- which is the
+            // half that makes a matchup readable.
+            civ: p.civ,
             result: p.result,
             rating_before: p.rating_before,
             rating_after: p.rating_after,
@@ -757,9 +765,9 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
         const inserts = [
             ctx.db.prepare(
                 `INSERT INTO matches (id, lobby_id, host_user_id, mod_id, mod_combined_hash,
-                                      map_name, duration_seconds, started_at, ended_at,
+                                      map_name, map_pool, duration_seconds, started_at, ended_at,
                                       replay_sha256, game_seed, game_host_time)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             ).bind(
                 matchId,
                 body.lobby_id ?? null,
@@ -767,6 +775,7 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
                 body.mod_id,
                 body.mod_combined_hash,
                 body.map_name ?? null,
+                body.map_pool ?? null,
                 Math.max(0, body.duration_seconds | 0),
                 body.started_at,
                 body.ended_at,
@@ -1120,7 +1129,7 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
             //
             // NULL on both means a row written before that migration: "we don't know",
             // which is not the same as "it counted", and the client treats it that way.
-            `SELECT m.id, m.mod_id, m.map_name, m.duration_seconds, m.started_at, m.ended_at,
+            `SELECT m.id, m.mod_id, m.map_name, m.map_pool, m.duration_seconds, m.started_at, m.ended_at,
                     m.replay_object_key, m.rated, m.unrated_reason,
                     mp.team, mp.civ, mp.score, mp.result,
                     mp.rating_before, mp.rating_after,

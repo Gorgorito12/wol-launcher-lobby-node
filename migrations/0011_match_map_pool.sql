@@ -1,0 +1,22 @@
+-- The map POOL a match was played from, alongside the map itself.
+--
+-- The recording has always carried both and the launcher has always parsed both:
+-- `gamefilename` is the map that was played ("ESOC_Baja California") and `gamemapname`
+-- is the pool it was drawn from ("ESOC Maps"). Only the first was ever stored, and the
+-- second was thrown away — which is why a stored match cannot say whether it was played
+-- from the competitive pool or from the casual map list.
+--
+-- It matters for BALANCE, which is what this column exists for: a civ's record on the
+-- ESOC pool and its record across every map anyone happens to pick are different
+-- questions, and without the pool they cannot be told apart after the fact.
+--
+-- Verified before adding it: across seven real recordings this field genuinely varies
+-- ("ESOC Maps", "amazonia", "Mapas normales") and agrees with the map. Two neighbouring
+-- keys were measured at the same time and deliberately NOT stored — `gamestartwithtreaty`
+-- reads true in all seven, including plain skirmishes with no treaty, and
+-- `gamestartingage` reads 0 in all seven, so neither can be shown to mean what its name
+-- says. See the .age3Yrec section of the launcher's multiplayer rules.
+--
+-- NULL means a match reported before this existed, or one whose recording was never read.
+-- It is not "no pool".
+ALTER TABLE matches ADD COLUMN map_pool TEXT;
