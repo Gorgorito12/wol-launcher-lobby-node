@@ -1111,8 +1111,18 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
     }, async (req, reply) => {
         const userId = (req.params as { userId: string }).userId;
         const rows = await ctx.db.prepare(
+            // m.rated / m.unrated_reason are stored columns (migration 0006) that this
+            // endpoint simply never selected, so a history row could show that a match did
+            // not count but never why — and the launcher's card was left inferring "nobody
+            // recorded it", which is right for the common case and wrong for a team game, a
+            // non-competitive room or a mod with no ladder. The reason it now carries maps
+            // straight onto the explanations the end-of-match card already has.
+            //
+            // NULL on both means a row written before that migration: "we don't know",
+            // which is not the same as "it counted", and the client treats it that way.
             `SELECT m.id, m.mod_id, m.map_name, m.duration_seconds, m.started_at, m.ended_at,
-                    m.replay_object_key, mp.team, mp.civ, mp.score, mp.result,
+                    m.replay_object_key, m.rated, m.unrated_reason,
+                    mp.team, mp.civ, mp.score, mp.result,
                     mp.rating_before, mp.rating_after,
                     (SELECT COUNT(*) FROM match_participants WHERE match_id = m.id) AS player_count
              FROM match_participants mp

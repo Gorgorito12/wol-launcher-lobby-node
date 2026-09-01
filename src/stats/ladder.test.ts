@@ -15,7 +15,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { MIN_DECIDED, LADDER_ORDER_BY, conservativeRating } from './rest';
+import { MIN_DECIDED, LADDER_ORDER_BY, LADDER_WHERE, conservativeRating } from './rest';
 
 /** The live table, the day the rule changed. */
 const LIVE = [
@@ -78,4 +78,18 @@ test('the entry bar is a floor, not the mechanism', () => {
     const eligible = LIVE.filter(r => r.games >= MIN_DECIDED).map(r => r.name);
     assert.ok(!eligible.includes('Gorgorito12'));
     assert.ok(eligible.includes('Aluclown'));
+});
+
+test('the ladder and its size ask the same question', () => {
+    // The profile says "rank 7 of 18". The 7 comes from the list, the 18 from a COUNT, and
+    // if those two ever filter differently the sentence is wrong in a way neither side can
+    // see — a player at "7 of 18" in a table showing 20 names. There is one WHERE and both
+    // queries interpolate it; this pins that it still says what it has to say.
+    assert.match(LADDER_WHERE, /e\.mode\s*=\s*\?/);
+    assert.match(LADDER_WHERE, /u\.is_banned\s*=\s*0/);
+    assert.match(LADDER_WHERE, /e\.games_played\s*>=\s*\?/);
+
+    // And that it is a WHERE rather than something that would silently splice into the
+    // COUNT query, which has no JOINs of its own to hang a condition on.
+    assert.match(LADDER_WHERE.trim(), /^WHERE/);
 });

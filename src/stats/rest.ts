@@ -55,6 +55,22 @@ export const MIN_DECIDED = 5;
  */
 export const LADDER_ORDER_BY = '(e.rating - 2 * e.rd) DESC';
 
+/**
+ * Who is on a ladder at all. SHARED, not copied, by the list and by the count of it.
+ *
+ * <p>A count that filtered differently from the list it describes would be worse than no
+ * count: it would put somebody at "7 of 18" in a table showing 20 names, and the disagreement
+ * would be invisible from either side. Two queries spelling out the same three conditions is
+ * exactly the shape that drifts, so there is one string and both interpolate it.</p>
+ *
+ * <p>The bound parameters are positional, so a caller must bind mode then MIN_DECIDED in that
+ * order, after whatever its own SELECT needs.</p>
+ */
+export const LADDER_WHERE = `WHERE e.mode = ?
+           AND u.is_banned = 0
+           AND e.games_played >= ?`;
+
+
 /** The same rule as {@link LADDER_ORDER_BY}, for tests and for anything that has to explain it. */
 export function conservativeRating(row: { rating: number; rd: number }): number {
     return row.rating - 2 * row.rd;
@@ -153,9 +169,7 @@ async function ladder(ctx: AppContext, mode: 'default' | 'team', limit: number) 
              WHERE COALESCE(m.rating_mode, 'default') = ?
              GROUP BY mp.user_id
          ) w ON w.user_id = e.user_id
-         WHERE e.mode = ?
-           AND u.is_banned = 0
-           AND e.games_played >= ?
+         ${LADDER_WHERE}
          ORDER BY ${LADDER_ORDER_BY}
          LIMIT ?`,
     ).bind(WIN_AT, LOSS_AT, mode, mode, MIN_DECIDED, limit).all<LeaderRow>();
@@ -175,6 +189,26 @@ async function ladder(ctx: AppContext, mode: 'default' | 'team', limit: number) 
         wins: r.wins,
         losses: r.losses,
     }));
+}
+
+/**
+ * How many players are ON a ladder, ignoring the page limit.
+ *
+ * <p>It exists because the launcher's profile says "rank 7 of 18", and `leaderboard.length`
+ * is only that number while the table is smaller than the page — the day it passes 50 that
+ * sentence would quietly start reporting the page size as the size of the league.</p>
+ *
+ * <p>It shares {@link LADDER_WHERE} with the list itself, which is the only reason the two
+ * can be trusted to describe the same set of people.</p>
+ */
+async function ladderSize(ctx: AppContext, mode: 'default' | 'team'): Promise<number> {
+    const row = await ctx.db.prepare(
+        `SELECT COUNT(*) AS n
+         FROM elo_ratings e
+         JOIN users u ON u.id = e.user_id
+         ${LADDER_WHERE}`,
+    ).bind(mode, MIN_DECIDED).first<{ n: number }>();
+    return row?.n ?? 0;
 }
 
 export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
@@ -197,10 +231,13 @@ export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
         // of the multiplayer notes: the community strip is one endpoint, because the
         // request budget is per IP and shared behind a Radmin NAT — a second route would
         // cost double for a page nobody asked twice for.
-        const [leaderboard, leaderboard_team] = await Promise.all([
-            ladder(ctx, 'default', limit),
-            ladder(ctx, 'team', limit),
-        ]);
+        const [leaderboard, leaderboard_team, ranked_players, ranked_players_team] =
+            await Promise.all([
+                ladder(ctx, 'default', limit),
+                ladder(ctx, 'team', limit),
+                ladderSize(ctx, 'default'),
+                ladderSize(ctx, 'team'),
+            ]);
 
         // Source is lobbies.created_at, and the wording on the card has to match:
         // this is when people OPEN ROOMS, not when they play. Rooms are stamped by
@@ -279,6 +316,11 @@ export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
             // field; a newer one against an older server deserializes it to null, which it
             // reads as "this backend has no team ladder" rather than as an empty one.
             leaderboard_team,
+            // How many players are on each ladder in total, which is NOT the length of the
+            // lists above once the league outgrows the page. The profile's "rank 7 of 18"
+            // reads these; a launcher older than them shows the rank alone.
+            ranked_players,
+            ranked_players_team,
             totals: {
                 window_days: ACTIVITY_WINDOW_DAYS,
                 matches: totals?.matches ?? 0,
