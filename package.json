@@ -13,7 +13,7 @@
     "start": "tsx src/index.ts",
     "typecheck": "tsc --noEmit",
     "admin": "tsx scripts/admin.ts",
-    "test": "tsx --test src/elo/ratability.test.ts src/elo/abandon.test.ts src/lib/launcherVersion.test.ts src/stats/ladder.test.ts src/stats/topMaps.test.ts src/stats/matchups.test.ts src/stats/deckCards.test.ts src/tournaments/bracket.test.ts src/tournaments/entrants.test.ts src/tournaments/lifecycle.test.ts src/tournaments/listing.test.ts"
+    "test": "tsx --test src/elo/ratability.test.ts src/elo/abandon.test.ts src/lib/launcherVersion.test.ts src/stats/ladder.test.ts src/stats/topMaps.test.ts src/stats/matchups.test.ts src/stats/deckCards.test.ts src/stats/modScope.test.ts src/stats/teamMode.test.ts src/tournaments/bracket.test.ts src/tournaments/entrants.test.ts src/tournaments/lifecycle.test.ts src/tournaments/listing.test.ts src/tournaments/rosters.test.ts"
   },
   "dependencies": {
     "@fastify/cors": "^9.0.1",

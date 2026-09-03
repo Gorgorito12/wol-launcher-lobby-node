@@ -12,7 +12,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { TOURNAMENT_LIST_WHERE } from './store';
+import { TOURNAMENT_LIST_WHERE, LIST_COLUMNS } from './store';
 import { aliveWhereClause, DRAFT_STALE_DAYS, LIVE_STALE_DAYS } from './lifecycle';
 
 test('the list hides drafts', () => {
@@ -56,4 +56,37 @@ test('a finished tournament is not filtered out by the list rule itself', () => 
     // keeping them out of a listing would be an explicit status filter — and there is
     // none beyond the draft one. History stays visible.
     assert.match(TOURNAMENT_LIST_WHERE, /status IN \('finished','cancelled','abandoned'\)/);
+});
+
+// ---------------------------------------------------------------- what a row carries
+
+test('the list counts applications separately from entrants', () => {
+    // `entrant_count` lumps pending, confirmed and waitlisted together, so it cannot answer
+    // "does this tournament need a decision from me". The launcher's list row says
+    // "2 requests" from this second count, and without it somebody has to open every
+    // tournament they own to find out whether anybody is waiting.
+    assert.match(LIST_COLUMNS, /AS pending_count/);
+    assert.match(LIST_COLUMNS, /e\.status\s*=\s*'pending'\)\s*AS pending_count/);
+});
+
+test('the two counts are different questions and stay different', () => {
+    // The trap is copying the entrant filter into the new count: 'pending' is ONE of the
+    // three statuses entrant_count accepts, so a copy would make the two columns equal
+    // for a tournament in approval mode and nobody would notice until a row claimed every
+    // entrant was an application.
+    const entrant = /AND e\.status IN \('pending','confirmed','waitlist'\)\) AS entrant_count/;
+    assert.match(LIST_COLUMNS, entrant);
+    assert.equal(
+        LIST_COLUMNS.match(/AS pending_count/g)?.length, 1,
+        'pending_count is selected exactly once',
+    );
+});
+
+test('the counts are properties of the tournament, not of the viewer', () => {
+    // /tournaments is served from ONE memo shared by every caller. A column that depended
+    // on who asked would be cached and then served to the wrong person, which is why
+    // "it is your turn to play" is NOT in this list and lives on the open tournament
+    // instead. Nothing here may bind a user id.
+    assert.equal(LIST_COLUMNS.includes('?'), false,
+        'a bound parameter here would mean a per-viewer column in a shared memo');
 });

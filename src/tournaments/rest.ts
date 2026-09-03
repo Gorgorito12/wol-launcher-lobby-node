@@ -736,6 +736,7 @@ function listView(t: store.TournamentListRow): Record<string, unknown> {
         capacity: t.capacity,
         confirmed_count: t.confirmed_count,
         entrant_count: t.entrant_count ?? 0,
+        pending_count: t.pending_count ?? 0,
         created_at: t.created_at,
         last_activity_at: t.last_activity_at,
     };
@@ -769,10 +770,14 @@ async function notifyEntrant(
 }
 
 async function displayNameOf(ctx: AppContext, userId: string): Promise<string> {
+    // The naming rule lives in ONE place: store.USER_DISPLAY_NAME_SQL. It used to be
+    // spelled again in JavaScript here, and two copies of "which column wins" are free to
+    // disagree — the symptom being a player named one way in a bracket and another in the
+    // room they just opened.
     const u = await ctx.db.prepare(
-        `SELECT display_name, discord_username FROM users WHERE id = ?`,
-    ).bind(userId).first<{ display_name: string; discord_username: string }>();
-    return u?.display_name || u?.discord_username || 'Unknown';
+        `SELECT ${store.USER_DISPLAY_NAME_SQL} AS display_name FROM users u WHERE u.id = ?`,
+    ).bind(userId).first<{ display_name: string }>();
+    return u?.display_name || 'Unknown';
 }
 
 async function disqualifiedSet(ctx: AppContext, tournamentId: string): Promise<Set<string>> {
@@ -823,7 +828,7 @@ async function buildDetail(ctx: AppContext, id: string): Promise<unknown> {
     if (!t) throw Errors.NotFound('Tournament');
 
     const entrants = await store.listEntrants(ctx.db, id);
-    const rosters = await store.loadRosters(ctx.db, id);
+    const rosters = await store.loadRosterMembers(ctx.db, id);
     const bracket = await store.loadBracket(ctx.db, id);
 
     const lobbies = new Map<string, { id: string; host_user_id: string; status: string }>();
@@ -855,7 +860,13 @@ async function buildDetail(ctx: AppContext, id: string): Promise<unknown> {
             captain_user_id: e.captain_user_id,
             seed: e.seed,
             status: e.status,
-            member_ids: rosters.get(e.id) ?? [],
+            // Both shapes, on purpose. `members` carries the names a team card needs to
+            // draw its line-up; `member_ids` stays because every launcher shipped before
+            // this field reads that one and nothing else, and dropping it would empty the
+            // team bracket with no error to explain why. Same reason `top_map` survived
+            // the arrival of `top_maps`.
+            member_ids: (rosters.get(e.id) ?? []).map((m) => m.user_id),
+            members: rosters.get(e.id) ?? [],
         })),
         matches: bracket.map((m) => ({
             id: m.id,

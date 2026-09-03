@@ -119,23 +119,73 @@ export async function listEntrants(db: Db, tournamentId: string): Promise<Entran
     return r.results ?? [];
 }
 
-/** Frozen rosters for a whole tournament, as entrant id to user ids. */
+/**
+ * How a person's name is chosen, once, for every query that needs one.
+ *
+ * `display_name` first, the Discord handle when it is blank, and a placeholder when even
+ * that is missing. Written as SQL rather than repeated in TypeScript because two copies of
+ * this rule would be free to disagree, and the symptom would be the same player named one
+ * way in a bracket and another in a room.
+ *
+ * `NULLIF` is what makes it match the JavaScript it replaced: `||` treats an empty string
+ * as absent, and plain `COALESCE` would not.
+ */
+export const USER_DISPLAY_NAME_SQL =
+    `COALESCE(NULLIF(u.display_name, ''), NULLIF(u.discord_username, ''), 'Unknown')`;
+
+/** One player of a frozen roster, with the name to draw for them. */
+export interface RosterMember {
+    user_id: string;
+    display_name: string;
+}
+
+/**
+ * Frozen rosters for a whole tournament, entrant id to its players AND their names.
+ *
+ * <p>The names are here because a bracket slot in a 3v3 holds a whole team, and a team name
+ * alone does not tell somebody whether they are in it. Ids cannot be drawn.</p>
+ *
+ * <p>Frozen: this reads `tournament_entrant_members`, the copy taken at registration, never
+ * `team_members`. A saved team can change the day after it entered, and the people who
+ * registered are the people who play.</p>
+ */
+export async function loadRosterMembers(
+    db: Db,
+    tournamentId: string,
+): Promise<Map<string, RosterMember[]>> {
+    const r = await db.prepare(
+        `SELECT m.entrant_id, m.user_id, ${USER_DISPLAY_NAME_SQL} AS display_name
+           FROM tournament_entrant_members m
+           JOIN tournament_entrants e ON e.id = m.entrant_id
+           LEFT JOIN users u ON u.id = m.user_id
+          WHERE e.tournament_id = ?`,
+    ).bind(tournamentId).all<{ entrant_id: string; user_id: string; display_name: string }>();
+
+    const out = new Map<string, RosterMember[]>();
+    for (const row of r.results ?? []) {
+        const member = { user_id: row.user_id, display_name: row.display_name };
+        const list = out.get(row.entrant_id);
+        if (list) list.push(member);
+        else out.set(row.entrant_id, [member]);
+    }
+    return out;
+}
+
+/**
+ * The same rosters as ids alone, for the callers that only need to know WHO.
+ *
+ * Derived from the query above rather than asking again: two queries over one table are
+ * free to drift apart, and then the roster used to seed would stop being the roster shown.
+ * The extra cost is a primary-key join the id-only callers do not use, which is nothing.
+ */
 export async function loadRosters(
     db: Db,
     tournamentId: string,
 ): Promise<Map<string, string[]>> {
-    const r = await db.prepare(
-        `SELECT m.entrant_id, m.user_id
-           FROM tournament_entrant_members m
-           JOIN tournament_entrants e ON e.id = m.entrant_id
-          WHERE e.tournament_id = ?`,
-    ).bind(tournamentId).all<{ entrant_id: string; user_id: string }>();
-
+    const full = await loadRosterMembers(db, tournamentId);
     const out = new Map<string, string[]>();
-    for (const row of r.results ?? []) {
-        const list = out.get(row.entrant_id);
-        if (list) list.push(row.user_id);
-        else out.set(row.entrant_id, [row.user_id]);
+    for (const [entrantId, members] of full) {
+        out.set(entrantId, members.map((m) => m.user_id));
     }
     return out;
 }
@@ -279,16 +329,24 @@ export interface TournamentListRow {
     capacity: number;
     confirmed_count: number;
     entrant_count: number;
+    pending_count: number;
     created_at: string;
     last_activity_at: string;
 }
 
-const LIST_COLUMNS = `
+export const LIST_COLUMNS = `
     t.id, t.name, t.mod_id, t.owner_user_id, t.format, t.team_source, t.entry_mode,
     t.status, t.capacity, t.confirmed_count, t.created_at, t.last_activity_at,
     (SELECT COUNT(*) FROM tournament_entrants e
       WHERE e.tournament_id = t.id
-        AND e.status IN ('pending','confirmed','waitlist')) AS entrant_count`;
+        AND e.status IN ('pending','confirmed','waitlist')) AS entrant_count,
+    -- Applications waiting on the owner. Counted here so the launcher's list can say "2
+    -- requests" on the row instead of making somebody open every tournament to find out;
+    -- it is a property of the tournament and not of the viewer, so the shared anonymous
+    -- memo over this list stays anonymous.
+    (SELECT COUNT(*) FROM tournament_entrants e
+      WHERE e.tournament_id = t.id
+        AND e.status = 'pending') AS pending_count`;
 
 /** The public list: newest activity first, drafts excluded, stale ones already gone. */
 export async function listTournaments(db: Db, limit: number): Promise<TournamentListRow[]> {
