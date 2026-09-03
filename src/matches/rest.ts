@@ -11,6 +11,8 @@ import { ratabilityReason, compareReadings, canUpgradeFromConfirmation, WIN_AT,
 import { decideByAbandon, PAIR_COOLDOWN_MS } from '../elo/abandon';
 import { sqliteTimestampToMs } from '../lib/time';
 import { finalizeRoom } from '../lobbies/discordAnnounce';
+import { advanceTournamentFromMatch } from '../tournaments/advance';
+import { getTournament, loadBracket } from '../tournaments/store';
 import type { AppContext } from '../context';
 
 interface ReportMatchBody {
@@ -27,6 +29,9 @@ interface ReportMatchBody {
         user_id: string;
         team: number;
         civ?: string;
+        /** The home CITY this player brought ("Beijing"), from the recording. The city and
+         *  never the deck: see migration 0012 for why that is as far as it goes. */
+        home_city?: string;
         score: number;
         result: 0 | 0.5 | 1;
     }>;
@@ -177,6 +182,56 @@ async function tieConfirmations(
  * <p>Best-effort in every direction: the caller wraps it, and a failure changes nothing about
  * the report or the confirmation that triggered it.</p>
  */
+/**
+ * Advance the bracket this match belongs to, and tell the two sides.
+ *
+ * Called from THREE places, because a match can be decided at three different moments:
+ * the host's report, a late 1v1 reading, and a team match's other side finally agreeing.
+ * The third is the one that is easy to forget and the one without which no team
+ * tournament would ever finish a round.
+ *
+ * Never throws. By the time it runs the match is stored and rated, so a bracket that
+ * fails to move must not cost the report — the owner can award the match by hand, and the
+ * maintainer's CLI can fix anything worse. Same placement philosophy as tieConfirmations.
+ */
+async function maybeAdvanceTournament(
+    ctx: AppContext,
+    log: FastifyBaseLogger,
+    matchId: string,
+): Promise<void> {
+    try {
+        const moved = await advanceTournamentFromMatch(ctx, log, matchId);
+        if (!moved) return;
+
+        const t = await getTournament(ctx.db, moved.tournamentId);
+        if (!t) return;
+
+        // Who won, from each recipient's own point of view. The bracket knows entrants;
+        // the push has to speak to people.
+        const bracket = await loadBracket(ctx.db, moved.tournamentId);
+        const m = bracket.find((x) => x.id === moved.tournamentMatchId);
+        const winners = new Set<string>();
+        if (m) {
+            const rosters = await ctx.db.prepare(
+                `SELECT user_id FROM tournament_entrant_members WHERE entrant_id = ?`,
+            ).bind(moved.winnerEntrantId).all<{ user_id: string }>();
+            for (const r of rosters.results ?? []) winners.add(r.user_id);
+        }
+
+        ctx.globalChat.announceTournamentUpdate({
+            kind: 'match_done',
+            tournamentId: t.id,
+            tournamentName: t.name,
+            tournamentMatchId: moved.tournamentMatchId,
+            round: m?.round ?? null,
+            roundsTotal: t.bracket_size ? Math.log2(t.bracket_size) : null,
+            perUser: new Map(moved.notify.map((u) => [u, { youWon: winners.has(u) }])),
+        });
+    } catch (err) {
+        log.info({ match_id: matchId, err: String(err) }, 'bracket could not be advanced');
+    }
+}
+
 async function maybeUpgradeFromConfirmation(
     ctx: AppContext,
     log: FastifyBaseLogger,
@@ -320,6 +375,10 @@ async function maybeUpgradeFromConfirmation(
                     return [o.userId, { result: o.result, before: d?.before ?? null, after: d?.after ?? null }];
                 })),
             });
+
+            // A 1v1 settled minutes after the fact still has to move its bracket, with the
+            // room long closed. Without this the round waits for a result that already exists.
+            await maybeAdvanceTournament(ctx, log, matchId);
         } catch (err) {
             // Put the row back rather than leave it marked rated with no ratings behind it —
             // and the PARTICIPANT scores with it. The result writes land before applyMatch, so
@@ -491,6 +550,11 @@ async function maybeRateAwaitingTeamMatch(
                 return [o.userId, { result: o.result, before: d?.before ?? null, after: d?.after ?? null }];
             })),
         });
+
+        // THE ONE THAT MAKES TEAM TOURNAMENTS WORK. A team match is never rated on the
+        // reporter's word: it sits `awaiting_confirmation` until the other side agrees, and
+        // this is where that agreement lands. Without this call no team bracket ever moves.
+        await maybeAdvanceTournament(ctx, log, matchId);
     } catch (err) {
         // Back to waiting. The results are untouched by design, so only the rating state
         // has to be undone — and leaving it 'awaiting_confirmation' means a later
@@ -596,7 +660,7 @@ export async function attachParticipants(
 
     const ids = matches.map((m) => m.id);
     const parts = await ctx.db.prepare(
-        `SELECT mp.match_id, mp.user_id, mp.team, mp.civ, mp.result,
+        `SELECT mp.match_id, mp.user_id, mp.team, mp.civ, mp.home_city, mp.result,
                 mp.rating_before, mp.rating_after,
                 u.discord_username, u.display_name, u.avatar_url
          FROM match_participants mp
@@ -616,6 +680,7 @@ export async function attachParticipants(
         user_id: string;
         team: number;
         civ: string | null;
+        home_city: string | null;
         result: number;
         rating_before: number | null;
         rating_after: number | null;
@@ -644,6 +709,9 @@ export async function attachParticipants(
             // say which civ YOU played and never which one you played against -- which is the
             // half that makes a matchup readable.
             civ: p.civ,
+            // And what they brought. The city only -- the recording names the deck FILE and
+            // never which of its decks was used, and the cards are on that player's machine.
+            home_city: p.home_city,
             result: p.result,
             rating_before: p.rating_before,
             rating_after: p.rating_after,
@@ -786,9 +854,10 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
         ];
         for (const p of body.participants) {
             inserts.push(ctx.db.prepare(
-                `INSERT INTO match_participants (match_id, user_id, team, civ, score, result)
-                 VALUES (?, ?, ?, ?, ?, ?)`,
-            ).bind(matchId, p.user_id, p.team | 0, p.civ ?? null, p.score | 0, p.result));
+                `INSERT INTO match_participants (match_id, user_id, team, civ, home_city, score, result)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            ).bind(matchId, p.user_id, p.team | 0, p.civ ?? null, p.home_city ?? null,
+                   p.score | 0, p.result));
         }
         await ctx.db.batch(inserts);
 
@@ -984,6 +1053,11 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
                 req.log.info({ match_id: matchId, err: String(err) },
                     'team match could not be rated');
             }
+
+            // AFTER the two upgrade helpers above, because either can turn an undecided
+            // report into a real result, and the bracket must see the final verdict. Before
+            // the room closes, which is merely tidy.
+            await maybeAdvanceTournament(ctx, req.log, matchId);
 
             await ctx.db.prepare(
                 `UPDATE lobbies SET status = 'closed', closed_at = datetime('now') WHERE id = ?`,

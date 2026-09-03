@@ -21,6 +21,9 @@ import { configure as configureDiscordAnnounce } from './lobbies/discordAnnounce
 import { scheduleOrphanLobbySweep } from './lobbies/orphanSweep';
 import { registerMatchesRest } from './matches/rest';
 import { registerStatsRest } from './stats/rest';
+import { registerTournamentsRest } from './tournaments/rest';
+import { registerTeamsRest } from './teams/rest';
+import { sweepStaleTournaments } from './tournaments/sweep';
 import { registerReplaysRest } from './replays/rest';
 
 const SERVICE_VERSION = '0.1.0';
@@ -178,6 +181,8 @@ async function main(): Promise<void> {
     registerMatchesRest(app, ctx);
     registerReplaysRest(app, ctx);
     registerStatsRest(app, ctx);
+    registerTournamentsRest(app, ctx);
+    registerTeamsRest(app, ctx);
 
     // /me — current user + ELO snapshot. Requires auth.
     app.get('/me', { preHandler: [requireAuth()] }, async (req, _reply) => {
@@ -268,6 +273,13 @@ async function main(): Promise<void> {
     // ----- Reap lobbies left behind by the previous process -----
     // After the grace window, so rooms whose players reconnect survive.
     const orphanSweep = scheduleOrphanLobbySweep(ctx, app.log);
+
+    // ----- Archive tournaments nobody has touched -----
+    // No grace window and no snapshot, unlike the lobby sweep above: a tournament does not
+    // revive on reconnect, and nothing this process created can be a week old. It is also
+    // only tidiness — the list and both creation caps already ignore stale rows, so this
+    // just makes the stored status agree with what players already see.
+    void sweepStaleTournaments(ctx, app.log);
 
     // ----- Graceful shutdown -----
     const shutdown = async (signal: string): Promise<void> => {

@@ -1,9 +1,11 @@
 import type { FastifyInstance } from 'fastify';
 import { Errors } from '../lib/errors';
-import { shortId, sha256Hex, uuid } from '../lib/ids';
+import { sha256Hex, uuid } from '../lib/ids';
 import { requireAuth, requireLauncherVersion } from '../middleware/auth';
 import { ipRateLimit, userRateLimit, Limits } from '../middleware/rateLimit';
-import { announceLobbyCreated, finalizeRoom } from './discordAnnounce';
+import { finalizeRoom } from './discordAnnounce';
+import { createLobby } from './create';
+import { isEntrantMember } from '../tournaments/store';
 import { DEFAULT_RATING, DEFAULT_RD } from '../elo/glicko2';
 import type { AppContext } from '../context';
 
@@ -20,6 +22,8 @@ interface LobbyRow {
     status: 'open' | 'locked' | 'in_game' | 'closed';
     created_at: string;
     competitive: number;
+    /** The bracket slot this room plays out, or null. Written only by the tournament route. */
+    tournament_match_id: string | null;
 }
 
 interface CreateLobbyBody {
@@ -51,6 +55,7 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
         const rows = await ctx.db.prepare(
             `SELECT l.id, l.host_user_id, l.title, l.mod_id, l.mod_combined_hash,
                     l.max_players, l.current_players, l.is_private, l.status, l.competitive,
+                    l.tournament_match_id,
                     l.created_at, u.discord_username AS host_login, u.display_name AS host_name,
                     u.avatar_url AS host_avatar, e.rating AS host_rating, e.rd AS host_rd
              FROM lobbies l
@@ -74,6 +79,7 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
             is_private: number;
             status: 'open' | 'locked' | 'in_game';
             competitive: number;
+            tournament_match_id: string | null;
             created_at: string;
             host_login: string;
             host_name: string;
@@ -96,6 +102,9 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
                 // Before joining, not after: this is what tells a player their rating is
                 // on the line and that leaving the room will not be free.
                 competitive: r.competitive === 1,
+                // Null for an ordinary room. Lets the rooms table show a tournament chip
+                // and hide Join from anyone who is not one of the two entrants.
+                tournament_match_id: r.tournament_match_id ?? null,
                 created_at: r.created_at,
                 host: {
                     id: r.host_user_id,
@@ -133,144 +142,19 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
             userRateLimit(ctx, Limits.LobbyCreateUser),
         ],
     }, async (req, reply) => {
-        const cfg = ctx.config;
-        const userId = req.userId!;
-
+        // The whole of this used to live here. It moved to `createLobby` so the tournament
+        // route can open a room by exactly these rules rather than growing a second copy
+        // of them — see the header of ./create.ts for what "exactly these rules" covers.
         const body = (req.body ?? {}) as CreateLobbyBody;
-        if (!body.title || !body.mod_id || !body.mod_combined_hash) {
-            throw Errors.BadRequest('title, mod_id and mod_combined_hash are required');
-        }
-        const title = body.title.trim().slice(0, 80);
-        if (title.length < 3) throw Errors.BadRequest('title too short');
-
-        const maxPlayers = Math.min(
-            cfg.lobbyMaxPlayers,
-            Math.max(2, Number.isFinite(body.max_players) ? body.max_players! : cfg.lobbyMaxPlayers),
-        );
-
-        // Force-close any prior lobby this user was hosting — same
-        // "create new = implicit leave previous" behaviour as the Worker.
-        const stale = await ctx.db.prepare(
-            `SELECT id FROM lobbies
-             WHERE host_user_id = ? AND status IN ('open','locked','in_game')`,
-        ).bind(userId).all<{ id: string }>();
-
-        for (const row of stale.results ?? []) {
-            await ctx.db.batch([
-                ctx.db.prepare(
-                    `UPDATE lobbies SET status='closed', closed_at=datetime('now') WHERE id = ?`,
-                ).bind(row.id),
-                ctx.db.prepare(
-                    `DELETE FROM lobby_members WHERE lobby_id = ?`,
-                ).bind(row.id),
-            ]);
-            ctx.rooms.close(row.id);
-            finalizeRoom(row.id);
-        }
-
-        const active = await ctx.db.prepare(
-            `SELECT COUNT(*) AS n FROM lobbies WHERE status IN ('open','locked','in_game')`,
-        ).bind().first<{ n: number }>();
-        if ((active?.n ?? 0) >= cfg.maxActiveGames) {
-            throw Errors.Conflict('Server full — max concurrent lobbies reached.');
-        }
-
-        // Competitive is a PROMISE — only this room's matches score, and the launcher
-        // holds the player to it (confirming Record Game, refusing to let the host leave
-        // before the result is in). A mod with no ladder cannot keep that promise, so the
-        // room is created casual instead of failing. The 201 echoes the EFFECTIVE value,
-        // which is how the launcher explains the downgrade without holding a copy of the
-        // ranked-mod list — that policy lives here and nowhere else.
-        const askedCompetitive = body.competitive === true;
-        const modKey = body.mod_id.trim().toLowerCase();
-        // A competitive room's SIZE is what names its format — 2 seats is 1v1, 4 is 2v2, 6 is
-        // 3v3 — so the launcher reads the format off it instead of sending one. That only holds
-        // if no other size can be competitive, and enforcing it is this side's job: the client
-        // is exactly what an attacker controls, and a competitive room of 8 would leave a match
-        // whose format nothing can name.
-        //
-        // Downgraded to casual rather than refused, the same way a mod with no ladder is: the
-        // room is still perfectly playable, the 201 echoes the effective value, and the launcher
-        // already tells the host in the room chat.
-        const COMPETITIVE_SIZES = [2, 4, 6];
-        const competitive = askedCompetitive
-            && cfg.rankedModIds.some((m) => m === modKey)
-            && COMPETITIVE_SIZES.includes(maxPlayers)
-            ? 1 : 0;
-
-        const lobbyId = shortId(8);
-        const passwordHash = body.password ? await sha256Hex(body.password) : null;
-        const isPrivate = passwordHash ? 1 : 0;
-
-        await ctx.db.batch([
-            ctx.db.prepare(
-                // created_by is written once and never updated — that is the whole point of
-                // it. host_user_id moves to whoever inherits the room, so it is the only
-                // record of who actually opened it, which is what the Discord embed names.
-                `INSERT INTO lobbies (id, host_user_id, created_by, title, mod_id, mod_combined_hash,
-                                      max_players, current_players, is_private, password_hash,
-                                      status, competitive)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'open', ?)`,
-            ).bind(
-                lobbyId, userId, userId, title, body.mod_id, body.mod_combined_hash,
-                maxPlayers, isPrivate, passwordHash, competitive,
-            ),
-            ctx.db.prepare(
-                `INSERT INTO lobby_members (lobby_id, user_id, role) VALUES (?, ?, 'player')`,
-            ).bind(lobbyId, userId),
-        ]);
-
-        // Pre-create the in-memory room so the host's WS upgrade
-        // doesn't race against an empty registry.
-        ctx.rooms.getOrCreate(lobbyId, userId);
-
-        // The creator is now "in a room" — refresh the global players panel.
-        ctx.globalChat.refreshPlayers();
-
-        // Announce the new room — both to the in-app global toast (every connected
-        // launcher) and to Discord (only if a webhook is configured). BOTH skip
-        // private rooms. The host identity is read once and shared. Best-effort:
-        // never awaited so it can't add latency to the 201, and each swallows its
-        // own errors internally.
-        if (isPrivate === 0) {
-            const host = await ctx.db.prepare(
-                `SELECT display_name, discord_username, avatar_url FROM users WHERE id = ?`,
-            ).bind(userId).first<{
-                display_name: string;
-                discord_username: string;
-                avatar_url: string | null;
-            }>();
-            const hostName = host?.display_name || host?.discord_username || 'Unknown';
-            const hostAvatar = host?.avatar_url ?? null;
-
-            // In-app popup for every connected launcher (they filter + dedup).
-            ctx.globalChat.announceLobbyCreated({
-                id: lobbyId, title, modId: body.mod_id, maxPlayers,
-                hostUserId: userId, hostName, hostAvatar,
-                competitive: competitive === 1,
-            });
-
-            // Discord webhook (only when configured).
-            if (cfg.discordWebhookUrls.length > 0) {
-                void announceLobbyCreated({
-                    id: lobbyId, title, modId: body.mod_id, maxPlayers,
-                    isPrivate: false, hostName, hostAvatar,
-                    competitive: competitive === 1,
-                });
-            }
-        }
-
-        return reply.code(201).send({
-            id: lobbyId,
-            title,
-            mod_id: body.mod_id,
-            mod_combined_hash: body.mod_combined_hash,
-            max_players: maxPlayers,
-            current_players: 1,
-            is_private: isPrivate === 1,
-            status: 'open',
-            competitive: competitive === 1,
+        const created = await createLobby(ctx, req.userId!, {
+            title: body.title,
+            modId: body.mod_id,
+            modCombinedHash: body.mod_combined_hash,
+            maxPlayers: body.max_players,
+            password: body.password,
+            askedCompetitive: body.competitive,
         });
+        return reply.code(201).send(created);
     });
 
     // GET /lobbies/:id — details with members.
@@ -308,6 +192,7 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
             is_private: lobby.is_private === 1,
             status: lobby.status,
             competitive: lobby.competitive === 1,
+            tournament_match_id: lobby.tournament_match_id ?? null,
             host_user_id: lobby.host_user_id,
             members: (members.results ?? []).map((m) => ({
                 id: m.user_id,
@@ -339,6 +224,17 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
         ).bind(lobbyId).first<LobbyRow>();
         if (!lobby || lobby.status === 'closed') throw Errors.NotFound('Lobby');
         if (lobby.status === 'in_game') throw Errors.Conflict('Lobby already in game.');
+
+        // A room bound to a bracket slot is not a public room. Checked HERE, beside the
+        // other status-shaped refusals and BEFORE the password branch, so a stranger
+        // cannot learn from the error whether a tournament room is password-protected.
+        //
+        // Membership is read from the FROZEN roster, so a saved team that drops a player
+        // after entering cannot lock that player out of a match they are registered for.
+        if (lobby.tournament_match_id) {
+            const mine = await isEntrantMember(ctx.db, lobby.tournament_match_id, userId);
+            if (!mine) throw Errors.NotTournamentParticipant();
+        }
         if (lobby.current_players >= lobby.max_players) throw Errors.LobbyFull();
 
         if (lobby.is_private === 1) {

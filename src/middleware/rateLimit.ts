@@ -132,6 +132,32 @@ export const Limits = {
     // everybody does. Fetched lazily and cached a minute on both sides, so this ceiling is
     // never reached by honest use either.
     StatsCivsIp:      { scope: 'statsc',    keyKind: 'ip',   perMinute: 20,  perDay: 600  } as const,
+    // Its own scope, not shared with the civ table beside it: same reasoning as that one, a
+    // rarely-opened table must not be able to spend the budget the busy surface needs from
+    // behind a shared Radmin NAT.
+    StatsMatchupsIp:  { scope: 'statsm',    keyKind: 'ip',   perMinute: 20,  perDay: 600  } as const,
+    StatsDecksIp:     { scope: 'statsd',    keyKind: 'ip',   perMinute: 20,  perDay: 600  } as const,
+    // Keyed by USER, not IP: two players behind one Radmin NAT each upload their own decks,
+    // and an IP budget would make the second one's silently fail. Deliberately tiny — the
+    // launcher uploads once a session, and there is no reason for a legitimate client to
+    // send this more than a handful of times a day.
+    StatsDeckUpload:  { scope: 'deckup',    keyKind: 'user', perMinute: 3,   perDay: 40   } as const,
+    // Public tournament reads. Its own scope for the same reason StatsPublicIp has one:
+    // the lists and brackets are opened by people who are ALSO on the profile and the
+    // rooms list, and behind one Radmin NAT they all share the count. Memoised a minute
+    // on both sides, so this ceiling is never reached by honest use.
+    TournamentsIp:    { scope: 'tourn',     keyKind: 'ip',   perMinute: 30,  perDay: 2000 } as const,
+    // Registering, withdrawing, seeding, starting. Keyed by USER and not by IP, the same
+    // decision as StatsDeckUpload: two players behind one Radmin NAT each enter their own
+    // tournaments, and an IP budget would make the second silently fail.
+    TournamentWriteUser: { scope: 'tourn-u', keyKind: 'user', perMinute: 10, perDay: 100 } as const,
+    // Creating one is the expensive, abusable action — anybody signed in may do it, and
+    // there is no moderator. Deliberately tiny; the per-user and server-wide caps in
+    // tournaments/rest.ts are the real limit, this only slows a script down.
+    TournamentCreateUser: { scope: 'tourn-new', keyKind: 'user', perMinute: 2, perDay: 10 } as const,
+    // Team upkeep: creating, inviting, answering, leaving. By USER, like every other
+    // write here, because two people behind one Radmin NAT each run their own team.
+    TeamInviteUser:   { scope: 'team-u',   keyKind: 'user', perMinute: 10,  perDay: 60   } as const,
     LobbyCreateUser:  { scope: 'lcreate-u', keyKind: 'user', perMinute: 10,  perDay: 100  } as const,
     LobbyJoinUser:    { scope: 'ljoin-u',   keyKind: 'user', perMinute: 50,  perDay: 200  } as const,
     ReportUser:       { scope: 'report-u',  keyKind: 'user', perMinute: 5,   perDay: 20   } as const,

@@ -466,9 +466,35 @@ and refused entry in the same breath. `npm test` pins the ordering.
 A room is created **competitive** or it is not, and only a competitive room's match can score.
 The flag lives on `lobbies.competitive` (migration `0007`), is set once at creation and never
 again, and the launcher only ever *asks* for it: `POST /lobbies` refuses `competitive: true` for
-a mod outside `RANKED_MOD_IDS` and creates a casual room instead, echoing what it actually made
-on the 201. That echo is what lets the launcher explain the downgrade without holding its own
-copy of the ranked-mod list.
+a mod outside `RANKED_MOD_IDS` **and for any size other than 2, 4 or 6 seats**, creating a
+casual room instead and echoing what it actually made on the 201. That echo is what lets the
+launcher explain the downgrade without holding its own copy of the ranked-mod list.
+
+The size rule is not cosmetic: a competitive room's seat count is what NAMES its format —
+2 is 1v1, 4 is 2v2, 6 is 3v3 — so a competitive room of 8 would leave a match whose format
+nothing could name. The clamp lives on the server because the client is what an attacker
+controls.
+
+Both rules now live in `src/lobbies/create.ts` rather than inline in the route, because a
+tournament match is played in an ordinary competitive room and has to be built by exactly
+these rules. `grep "INSERT INTO lobbies" src/` returning one hit is the property that keeps
+the two from drifting.
+
+## How many rooms the server allows
+
+`MAX_ACTIVE_GAMES` (default **16**) is the only one of the capacity knobs that is actually
+enforced — `src/lobbies/rest.ts` refuses creation past it with a 409 `conflict`.
+`MAX_CONCURRENT_USERS` is reported in `GET /quota` and in the login payload but checked
+nowhere, so do not tune it expecting an effect.
+
+It was 8 until tournaments arrived. A 16-entrant single-elimination first round needs **eight
+rooms at the same time**, so at 8 one round consumed the whole server and no one else could
+play. Raising it is cheap because tournament rooms are created with `announce: false`: a round
+opening eight rooms at once fires no Discord webhooks and no in-app toasts.
+
+The number reaches the launcher on its own, as `max_active_games` in the login response, so
+changing it needs no client release — but it needs a **restart**, since `loadConfig()` runs
+once at boot and there is no reload.
 
 Everything else follows from the flag: the launcher confirms Record Game before every
 competitive start, holds the host in the room until the result is sent, and looks harder for the

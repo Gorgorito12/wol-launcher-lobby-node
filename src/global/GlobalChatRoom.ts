@@ -294,6 +294,81 @@ export class GlobalChatRoom {
         } catch { /* a correction that cannot be announced is still a correction */ }
     }
 
+    /**
+     * Tell the people in a tournament match that something moved.
+     *
+     * <p>Directed at a named set of users rather than broadcast, like
+     * {@link announceMatchRated} beside it: a bracket is public but a "your match is
+     * ready" is not everybody's business, and broadcasting it to two hundred sockets to
+     * reach four people is the kind of thing that makes a 1 GB box unhappy.</p>
+     *
+     * <p>It rides THIS socket and not the room's for the same reason the rating
+     * correction does: by the time a bracket advances the room has been closed for
+     * minutes, so there is nowhere else for it to land.</p>
+     *
+     * <p>Best-effort. Somebody offline simply sees the change when they next open the
+     * tab — there is no notification table and deliberately so. Never awaited, never
+     * allowed to throw.</p>
+     */
+    announceTournamentUpdate(notice: {
+        kind: 'match_ready' | 'room_opened' | 'match_done' | 'entry_accepted' | 'entry_promoted';
+        tournamentId: string;
+        tournamentName: string;
+        tournamentMatchId?: string | null;
+        round?: number | null;
+        roundsTotal?: number | null;
+        lobbyId?: string | null;
+        /** Who to tell, and per user whether they won — null when it does not apply. */
+        perUser: ReadonlyMap<string, { youWon: boolean | null }>;
+    }): void {
+        try {
+            for (const [ws, attached] of this.attached) {
+                const mine = notice.perUser.get(attached.userId);
+                if (!mine) continue;
+                this.send(ws, {
+                    type: 'tournament_update',
+                    kind: notice.kind,
+                    tournament_id: notice.tournamentId,
+                    tournament_name: notice.tournamentName,
+                    tournament_match_id: notice.tournamentMatchId ?? null,
+                    round: notice.round ?? null,
+                    rounds_total: notice.roundsTotal ?? null,
+                    lobby_id: notice.lobbyId ?? null,
+                    you_won: mine.youWon,
+                });
+            }
+        } catch { /* a bracket that cannot be announced has still advanced */ }
+    }
+
+    /**
+     * Deliver a team invitation to its target, if they happen to be connected.
+     *
+     * <p>Unlike the ROOM invite beside it, this is a convenience and not the delivery
+     * mechanism: the invitation is a row in `team_invites` and is waiting in the tab
+     * whether or not this ever reaches anybody. Inviting somebody who is offline is the
+     * normal case for a team, which is exactly why the row exists.</p>
+     */
+    announceTeamInvite(notice: {
+        inviteId: string;
+        teamId: string;
+        teamName: string;
+        fromUserId: string;
+        toUserId: string;
+    }): void {
+        try {
+            for (const [ws, attached] of this.attached) {
+                if (attached.userId !== notice.toUserId) continue;
+                this.send(ws, {
+                    type: 'team_invite',
+                    invite_id: notice.inviteId,
+                    team_id: notice.teamId,
+                    team_name: notice.teamName,
+                    from_user_id: notice.fromUserId,
+                });
+            }
+        } catch { /* the row is the invitation; this was only the doorbell */ }
+    }
+
     private async handleHello(
         ws: WebSocket,
         ctx: AppContext,

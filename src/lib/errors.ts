@@ -75,6 +75,59 @@ export const Errors = {
         'This launcher is too old for multiplayer. Update it and try again.',
         { min_version: minVersion },
     ),
+    // A room bound to a bracket slot is not a public room: only the two entrants'
+    // frozen rosters may enter it. The launcher localises by CODE, so the message here
+    // is only what an OLD launcher shows verbatim — hence a full sentence.
+    NotTournamentParticipant: () => new HttpError(
+        403,
+        'tournament_not_participant',
+        'This room belongs to a tournament match between two other players.',
+    ),
+    TournamentClosed: () => new HttpError(
+        409,
+        'tournament_closed',
+        'Registration for this tournament is not open.',
+    ),
+    TournamentFull:   () => new HttpError(
+        409,
+        'tournament_full',
+        'This tournament has no places left.',
+    ),
+    // Carries the cap so the launcher can name it rather than saying "too many".
+    TournamentLimitReached: (limit: number) => new HttpError(
+        409,
+        'tournament_limit_reached',
+        'You already have as many tournaments running as you may.',
+        { limit },
+    ),
+    TournamentMatchNotReady: () => new HttpError(
+        409,
+        'tournament_match_not_ready',
+        'This match is not ready to be played.',
+    ),
+    AlreadyEntered:   () => new HttpError(
+        409,
+        'already_entered',
+        'You are already entered in this tournament.',
+    ),
+    // `reason` is one of validateRoster's refusals, so the launcher can say WHICH
+    // player is the problem instead of rejecting the whole roster with no reason.
+    RosterInvalid:    (reason: string) => new HttpError(
+        400,
+        'roster_invalid',
+        'That line-up cannot enter this tournament.',
+        { reason },
+    ),
+    TeamFull:         () => new HttpError(
+        409,
+        'team_full',
+        'This team has no room for another player.',
+    ),
+    NotTeamCaptain:   () => new HttpError(
+        403,
+        'not_team_captain',
+        'Only the captain of this team can do that.',
+    ),
     Conflict:        (msg: string) => new HttpError(409, 'conflict', msg),
     Internal:        (msg = 'Unexpected server error.') =>
         new HttpError(500, 'internal', msg),

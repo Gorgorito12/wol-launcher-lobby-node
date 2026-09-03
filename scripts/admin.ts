@@ -43,6 +43,7 @@ import {
     DEFAULT_VOLATILITY,
     type ParticipantOutcome,
 } from '../src/elo/glicko2';
+import * as tourn from './adminTournaments';
 
 // ---------------------------------------------------------------- argv
 
@@ -919,8 +920,15 @@ function usage(): void {
   player:ban <player> --reason "..."        |  player:unban <player>
   player:unstick <player>                   clear rows that bar them from every room
 
+${tourn.TOURNAMENT_USAGE}
+
 A player is matched by id, Discord username or display name.
 The database is the positional path, else DB_PATH, else ./lobby.db.`);
+}
+
+/** The small slice of this file's plumbing the tournament commands need. */
+function cli(): tourn.CliCtx {
+    return { apply: APPLY, positionals: positionals(), flag, pad };
 }
 
 // ---------------------------------------------------------------- main
@@ -934,6 +942,7 @@ const KNOWN = new Set([
     'player:show', 'player:history', 'player:reset',
     'versions',
     'player:ban', 'player:unban', 'player:unstick',
+    ...tourn.TOURNAMENT_COMMANDS,
 ]);
 
 async function main(): Promise<void> {
@@ -970,6 +979,19 @@ async function main(): Promise<void> {
             case 'player:unban': return await cmdPlayerBan(db, false);
             case 'player:unstick': return await cmdPlayerUnstick(db);
             case 'versions': return await cmdVersions(db);
+
+            // Tournaments and teams. The maintainer inspects and overrules; creating,
+            // seeding and starting belong to whoever owns the tournament.
+            case 'tournament:list': return await tourn.cmdTournamentList(db, cli());
+            case 'tournament:show': return await tourn.cmdTournamentShow(db, cli());
+            case 'tournament:void': return await tourn.cmdTournamentVoid(db, cli());
+            case 'tournament:cancel': return await tourn.cmdTournamentCancel(db, cli());
+            case 'tournament:feature': return await tourn.cmdTournamentFeature(db, cli());
+            case 'tournament:reap': return await tourn.cmdTournamentReap(db, cli());
+            case 'team:show': return await tourn.cmdTeamShow(db, cli());
+            case 'team:disband': return await tourn.cmdTeamDisband(db, cli());
+            case 'tournament:transfer':
+                return await tourn.cmdTournamentTransfer(db, cli(), (n) => findUser(db, n));
         }
     } finally {
         db.close();

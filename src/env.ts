@@ -17,6 +17,17 @@ export interface Config {
 
     // Public tunables — same defaults the original wrangler.toml declared.
     maxConcurrentUsers: number;
+    /**
+     * Rooms that may be open at once, across the whole server.
+     *
+     * Raised from 8 to 16 for tournaments: a 16-entrant first round needs EIGHT rooms
+     * simultaneously, which at 8 was the entire budget and left nothing for ordinary
+     * play. It is the only enforced cap a tournament can exhaust (lobbies/rest.ts)
+     * — MAX_CONCURRENT_USERS is reported to the launcher but never checked anywhere.
+     *
+     * Cheap to raise because tournament rooms are created with `announce: false`, so a
+     * round opening eight at once fires no Discord webhooks and no global toasts.
+     */
     maxActiveGames: number;
     chatMsgsPerMin: number;
     // Global chat (the process-wide /global/ws room). Separate knobs from
@@ -173,7 +184,7 @@ export function loadConfig(): Config {
         replaysDir: strEnv('REPLAYS_DIR', './replays'),
 
         maxConcurrentUsers: intEnv('MAX_CONCURRENT_USERS', 60),
-        maxActiveGames: intEnv('MAX_ACTIVE_GAMES', 8),
+        maxActiveGames: intEnv('MAX_ACTIVE_GAMES', 16),
         chatMsgsPerMin: intEnv('CHAT_MSGS_PER_MIN', 30),
         globalChatMsgsPerMin: intEnv('GLOBAL_CHAT_MSGS_PER_MIN', 20),
         globalChatHistory: intEnv('GLOBAL_CHAT_HISTORY', 100),

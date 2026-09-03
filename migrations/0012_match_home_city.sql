@@ -1,0 +1,28 @@
+-- The HOME CITY each player brought to a match.
+--
+-- The recording has always carried it and the launcher has always been able to read it:
+-- `gameplayerNhcfilename` is the deck's file ("sp_Beijing_homecity.xml") for EVERY player,
+-- not just the one reporting. It was parsed and thrown away, which is why a stored match
+-- can say which civilization somebody played and nothing about what they brought.
+--
+-- It is the CITY and never the deck, and that limit is the whole reason this column is a
+-- single word rather than a deck list. Measured against the real files:
+--
+--   * The recording has exactly four per-player home city keys -- hclocation, hclevel,
+--     hcfilename, homecityname -- and NONE of them identifies a deck. A home city file
+--     holds several decks (a real one holds two), and its <deck> elements carry only a
+--     name, a gameid and their cards: no active marker, and both decks can share the same
+--     gameid, so not even the game mode separates them.
+--   * The CARDS are further still. They live in a file on that player's own machine, and
+--     the recording does not embed them. Searching a real 25-card deck's internal names
+--     through three inflated recordings finds all 35 of them -- and also 200 of 200 cards
+--     that player does not run, because what the file carries is the game's whole tech-name
+--     table. That false positive is written up in the launcher's docs/REPLAY-DATA.md.
+--
+-- So: one word per participant, which is exactly as much as is true.
+--
+-- NULL means a match reported before this existed, or one whose recording was never joined
+-- to the room's roster. Every surface already renders without it -- the launcher's history
+-- row appends it to the name cell only when it is there, the same way `civ` arrived.
+
+ALTER TABLE match_participants ADD COLUMN home_city TEXT;

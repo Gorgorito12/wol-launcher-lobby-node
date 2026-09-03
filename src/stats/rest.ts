@@ -1,5 +1,7 @@
 import type { FastifyInstance } from 'fastify';
-import { ipRateLimit, Limits } from '../middleware/rateLimit';
+import { ipRateLimit, userRateLimit, Limits } from '../middleware/rateLimit';
+import { requireAuth } from '../middleware/auth';
+import { Errors } from '../lib/errors';
 import { WIN_AT, LOSS_AT } from '../elo/ratability';
 import { attachParticipants } from '../matches/rest';
 import type { AppContext } from '../context';
@@ -70,6 +72,94 @@ export const LADDER_WHERE = `WHERE e.mode = ?
            AND u.is_banned = 0
            AND e.games_played >= ?`;
 
+/**
+ * Civilization against civilization, in rated 1v1s. The table a modder balances from: a civ's
+ * overall win rate says it is strong, this says what it is strong AGAINST.
+ *
+ * <p>Three clauses carry the whole thing and none is decoration.</p>
+ *
+ * <p><b>`a.civ &lt; b.civ`</b> does two jobs at once. The self-join sees each match twice — once
+ * from each player — so without a canonical order every pair would appear as both "A vs B" and
+ * "B vs A", the same games counted under two names with mirrored records. It also drops MIRROR
+ * matchups, which is deliberate: a civ against itself is 50% by construction and carries no
+ * balance signal.</p>
+ *
+ * <p><b>`b.user_id &lt;&gt; a.user_id`</b> is what stops a player being joined to themselves.</p>
+ *
+ * <p><b>The rated-1v1 filter is copied from /stats/civs verbatim, and must stay that way.</b>
+ * `rating_mode` is NULL for every match stored before migration 0010 and those were all 1v1, so
+ * NULL reads as 'default' rather than being skipped. A team game answers a different question
+ * and an unrated one was never judged. If the two tables filtered differently, a civ's overall
+ * record would not reconcile with the sum of its matchups and neither number could be trusted.</p>
+ *
+ * <p>Wins and losses are counted from the perspective of `civ_a`, the alphabetically first of
+ * the pair. Draws are neither, exactly as in the civ table — a 0.5 is a match that was played
+ * and not decided, and the launcher withholds a percentage until enough of them were.</p>
+ *
+ * <p>Binds: the minimum played, then the row limit.</p>
+ */
+export const MATCHUPS_SQL = `SELECT m.mod_id, m.mod_combined_hash,
+                    a.civ AS civ_a, b.civ AS civ_b,
+                    COUNT(*) AS played,
+                    SUM(CASE WHEN a.result >= 0.999 THEN 1 ELSE 0 END) AS wins_a,
+                    SUM(CASE WHEN a.result <= 0.001 THEN 1 ELSE 0 END) AS losses_a
+               FROM match_participants a
+               JOIN match_participants b
+                 ON b.match_id = a.match_id AND b.user_id <> a.user_id
+               JOIN matches m ON m.id = a.match_id
+              WHERE a.civ IS NOT NULL AND TRIM(a.civ) <> ''
+                AND b.civ IS NOT NULL AND TRIM(b.civ) <> ''
+                AND a.civ < b.civ
+                AND m.rated = 1
+                AND (m.rating_mode IS NULL OR m.rating_mode = 'default')
+              GROUP BY m.mod_id, m.mod_combined_hash, a.civ, b.civ
+             HAVING played >= ?
+              ORDER BY played DESC, a.civ ASC, b.civ ASC
+              LIMIT ?`;
+
+/**
+ * The most-played maps of the window, most first.
+ *
+ * <p>ONE query serves both `top_maps` and the older singular `top_map`, which is derived from
+ * its first row rather than fetched again. Two queries would be free to disagree — a different
+ * window, a different tiebreak — and then `top_map` would quietly stop being the head of
+ * `top_maps` with nothing to reveal it. Deriving makes that impossible instead of unlikely.</p>
+ *
+ * <p>The tiebreak is not decoration: with two maps on the same count the winner would otherwise
+ * change between one request and the next. That mattered for a single card; for a LIST it
+ * reorders the whole table, so it matters more.</p>
+ *
+ * <p>The bound parameters are positional: the window offset, then the row limit.</p>
+ */
+/**
+ * Which cards the community BRINGS, most-carried first.
+ *
+ * <p>Counts DISTINCT USERS, never rows: one player's deck contributes one to each of its
+ * cards and no more, so the table measures how many people carry a card rather than how
+ * many decks happen to hold it. A player with the same card in four civilizations' decks is
+ * four different facts, which is why the civ is part of the group.</p>
+ *
+ * <p>It says what people TAKE, never what they played — the recording carries neither the
+ * card played nor the deck it came from, and that is a property of the format rather than a
+ * gap. Every surface built on this has to say so.</p>
+ *
+ * <p>Binds: the minimum carriers, then the row limit.</p>
+ */
+export const DECK_CARDS_SQL = `SELECT mod_id, civ, card, COUNT(DISTINCT user_id) AS players
+               FROM deck_cards
+              GROUP BY mod_id, civ, card
+             HAVING players >= ?
+              ORDER BY players DESC, civ ASC, card ASC
+              LIMIT ?`;
+
+export const TOP_MAPS_SQL = `SELECT map_name, COUNT(*) AS n
+               FROM matches
+              WHERE map_name IS NOT NULL AND map_name <> ''
+                AND created_at >= datetime('now', ?)
+              GROUP BY map_name
+              ORDER BY n DESC, map_name ASC
+              LIMIT ?`;
+
 
 /** The same rule as {@link LADDER_ORDER_BY}, for tests and for anything that has to explain it. */
 export function conservativeRating(row: { rating: number; rd: number }): number {
@@ -102,6 +192,8 @@ let cache: CacheEntry | null = null;
 /** The civilization table's own memo. Same TTL, its own slot: it is fetched by a different
  *  page and a different set of clients, so sharing one would evict the busy one constantly. */
 let civCache: { at: number; payload: unknown } | null = null;
+let matchupCache: { at: number; payload: unknown } | null = null;
+let deckCache: { at: number; payload: unknown } | null = null;
 
 /** A civilization is listed once it has been played this many RATED 1v1s. One is enough to be
  *  a fact; what needs a sample is the win RATE, and that bar lives in the launcher, next to the
@@ -111,6 +203,36 @@ const CIV_MIN_PLAYED = 1;
 /** How many rows the table carries. Wars of Liberty ships 188 civilizations and this is per mod
  *  AND per version, so the cap is what stops one payload from growing without bound. */
 const CIV_LIMIT = 400;
+
+/**
+ * A pair is listed from its first game. There is no bar here because the LAUNCHER has one: it
+ * prints the record always and the percentage only past five decided, so a 1-match pair shows
+ * "1-0" with no rate rather than a claim. Hiding it here instead would make a pair that exists
+ * invisible, and "no games between these two" is itself worth seeing on a balance table.
+ */
+const MATCHUP_MIN_PLAYED = 1;
+
+/**
+ * Pairs, not civilizations: 188 civilizations could in principle produce ~17,500 of them, but
+ * only pairs somebody actually played exist as rows. 600 is far above any real league and still
+ * bounds the payload if a mod with a huge roster ever fills it.
+ */
+const MATCHUP_LIMIT = 600;
+
+/**
+ * A card is listed as soon as ONE person carries it. There is no bar because the figure is a
+ * headcount rather than a rate — "1 player" is a true and complete statement, unlike a win
+ * percentage over one game — and hiding the long tail would remove exactly what a modder
+ * looking for an unused card came for.
+ */
+const DECK_MIN_PLAYERS = 1;
+
+/** Wars of Liberty ships 4,517 cards across 188 civilizations; this bounds the payload. */
+const DECK_LIMIT = 800;
+
+/** How many cards one upload may declare. A deck holds 25; 188 civilizations of them is the
+ *  ceiling a legitimate client can reach, and this sits above it without being unbounded. */
+const DECK_UPLOAD_MAX_CARDS = 6000;
 
 interface LeaderRow {
     id: string;
@@ -291,18 +413,14 @@ export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
             `-${ACTIVE_PLAYERS_WINDOW_DAYS} days`,
         ).first<TotalsRow>();
 
-        // The tiebreak is not decoration: with two maps on the same count the winner would
-        // otherwise change between one request and the next, and a card that reports a
-        // different favourite map every minute is worse than one that reports none.
-        const topMap = await ctx.db.prepare(
-            `SELECT map_name, COUNT(*) AS n
-               FROM matches
-              WHERE map_name IS NOT NULL AND map_name <> ''
-                AND created_at >= datetime('now', ?)
-              GROUP BY map_name
-              ORDER BY n DESC, map_name ASC
-              LIMIT 1`,
-        ).bind(`-${ACTIVITY_WINDOW_DAYS} days`).first<TopMapRow>();
+        // The whole list, and the singular below is its head. See TOP_MAPS_SQL for why that is
+        // one query and not two. Same `limit` the ladders take, so a caller asking for a bigger
+        // page gets a bigger page of everything.
+        const topMapRows = await ctx.db.prepare(TOP_MAPS_SQL)
+            .bind(`-${ACTIVITY_WINDOW_DAYS} days`, limit).all<TopMapRow>();
+
+        const top_maps = (topMapRows.results ?? []).map(r => ({ map: r.map_name, matches: r.n }));
+        const topMap = topMapRows.results?.[0] ?? null;
 
         // The community's last few matches — everyone's, not the caller's. The strip is
         // headed "community activity" and used to fill this from the viewer's own history,
@@ -341,8 +459,17 @@ export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
                 players: totals?.players ?? 0,
                 // null, never "" — the client shows the row only when there IS a map, and
                 // an empty string would render as a blank value under a live heading.
+                //
+                // KEPT once top_maps arrived: every launcher shipped before it reads these two
+                // and nothing else, so dropping them empties that card with no error to explain
+                // it. They are the head of the list below, never a second query — see
+                // TOP_MAPS_SQL.
                 top_map: topMap?.map_name ?? null,
                 top_map_matches: topMap?.n ?? 0,
+                // The launcher's ranking summary card takes the first few and its STATS table
+                // shows them all. A launcher older than this field deserializes it to null and
+                // hides both, which is why it can ship before anyone updates.
+                top_maps,
             },
             recent_matches,
             activity: {
@@ -448,5 +575,162 @@ export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
         civCache = { at: now, payload };
         reply.header('Cache-Control', 'public, max-age=60');
         return payload;
+    });
+
+    /**
+     * Civilization against civilization. See {@link MATCHUPS_SQL} for the rules; this only
+     * serves it.
+     *
+     * <p>Its OWN rate-limit scope and its OWN cache slot, following the house rule the Limits
+     * table spells out: a rarely-opened table must not be able to starve the busy one behind a
+     * shared Radmin NAT.</p>
+     *
+     * <p>Counts only. The launcher decides what to SHOW — the record and the count always, a
+     * percentage only past its own bar of decided games, and never an ordering by that
+     * percentage. Sorting a rate computed from three matches puts whoever went 1-0 at the top
+     * and calls it the best matchup in the game.</p>
+     */
+    app.get('/stats/matchups', {
+        preHandler: [ipRateLimit(ctx, Limits.StatsMatchupsIp)],
+    }, async (_req, reply) => {
+        const now = Date.now();
+        if (matchupCache && now - matchupCache.at < CACHE_TTL_MS) {
+            reply.header('Cache-Control', 'public, max-age=60');
+            return matchupCache.payload;
+        }
+
+        const rows = await ctx.db.prepare(MATCHUPS_SQL)
+            .bind(MATCHUP_MIN_PLAYED, MATCHUP_LIMIT).all<{
+                mod_id: string;
+                mod_combined_hash: string;
+                civ_a: string;
+                civ_b: string;
+                played: number;
+                wins_a: number;
+                losses_a: number;
+            }>();
+
+        const matchups = (rows.results ?? []).map((r) => ({
+            mod_id: r.mod_id,
+            mod_version: r.mod_combined_hash,
+            civ_a: r.civ_a,
+            civ_b: r.civ_b,
+            played: r.played,
+            wins_a: r.wins_a,
+            losses_a: r.losses_a,
+        }));
+
+        const payload = {
+            generated_at: new Date(now).toISOString(),
+            matchups,
+        };
+
+        matchupCache = { at: now, payload };
+        reply.header('Cache-Control', 'public, max-age=60');
+        return payload;
+    });
+
+    /**
+     * Which cards the community brings. See {@link DECK_CARDS_SQL}; this only serves it.
+     */
+    app.get('/stats/decks', {
+        preHandler: [ipRateLimit(ctx, Limits.StatsDecksIp)],
+    }, async (_req, reply) => {
+        const now = Date.now();
+        if (deckCache && now - deckCache.at < CACHE_TTL_MS) {
+            reply.header('Cache-Control', 'public, max-age=60');
+            return deckCache.payload;
+        }
+
+        const rows = await ctx.db.prepare(DECK_CARDS_SQL)
+            .bind(DECK_MIN_PLAYERS, DECK_LIMIT).all<{
+                mod_id: string; civ: string; card: string; players: number;
+            }>();
+
+        // Counted, never derived by summing the rows: a player contributes to many cards, so
+        // any arithmetic over the list above would report a multiple of the real headcount —
+        // and the launcher prints this figure above the table.
+        const contributors = await ctx.db.prepare(
+            'SELECT COUNT(DISTINCT user_id) AS n FROM deck_cards',
+        ).bind().first<{ n: number }>();
+
+        const payload = {
+            generated_at: new Date(now).toISOString(),
+            contributors: contributors?.n ?? 0,
+            cards: rows.results ?? [],
+        };
+
+        deckCache = { at: now, payload };
+        reply.header('Cache-Control', 'public, max-age=60');
+        return payload;
+    });
+
+    /**
+     * A player contributing their own decks. OPT-IN on the launcher side; nothing here can
+     * tell, so this endpoint's job is to make an upload harmless rather than to police it.
+     *
+     * <p>It REPLACES that user's cards for each civilization it names — delete then insert,
+     * in one batch — so re-uploading is idempotent and a player who opens the launcher daily
+     * counts once. A civilization the upload does not mention is left alone, which is what
+     * makes a partial upload safe.</p>
+     *
+     * <p>It stores no deck NAME and no timestamp of play: a deck name is whatever the player
+     * typed, and there is no match here to attach anything to. The rows say only "this
+     * account carries this card for this civilization in this mod".</p>
+     */
+    app.post('/stats/decks', {
+        preHandler: [requireAuth(), userRateLimit(ctx, Limits.StatsDeckUpload)],
+    }, async (req) => {
+        const userId = req.userId!;
+        const body = (req.body ?? null) as {
+            mod_id?: unknown;
+            decks?: { civ?: unknown; cards?: unknown }[];
+        } | null;
+
+        const modId = typeof body?.mod_id === 'string' ? body.mod_id.trim() : '';
+        if (!modId) throw Errors.BadRequest('mod_id is required');
+        if (!Array.isArray(body?.decks)) throw Errors.BadRequest('decks is required');
+
+        const writes: { sql: string; params: unknown[] }[] = [];
+        let cards = 0;
+
+        for (const deck of body!.decks!) {
+            const civ = typeof deck?.civ === 'string' ? deck.civ.trim() : '';
+            if (!civ || !Array.isArray(deck?.cards)) continue;
+
+            // Whatever this account had for this civilization goes first, so a card the player
+            // removed from their deck stops being counted instead of lingering for ever.
+            writes.push({
+                sql: 'DELETE FROM deck_cards WHERE user_id = ? AND mod_id = ? AND civ = ?',
+                params: [userId, modId, civ],
+            });
+
+            const seen = new Set<string>();
+            for (const raw of deck.cards as unknown[]) {
+                const card = typeof raw === 'string' ? raw.trim() : '';
+                // De-duplicated here as well as by the primary key: a deck can legitimately
+                // hold the same card twice, and two INSERTs of one row inside a single batch
+                // would abort the whole transaction rather than be ignored.
+                if (!card || seen.has(card)) continue;
+                seen.add(card);
+                if (++cards > DECK_UPLOAD_MAX_CARDS) {
+                    throw Errors.BadRequest('too many cards');
+                }
+                writes.push({
+                    sql: 'INSERT INTO deck_cards (user_id, mod_id, civ, card) VALUES (?, ?, ?, ?)',
+                    params: [userId, modId, civ, card],
+                });
+            }
+        }
+
+        if (writes.length > 0) {
+            await ctx.db.batch(writes.map(w => ctx.db.prepare(w.sql).bind(...w.params)));
+            // The aggregate is memoised for a minute and would otherwise keep serving a table
+            // that predates this upload — which reads, to the person who just opted in, as the
+            // feature not working.
+            deckCache = null;
+        }
+
+        return { ok: true, cards };
     });
 }

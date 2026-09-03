@@ -137,6 +137,40 @@ export function requireAuth(): preHandlerHookHandler {
     };
 }
 
+/**
+ * Refuse anybody who is not the owner of the tournament named in the path.
+ *
+ * The permission model has no ROLE anywhere: whoever created a tournament may do
+ * everything to it and nothing at all to anybody else's. That is the same shape as
+ * `lobbies.host_user_id` gating kick and start, and it needs no administration — which is
+ * the whole point, since nobody wants to be granting permissions by hand.
+ *
+ * Shaped like `requireLauncherVersion` (a factory closing over `ctx`) rather than
+ * `requireAuth` (which needs none), because it has to read a row.
+ *
+ * **Fails CLOSED.** `isBanned` above swallows a database error and answers "not banned",
+ * which is the right call for a check that only ever takes privileges away. This one
+ * GRANTS them, so a failed read must deny — hence no try/catch here at all: a thrown
+ * database error becomes a 500 and the action does not happen.
+ *
+ * Order matters: a tournament that does not exist answers 404 rather than 403, so a
+ * mistyped id is never reported as somebody else's tournament.
+ */
+export function requireTournamentOwner(ctx: AppContext): preHandlerHookHandler {
+    return async (req: FastifyRequest, _reply: FastifyReply): Promise<void> => {
+        if (!req.authenticated) throw Errors.Unauthorized();
+        if (req.banned) throw Errors.UserBanned();
+
+        const id = (req.params as { id?: string }).id ?? '';
+        const row = await ctx.db.prepare(
+            `SELECT owner_user_id FROM tournaments WHERE id = ?`,
+        ).bind(id).first<{ owner_user_id: string }>();
+
+        if (!row) throw Errors.NotFound('Tournament');
+        if (row.owner_user_id !== req.userId) throw Errors.Forbidden();
+    };
+}
+
 /** Tag the current request as a "safe read" so the circuit breaker lets it through in degraded mode. */
 export function safeRead(): preHandlerHookHandler {
     return async (req: FastifyRequest, _reply: FastifyReply): Promise<void> => {
