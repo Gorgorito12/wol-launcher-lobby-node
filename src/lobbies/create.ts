@@ -33,21 +33,75 @@ import { announceLobbyCreated, finalizeRoom } from './discordAnnounce';
 import type { AppContext } from '../context';
 
 /**
- * Sizes that may be competitive.
+ * PLAYING sizes that may be competitive.
  *
- * A competitive room's SIZE is what names its format — 2 seats is 1v1, 4 is 2v2, 6 is
- * 3v3 — so the launcher reads the format off it instead of sending one. That only holds
+ * A competitive room's playing size is what names its format — 2 seats is 1v1, 4 is 2v2, 6
+ * is 3v3 — so the launcher reads the format off it instead of sending one. That only holds
  * if no other size can be competitive, and enforcing it is this side's job: the client is
  * exactly what an attacker controls, and a competitive room of 8 would leave a match
  * whose format nothing can name.
+ *
+ * "Playing" is `max_players - spectator_slots`, because an observer sits in a real map slot
+ * and is counted by `max_players` like anyone else. Before that subtraction a 2v2 with one
+ * observer was five seats, matched nothing here, and was quietly downgraded to casual — the
+ * game was played and the result did not score.
  */
 const COMPETITIVE_SIZES = [2, 4, 6];
+
+/**
+ * The most seats a room may hand to people who are not playing.
+ *
+ * Two, which covers a caster and a co-caster. It is a cap and not a policy: every observer
+ * still costs a real map slot, so an unbounded count would let a client create a "6v6" that
+ * is one player and eleven watchers, and the map script's format detection — which reads
+ * team assignments off the first six slots — would place them as if they were playing.
+ */
+export const MAX_SPECTATOR_SLOTS = 2;
+
+/**
+ * How many of a room's seats actually go to watchers, given what the client asked for.
+ *
+ * Exported and pure so it can be pinned without a database: the rest of `createLobby` needs
+ * a connection, a config and an authenticated user, and this arithmetic needs none of them
+ * while being the part that can silently cost somebody a rated match.
+ *
+ * Clamped in three directions, and the third is the one that matters: the room must be left
+ * with at least two people PLAYING. Without it a client could ask for two seats and two
+ * observers and open a competitive room with nobody in it.
+ *
+ * `Number.isFinite` is checked FIRST because NaN passes through both `Math.max` and
+ * `Math.min` unchanged — it would survive every clamp here and reach the database.
+ */
+export function resolveSpectatorSlots(asked: unknown, maxPlayers: number): number {
+    const n = typeof asked === 'number' && Number.isFinite(asked) ? Math.floor(asked) : 0;
+    return Math.max(0, Math.min(MAX_SPECTATOR_SLOTS, Math.min(n, maxPlayers - 2)));
+}
+
+/**
+ * The seats a room's format is read off — everything that is not an observer.
+ *
+ * The launcher's `RoomFormats.PlayingSeats` is the same subtraction on the other side of the
+ * wire, and they have to agree: this side decides whether a room may be competitive, that
+ * side decides which format to show and which rules to enforce. Disagreeing by one would
+ * mean a room the server rated and the launcher could not name.
+ */
+export function playingSeatsOf(maxPlayers: number, spectatorSlots: number): number {
+    return maxPlayers - (spectatorSlots > 0 ? spectatorSlots : 0);
+}
 
 export interface CreateLobbyInput {
     title: string;
     modId: string;
     modCombinedHash: string;
     maxPlayers?: number;
+    /**
+     * Seats reserved for watchers, INCLUDED in `maxPlayers` rather than added to it.
+     *
+     * A request, not a decision: clamped to at most MAX_SPECTATOR_SLOTS and to leaving at
+     * least two people playing, then echoed back. Absent means 0, which is what every
+     * existing client sends and what every existing room has.
+     */
+    spectatorSlots?: number;
     password?: string;
     /** A request, not a decision. Clamped below; the result is echoed back. */
     askedCompetitive?: boolean;
@@ -81,6 +135,12 @@ export interface CreatedLobby {
     mod_id: string;
     mod_combined_hash: string;
     max_players: number;
+    /**
+     * How many of `max_players` are watching rather than playing. The EFFECTIVE value after
+     * clamping, which is how the launcher learns that its request was cut down without
+     * holding a copy of the rule.
+     */
+    spectator_slots: number;
     current_players: number;
     is_private: boolean;
     status: 'open';
@@ -107,6 +167,9 @@ export async function createLobby(
         Math.max(2, Number.isFinite(input.maxPlayers) ? input.maxPlayers! : cfg.lobbyMaxPlayers),
     );
 
+    const spectatorSlots = resolveSpectatorSlots(input.spectatorSlots, maxPlayers);
+    const playingSeats = playingSeatsOf(maxPlayers, spectatorSlots);
+
     await closePreviousRooms(ctx, userId);
 
     const active = await ctx.db.prepare(
@@ -126,7 +189,7 @@ export async function createLobby(
     const modKey = input.modId.trim().toLowerCase();
     const competitive = askedCompetitive
         && cfg.rankedModIds.some((m) => m === modKey)
-        && COMPETITIVE_SIZES.includes(maxPlayers)
+        && COMPETITIVE_SIZES.includes(playingSeats)
         ? 1 : 0;
 
     const lobbyId = shortId(8);
@@ -141,11 +204,11 @@ export async function createLobby(
             // record of who actually opened it, which is what the Discord embed names.
             `INSERT INTO lobbies (id, host_user_id, created_by, title, mod_id, mod_combined_hash,
                                   max_players, current_players, is_private, password_hash,
-                                  status, competitive, tournament_match_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'open', ?, ?)`,
+                                  status, competitive, tournament_match_id, spectator_slots)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'open', ?, ?, ?)`,
         ).bind(
             lobbyId, userId, userId, title, input.modId, input.modCombinedHash,
-            maxPlayers, isPrivate, passwordHash, competitive, tournamentMatchId,
+            maxPlayers, isPrivate, passwordHash, competitive, tournamentMatchId, spectatorSlots,
         ),
         ctx.db.prepare(
             `INSERT INTO lobby_members (lobby_id, user_id, role) VALUES (?, ?, 'player')`,
@@ -195,6 +258,7 @@ export async function createLobby(
         mod_id: input.modId,
         mod_combined_hash: input.modCombinedHash,
         max_players: maxPlayers,
+        spectator_slots: spectatorSlots,
         current_players: 1,
         is_private: isPrivate === 1,
         status: 'open',

@@ -16,6 +16,8 @@ interface LobbyRow {
     mod_id: string;
     mod_combined_hash: string;
     max_players: number;
+    /** How many of `max_players` are watching rather than playing. 0 for every older room. */
+    spectator_slots: number;
     current_players: number;
     is_private: number;
     password_hash: string | null;
@@ -31,6 +33,14 @@ interface CreateLobbyBody {
     mod_id: string;
     mod_combined_hash: string;
     max_players?: number;
+    /**
+     * How many of `max_players` are seats for watchers rather than players.
+     *
+     * A request. Clamped in `createLobby` and echoed back as the effective value, the same
+     * way `competitive` is — the client must not be able to decide either, and it learns
+     * what it actually got from the 201 rather than from a copy of the rule.
+     */
+    spectator_slots?: number;
     password?: string;
     /** Whether the host is putting rating on this match. Clamped below — see the insert. */
     competitive?: boolean;
@@ -39,6 +49,14 @@ interface CreateLobbyBody {
 interface JoinLobbyBody {
     mod_combined_hash: string;
     password?: string;
+    /**
+     * Take one of the room's watching seats instead of a playing one.
+     *
+     * Refused when the room has none free — never quietly downgraded to a player seat. A
+     * caster who is silently seated as a player is a caster who starts the game with a town
+     * centre in a match that is now 3v2.
+     */
+    as_spectator?: boolean;
 }
 
 /**
@@ -54,8 +72,15 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
     }, async (_req, reply) => {
         const rows = await ctx.db.prepare(
             `SELECT l.id, l.host_user_id, l.title, l.mod_id, l.mod_combined_hash,
-                    l.max_players, l.current_players, l.is_private, l.status, l.competitive,
-                    l.tournament_match_id,
+                    l.max_players, l.spectator_slots, l.current_players, l.is_private,
+                    l.status, l.competitive, l.tournament_match_id,
+                    -- Counted rather than denormalised, unlike current_players. This is read
+                    -- once per row on a list capped at 100 and covered by lobby_members' own
+                    -- primary key; a second denormalised counter would be a second thing that
+                    -- can drift out of step with the roster, and the first one already has a
+                    -- comment in LobbyRoom about never decrementing.
+                    (SELECT COUNT(*) FROM lobby_members m
+                      WHERE m.lobby_id = l.id AND m.role = 'spectator') AS spectators_present,
                     l.created_at, u.discord_username AS host_login, u.display_name AS host_name,
                     u.avatar_url AS host_avatar, e.rating AS host_rating, e.rd AS host_rd
              FROM lobbies l
@@ -75,6 +100,8 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
             mod_id: string;
             mod_combined_hash: string;
             max_players: number;
+            spectator_slots: number;
+            spectators_present: number;
             current_players: number;
             is_private: number;
             status: 'open' | 'locked' | 'in_game';
@@ -96,6 +123,13 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
                 mod_id: r.mod_id,
                 mod_combined_hash: r.mod_combined_hash,
                 max_players: r.max_players,
+                // Seats that are not players. The launcher subtracts this before reading a
+                // format off the size, so a 2v2 with a caster is five seats and still a 2v2.
+                spectator_slots: r.spectator_slots,
+                // How many of current_players are watching. The row subtracts it to learn
+                // how many PLAYING seats are taken, which is what decides whether its button
+                // offers a seat at the game or a seat beside it.
+                spectators_present: r.spectators_present,
                 current_players: r.current_players,
                 is_private: r.is_private === 1,
                 status: r.status,
@@ -151,6 +185,7 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
             modId: body.mod_id,
             modCombinedHash: body.mod_combined_hash,
             maxPlayers: body.max_players,
+            spectatorSlots: body.spectator_slots,
             password: body.password,
             askedCompetitive: body.competitive,
         });
@@ -188,6 +223,7 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
             mod_id: lobby.mod_id,
             mod_combined_hash: lobby.mod_combined_hash,
             max_players: lobby.max_players,
+            spectator_slots: lobby.spectator_slots,
             current_players: lobby.current_players,
             is_private: lobby.is_private === 1,
             status: lobby.status,
@@ -235,7 +271,28 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
             const mine = await isEntrantMember(ctx.db, lobby.tournament_match_id, userId);
             if (!mine) throw Errors.NotTournamentParticipant();
         }
-        if (lobby.current_players >= lobby.max_players) throw Errors.LobbyFull();
+        // Seats fill by ROLE, not by total. A room of five with one watching seat has four
+        // player seats and one observer seat, and they run out independently: checking only
+        // the total would let a fifth player in and lock the caster out of the room that was
+        // widened for them.
+        const seated = await ctx.db.prepare(
+            `SELECT
+                 SUM(CASE WHEN role = 'spectator' THEN 1 ELSE 0 END) AS watching,
+                 SUM(CASE WHEN role = 'spectator' THEN 0 ELSE 1 END) AS playing
+             FROM lobby_members WHERE lobby_id = ?`,
+        ).bind(lobbyId).first<{ watching: number | null; playing: number | null }>();
+        const watching = seated?.watching ?? 0;
+        const playing = seated?.playing ?? 0;
+
+        const asSpectator = body.as_spectator === true;
+        if (asSpectator) {
+            // Refused rather than downgraded to a player seat. Someone who asked to watch and
+            // is quietly seated as a player starts the game with a town centre, in a match
+            // that is now uneven and that nobody realises is uneven until it is over.
+            if (watching >= lobby.spectator_slots) throw Errors.LobbyFull();
+        } else if (playing >= lobby.max_players - lobby.spectator_slots) {
+            throw Errors.LobbyFull();
+        }
 
         if (lobby.is_private === 1) {
             if (!body.password) throw Errors.Forbidden();
@@ -260,10 +317,14 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
 
         await ctx.db.batch([
             ctx.db.prepare(
+                // The role is written on re-join too: someone who left a player seat and came
+                // back to watch must not keep the seat they gave up. is_ready is cleared for
+                // the same reason it always was - a returning member has not agreed to
+                // anything about the room as it now stands.
                 `INSERT INTO lobby_members (lobby_id, user_id, role)
-                 VALUES (?, ?, 'player')
-                 ON CONFLICT (lobby_id, user_id) DO UPDATE SET is_ready = 0`,
-            ).bind(lobbyId, userId),
+                 VALUES (?, ?, ?)
+                 ON CONFLICT (lobby_id, user_id) DO UPDATE SET is_ready = 0, role = excluded.role`,
+            ).bind(lobbyId, userId, asSpectator ? 'spectator' : 'player'),
             ctx.db.prepare(
                 `UPDATE lobbies SET current_players = (
                     SELECT COUNT(*) FROM lobby_members WHERE lobby_id = ?

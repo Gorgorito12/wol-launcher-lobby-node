@@ -1,0 +1,24 @@
+-- How many of a room's seats are for people who are watching rather than playing.
+--
+-- AoE3 has no engine-level spectator. An observer is a real player occupying a real slot on
+-- the map, given no town centre, no settlers and no crates by the map script -- which is why
+-- this is a count of SEATS and not a mode. `lobby_members.role` has said 'player' or
+-- 'spectator' since 0001 and nothing has ever written the second value; this is the column
+-- that makes writing it safe.
+--
+-- WHY IT HAS TO EXIST, rather than counting spectator rows. A competitive room's format is
+-- read off its size -- 2 seats is 1v1, 4 is 2v2, 6 is 3v3 -- and `create.ts` refuses to mark
+-- any other size competitive. So a 2v2 with one observer is five seats, matches no format,
+-- and is silently downgraded to casual: the room looks fine, the game is played, and the
+-- match does not score. Counting rows cannot fix that, because the decision is made when the
+-- room is CREATED and the observer has not joined yet. The seats have to be declared up
+-- front, and the format read off `max_players - spectator_slots`.
+--
+-- The launcher said this would happen. RoomFormat.cs has carried the sentence "the day a
+-- competitive room wants spectator seats, this stops deriving and has to become a real
+-- column on lobbies" since formats were added. This is that column.
+--
+-- Existing rooms get 0, and that is not merely a safe default -- it is the whole compatibility
+-- story. Every room ever created has no observers, so `max_players - 0` is `max_players` and
+-- every one of them resolves to exactly the format it resolved to yesterday.
+ALTER TABLE lobbies ADD COLUMN spectator_slots INTEGER NOT NULL DEFAULT 0;
