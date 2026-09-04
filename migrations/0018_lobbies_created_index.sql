@@ -1,0 +1,31 @@
+-- The peak-hour histogram had no index it could use, and `lobbies` never shrinks.
+--
+-- The card on the Rooms tab and the "when people play" card in Statistics both come out of
+-- one query in GET /stats/community:
+--
+--     SELECT CAST(strftime('%H', created_at) AS INTEGER) AS h, COUNT(*) AS c
+--       FROM lobbies
+--      WHERE created_at >= datetime('now', '-30 days')
+--      GROUP BY h
+--
+-- The only index whose leading column could have served it is
+-- `idx_lobbies_status_created (status, created_at DESC)` from 0001, and this query has no
+-- `status` predicate -- so SQLite could not seek it and fell back to scanning the table.
+--
+-- **The scan is the part that gets worse forever.** A room is never deleted, only closed
+-- (`UPDATE lobbies SET status='closed'` when its match is reported), so the table grows for
+-- the life of the server while the answer only ever covers thirty days. Every request paid
+-- for every room ever opened, and better-sqlite3 is synchronous, so that cost is charged to
+-- the event loop -- the rooms list of every other player waits behind it. That is the
+-- reported "sometimes it takes ages to load".
+--
+-- The GROUP BY still cannot be indexed: `strftime('%H', ...)` is computed per row, and an
+-- expression index on it would not help because the WHERE is on the raw column and the
+-- grouping is over the whole window anyway. What this index buys is the RANGE: thirty days
+-- of rows instead of all of them. That is the part that was unbounded.
+--
+-- `mod_id` is deliberately NOT in the key. The endpoint's optional `?mod=` filter adds
+-- `AND mod_id = ?`, but the unfiltered call is the common one (the Rooms strip never passes
+-- a mod), and a two-column key would make the common case seek a wider index for nothing.
+-- The residual filter on a thirty-day slice is cheap.
+CREATE INDEX IF NOT EXISTS idx_lobbies_created ON lobbies (created_at);

@@ -1,5 +1,5 @@
 import type { FastifyInstance } from 'fastify';
-import { ipRateLimit, userRateLimit, Limits } from '../middleware/rateLimit';
+import { chargeIpQuota, ipRateLimit, userRateLimit, Limits } from '../middleware/rateLimit';
 import { requireAuth } from '../middleware/auth';
 import { Errors } from '../lib/errors';
 import { WIN_AT, LOSS_AT } from '../elo/ratability';
@@ -292,8 +292,42 @@ const RECENT_MATCHES_LIMIT = 5;
  *  minute of staleness on a decorative card is invisible; what it buys is that a
  *  roomful of players opening the tab together costs one query, not eight. */
 const CACHE_TTL_MS = 60_000;
-interface CacheEntry { at: number; limit: number; mod: string | null; mode: string; payload: unknown }
-let cache: CacheEntry | null = null;
+interface CacheEntry { at: number; payload: unknown }
+
+/**
+ * One entry PER KEY, not one entry.
+ *
+ * It used to be a single slot holding its own (limit, mod, mode) and compared on read, so
+ * two players looking at different mods evicted each other on every request and the hit
+ * rate fell to nothing precisely when the most people were on the tab. A Map keyed by the
+ * same triple costs the same to read and actually memoises.
+ *
+ * Bounded by pruning on write rather than by an LRU: the key space is small and bounded by
+ * the mod catalogue, and entries are worthless after 60 s anyway.
+ */
+const communityCache = new Map<string, CacheEntry>();
+
+/**
+ * Requests already computing a key, so a cold entry is computed ONCE.
+ *
+ * Without this, N clients arriving together on an expired entry all missed and all ran the
+ * eight queries. better-sqlite3 is synchronous (see src/db.ts), so those are not eight
+ * concurrent queries - they are eight blocking scans in a row, on the same thread that
+ * serves the room list to everybody else. The second caller now awaits the first one's
+ * promise.
+ */
+const communityInFlight = new Map<string, Promise<unknown>>();
+
+function communityKey(limit: number, mod: string | null, mode: string): string {
+    return `${limit}\u0000${mod ?? ''}\u0000${mode}`;
+}
+
+/** Drop expired entries. Called on write, which is the only time the map grows. */
+function pruneCommunityCache(now: number): void {
+    for (const [key, entry] of communityCache) {
+        if (now - entry.at >= CACHE_TTL_MS) communityCache.delete(key);
+    }
+}
 
 /** The civilization table's own memo. Same TTL, its own slot: it is fetched by a different
  *  page and a different set of clients, so sharing one would evict the busy one constantly. */
@@ -456,9 +490,9 @@ async function ladderSize(ctx: AppContext, mode: 'default' | 'team'): Promise<nu
 }
 
 export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
-    app.get('/stats/community', {
-        preHandler: [ipRateLimit(ctx, Limits.StatsPublicIp)],
-    }, async (req, reply) => {
+    // NO ipRateLimit preHandler here, on purpose - see the cache check below. The quota is
+    // charged inside the handler, and only when the request is actually going to do work.
+    app.get('/stats/community', async (req, reply) => {
         const query = req.query as { limit?: string; mod?: string } | undefined;
         const raw = query?.limit;
         const parsed = raw ? parseInt(raw, 10) : DEFAULT_LIMIT;
@@ -478,210 +512,245 @@ export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
         const modArgs = modClause(mod).args;
 
         const now = Date.now();
-        // Keyed by BOTH now. One slot for two different pages would serve whichever was asked
-        // for first to whoever asked second, which is the quietest kind of wrong.
-        if (cache && cache.limit === limit && cache.mod === mod && cache.mode === mode
-            && now - cache.at < CACHE_TTL_MS) {
+        const key = communityKey(limit, mod, mode);
+
+        // THE MEMO IS CHECKED BEFORE THE QUOTA, and that ordering is the fix rather than a
+        // shortcut. ipRateLimit used to be a preHandler, so a request answered entirely out
+        // of this map still spent one of the 2000 daily requests an IP gets - and a launcher
+        // polling once a minute with the tab open spends 1440 of them by itself. Two PCs
+        // behind one router (or one CGNAT, which this player base is full of) therefore ran
+        // out mid-afternoon and got 429 for the rest of the UTC day, which the client
+        // rendered as an absent card, indistinguishable from "not enough data yet".
+        //
+        // A cached answer costs no query, so it costs no quota.
+        const hit = communityCache.get(key);
+        if (hit && now - hit.at < CACHE_TTL_MS) {
             reply.header('Cache-Control', 'public, max-age=60');
-            return cache.payload;
+            return hit.payload;
         }
 
-        // Both ladders, one round trip each, inside the SAME cached payload. Rule (10)
-        // of the multiplayer notes: the community strip is one endpoint, because the
-        // request budget is per IP and shared behind a Radmin NAT — a second route would
-        // cost double for a page nobody asked twice for.
-        const [leaderboard, leaderboard_team, ranked_players, ranked_players_team] =
-            await Promise.all([
-                ladder(ctx, 'default', limit),
-                ladder(ctx, 'team', limit),
-                ladderSize(ctx, 'default'),
-                ladderSize(ctx, 'team'),
-            ]);
+        // Past here the request is going to hit the database, so now it pays.
+        await chargeIpQuota(ctx, req, reply, Limits.StatsPublicIp);
 
-        // Source is lobbies.created_at, and the wording on the card has to match:
-        // this is when people OPEN ROOMS, not when they play. Rooms are stamped by
-        // the server (datetime('now'), UTC) and their rows are never deleted, while
-        // matches.started_at is written by the client and only exists for the few
-        // games that got reported at all.
-        const hourRows = await ctx.db.prepare(
-            `SELECT CAST(strftime('%H', created_at) AS INTEGER) AS h, COUNT(*) AS c
-             FROM lobbies
-             WHERE created_at >= datetime('now', ?)${modSql}
-             GROUP BY h`,
-        ).bind(`-${ACTIVITY_WINDOW_DAYS} days`, ...modArgs).all<HourRow>();
-
-        // All 24 buckets, always, zero-filled here. A gap in the array would leave
-        // the client guessing whether it meant "nobody" or "not reported".
-        const counts = new Array<number>(24).fill(0);
-        let total = 0;
-        for (const r of hourRows.results ?? []) {
-            if (r.h >= 0 && r.h < 24) { counts[r.h] = r.c; total += r.c; }
+        // Somebody else is already computing this exact key: wait for theirs instead of
+        // running the same eight scans again on the one synchronous thread.
+        const pending = communityInFlight.get(key);
+        if (pending) {
+            reply.header('Cache-Control', 'public, max-age=60');
+            return pending;
         }
 
-        // Two scalars in one round trip, the pattern /quota already uses.
-        //
-        // Both windows are measured against SERVER-stamped columns. matches.created_at is
-        // the DEFAULT datetime('now') written when the report lands; matches.started_at is
-        // sent by the client and would let one wrong clock skew the count — the same
-        // reasoning that makes the histogram above read lobbies.created_at rather than
-        // anything a launcher reports. It costs a scan of `matches` (created_at is not
-        // indexed), which is no worse than the histogram's scan of `lobbies`.
-        // `matches` counts EVERY match of the window, rated or not; `rated` counts the ones
-        // that actually moved a rating. Two numbers and not one, because the launcher used to
-        // print the first and call it the second — and the gap between them is the interesting
-        // part: it is how many games the server could not read a result from.
-        //
-        // `rated` is the only count in this file that filters on `matches.rated`. That column
-        // and `unrated_reason` have existed since migration 0006 and no endpoint read either.
-        const totals = await ctx.db.prepare(
-            `SELECT
-                (SELECT COUNT(*) FROM matches m
-                  WHERE m.created_at >= datetime('now', ?)${modSql}${modeSql})  AS matches,
-                (SELECT COUNT(*) FROM matches m
-                  WHERE m.created_at >= datetime('now', ?)${modSql}${modeSql}
-                    AND m.rated = 1)                                            AS rated,
-                (SELECT COUNT(*) FROM users
-                  WHERE last_seen_at >= datetime('now', ?))            AS players`,
-        ).bind(
-            `-${ACTIVITY_WINDOW_DAYS} days`, ...modArgs,
-            `-${ACTIVITY_WINDOW_DAYS} days`, ...modArgs,
-            `-${ACTIVE_PLAYERS_WINDOW_DAYS} days`,
-        ).first<TotalsRow>();
+        // ONE computation per key, shared. The map entry is set BEFORE the first await
+        // inside it, so a second request arriving in the same tick finds it.
+        const compute = (async () => {
+            // Both ladders, one round trip each, inside the SAME cached payload. Rule (10)
+            // of the multiplayer notes: the community strip is one endpoint, because the
+            // request budget is per IP and shared behind a Radmin NAT — a second route would
+            // cost double for a page nobody asked twice for.
+            const [leaderboard, leaderboard_team, ranked_players, ranked_players_team] =
+                await Promise.all([
+                    ladder(ctx, 'default', limit),
+                    ladder(ctx, 'team', limit),
+                    ladderSize(ctx, 'default'),
+                    ladderSize(ctx, 'team'),
+                ]);
 
-        // WHY the rest did not count, most common first. One reason is worth more than a
-        // number: "16 did not count" invites a bug report, "16 did not count, mostly
-        // no_decided_result" is a fact somebody can act on.
-        const unratedRows = await ctx.db.prepare(
-            `SELECT COALESCE(m.unrated_reason, 'unknown') AS reason, COUNT(*) AS n
-               FROM matches m
-              WHERE m.created_at >= datetime('now', ?)${modSql}${modeSql}
-                AND m.rated = 0
-              GROUP BY reason
-              ORDER BY n DESC, reason ASC
-              LIMIT 1`,
-        ).bind(`-${ACTIVITY_WINDOW_DAYS} days`, ...modArgs)
-            .first<{ reason: string; n: number }>();
+            // Source is lobbies.created_at, and the wording on the card has to match:
+            // this is when people OPEN ROOMS, not when they play. Rooms are stamped by
+            // the server (datetime('now'), UTC) and their rows are never deleted, while
+            // matches.started_at is written by the client and only exists for the few
+            // games that got reported at all.
+            const hourRows = await ctx.db.prepare(
+                `SELECT CAST(strftime('%H', created_at) AS INTEGER) AS h, COUNT(*) AS c
+                 FROM lobbies
+                 WHERE created_at >= datetime('now', ?)${modSql}
+                 GROUP BY h`,
+            ).bind(`-${ACTIVITY_WINDOW_DAYS} days`, ...modArgs).all<HourRow>();
 
-        // One row per day of the window, days with no matches included as zero. A community
-        // this size cannot see a trend in a single total, and a gap in the series would read
-        // as missing data rather than as a quiet day.
-        const perDayRows = await ctx.db.prepare(
-            `SELECT date(m.created_at) AS day, COUNT(*) AS n
-               FROM matches m
-              WHERE m.created_at >= datetime('now', ?)${modSql}${modeSql}
-              GROUP BY day
-              ORDER BY day ASC`,
-        ).bind(`-${ACTIVITY_WINDOW_DAYS} days`, ...modArgs)
-            .all<{ day: string; n: number }>();
+            // All 24 buckets, always, zero-filled here. A gap in the array would leave
+            // the client guessing whether it meant "nobody" or "not reported".
+            const counts = new Array<number>(24).fill(0);
+            let total = 0;
+            for (const r of hourRows.results ?? []) {
+                if (r.h >= 0 && r.h < 24) { counts[r.h] = r.c; total += r.c; }
+            }
 
-        // The whole list, and the singular below is its head. See TOP_MAPS_SQL for why that is
-        // one query and not two. Same `limit` the ladders take, so a caller asking for a bigger
-        // page gets a bigger page of everything.
-        const topMapRows = await ctx.db.prepare(topMapsSql(mod, mode))
-            .bind(`-${ACTIVITY_WINDOW_DAYS} days`, ...modArgs, limit).all<TopMapRow>();
-
-        const top_maps = (topMapRows.results ?? []).map(r => ({ map: r.map_name, matches: r.n }));
-        const topMap = topMapRows.results?.[0] ?? null;
-
-        // The community's last few matches — everyone's, not the caller's. The strip is
-        // headed "community activity" and used to fill this from the viewer's own history,
-        // so a player who had never played saw an empty panel with nothing to suggest
-        // anyone else was here.
-        const recentRows = await ctx.db.prepare(
-            `SELECT id, mod_id, map_name, duration_seconds,
-                    created_at AS reported_at
-               FROM matches
-              ${mod ? 'WHERE mod_id = ?' : ''}
-              ORDER BY created_at DESC
-              LIMIT ?`,
-        ).bind(...modArgs, RECENT_MATCHES_LIMIT)
-            .all<Record<string, unknown> & { id: string }>();
-
-        const recent_matches = recentRows.results ?? [];
-        // The same helper the history endpoint uses, so "who played" is assembled one way
-        // in this codebase: one query for the whole page, never one per match.
-        await attachParticipants(ctx, recent_matches);
-
-        // 2v2 against 3v3. Nothing stores a format, so it is derived by counting participants
-        // and sides per match - the same shape /matches/history derives player_count from. It
-        // is asked only in team mode: in 1v1 the answer is "every match is 1v1".
-        const formatRows = mode === 'team'
-            ? await ctx.db.prepare(
-                `SELECT players, COUNT(*) AS matches FROM (
-                     SELECT mp.match_id AS id, COUNT(*) AS players
-                       FROM match_participants mp
-                       JOIN matches m ON m.id = mp.match_id
+            // Two scalars in one round trip, the pattern /quota already uses.
+            //
+            // Both windows are measured against SERVER-stamped columns. matches.created_at is
+            // the DEFAULT datetime('now') written when the report lands; matches.started_at is
+            // sent by the client and would let one wrong clock skew the count — the same
+            // reasoning that makes the histogram above read lobbies.created_at rather than
+            // anything a launcher reports. It costs a scan of `matches` (created_at is not
+            // indexed), which is no worse than the histogram's scan of `lobbies`.
+            // `matches` counts EVERY match of the window, rated or not; `rated` counts the ones
+            // that actually moved a rating. Two numbers and not one, because the launcher used to
+            // print the first and call it the second — and the gap between them is the interesting
+            // part: it is how many games the server could not read a result from.
+            //
+            // `rated` is the only count in this file that filters on `matches.rated`. That column
+            // and `unrated_reason` have existed since migration 0006 and no endpoint read either.
+            const totals = await ctx.db.prepare(
+                `SELECT
+                    (SELECT COUNT(*) FROM matches m
+                      WHERE m.created_at >= datetime('now', ?)${modSql}${modeSql})  AS matches,
+                    (SELECT COUNT(*) FROM matches m
                       WHERE m.created_at >= datetime('now', ?)${modSql}${modeSql}
-                      GROUP BY mp.match_id)
-                  GROUP BY players
-                  ORDER BY players ASC`,
+                        AND m.rated = 1)                                            AS rated,
+                    (SELECT COUNT(*) FROM users
+                      WHERE last_seen_at >= datetime('now', ?))            AS players`,
+            ).bind(
+                `-${ACTIVITY_WINDOW_DAYS} days`, ...modArgs,
+                `-${ACTIVITY_WINDOW_DAYS} days`, ...modArgs,
+                `-${ACTIVE_PLAYERS_WINDOW_DAYS} days`,
+            ).first<TotalsRow>();
+
+            // WHY the rest did not count, most common first. One reason is worth more than a
+            // number: "16 did not count" invites a bug report, "16 did not count, mostly
+            // no_decided_result" is a fact somebody can act on.
+            const unratedRows = await ctx.db.prepare(
+                `SELECT COALESCE(m.unrated_reason, 'unknown') AS reason, COUNT(*) AS n
+                   FROM matches m
+                  WHERE m.created_at >= datetime('now', ?)${modSql}${modeSql}
+                    AND m.rated = 0
+                  GROUP BY reason
+                  ORDER BY n DESC, reason ASC
+                  LIMIT 1`,
             ).bind(`-${ACTIVITY_WINDOW_DAYS} days`, ...modArgs)
-                .all<{ players: number; matches: number }>()
-            : { results: [] as { players: number; matches: number }[] };
+                .first<{ reason: string; n: number }>();
 
-        const payload = {
-            generated_at: new Date(now).toISOString(),
-            min_decided: MIN_DECIDED,
-            mode,
-            leaderboard,
-            // The team ladder rides the same payload. An older launcher ignores the extra
-            // field; a newer one against an older server deserializes it to null, which it
-            // reads as "this backend has no team ladder" rather than as an empty one.
-            leaderboard_team,
-            // How many players are on each ladder in total, which is NOT the length of the
-            // lists above once the league outgrows the page. The profile's "rank 7 of 18"
-            // reads these; a launcher older than them shows the rank alone.
-            ranked_players,
-            ranked_players_team,
-            // Which mod this whole payload is about, echoed back. The launcher draws it beside
-            // the figures; without it a cached page and a fresh one are indistinguishable.
-            mod: mod,
-            totals: {
-                window_days: ACTIVITY_WINDOW_DAYS,
-                matches: totals?.matches ?? 0,
-                // The subset that moved a rating, and the commonest reason the rest did not.
-                rated: totals?.rated ?? 0,
-                unrated_top_reason: unratedRows?.reason ?? null,
-                unrated_top_reason_matches: unratedRows?.n ?? 0,
-                // The window, day by day. Zero-filled by the client, which knows its own
-                // calendar; the server sends only the days it has.
-                matches_per_day: (perDayRows.results ?? []).map(
-                    r => ({ day: r.day, matches: r.n })),
-                // Empty outside team mode, where the question does not arise.
-                team_formats: (formatRows.results ?? []).map(
-                    r => ({ players: r.players, matches: r.matches })),
-                players_window_days: ACTIVE_PLAYERS_WINDOW_DAYS,
-                players: totals?.players ?? 0,
-                // null, never "" — the client shows the row only when there IS a map, and
-                // an empty string would render as a blank value under a live heading.
-                //
-                // KEPT once top_maps arrived: every launcher shipped before it reads these two
-                // and nothing else, so dropping them empties that card with no error to explain
-                // it. They are the head of the list below, never a second query — see
-                // TOP_MAPS_SQL.
-                top_map: topMap?.map_name ?? null,
-                top_map_matches: topMap?.n ?? 0,
-                // The launcher's ranking summary card takes the first few and its STATS table
-                // shows them all. A launcher older than this field deserializes it to null and
-                // hides both, which is why it can ship before anyone updates.
-                top_maps,
-            },
-            recent_matches,
-            activity: {
-                source: 'lobbies_created',
-                window_days: ACTIVITY_WINDOW_DAYS,
-                // UTC, and said out loud. The server has no idea where any given
-                // player lives; the launcher knows its own offset and shifts the
-                // buckets when it draws them.
-                timezone: 'UTC',
-                total,
-                hours: counts.map((c, h) => ({ hour: h, count: c })),
-            },
-        };
+            // One row per day of the window, days with no matches included as zero. A community
+            // this size cannot see a trend in a single total, and a gap in the series would read
+            // as missing data rather than as a quiet day.
+            const perDayRows = await ctx.db.prepare(
+                `SELECT date(m.created_at) AS day, COUNT(*) AS n
+                   FROM matches m
+                  WHERE m.created_at >= datetime('now', ?)${modSql}${modeSql}
+                  GROUP BY day
+                  ORDER BY day ASC`,
+            ).bind(`-${ACTIVITY_WINDOW_DAYS} days`, ...modArgs)
+                .all<{ day: string; n: number }>();
 
-        cache = { at: now, limit, mod, mode, payload };
-        reply.header('Cache-Control', 'public, max-age=60');
-        return payload;
+            // The whole list, and the singular below is its head. See TOP_MAPS_SQL for why that is
+            // one query and not two. Same `limit` the ladders take, so a caller asking for a bigger
+            // page gets a bigger page of everything.
+            const topMapRows = await ctx.db.prepare(topMapsSql(mod, mode))
+                .bind(`-${ACTIVITY_WINDOW_DAYS} days`, ...modArgs, limit).all<TopMapRow>();
+
+            const top_maps = (topMapRows.results ?? []).map(r => ({ map: r.map_name, matches: r.n }));
+            const topMap = topMapRows.results?.[0] ?? null;
+
+            // The community's last few matches — everyone's, not the caller's. The strip is
+            // headed "community activity" and used to fill this from the viewer's own history,
+            // so a player who had never played saw an empty panel with nothing to suggest
+            // anyone else was here.
+            const recentRows = await ctx.db.prepare(
+                `SELECT id, mod_id, map_name, duration_seconds,
+                        created_at AS reported_at
+                   FROM matches
+                  ${mod ? 'WHERE mod_id = ?' : ''}
+                  ORDER BY created_at DESC
+                  LIMIT ?`,
+            ).bind(...modArgs, RECENT_MATCHES_LIMIT)
+                .all<Record<string, unknown> & { id: string }>();
+
+            const recent_matches = recentRows.results ?? [];
+            // The same helper the history endpoint uses, so "who played" is assembled one way
+            // in this codebase: one query for the whole page, never one per match.
+            await attachParticipants(ctx, recent_matches);
+
+            // 2v2 against 3v3. Nothing stores a format, so it is derived by counting participants
+            // and sides per match - the same shape /matches/history derives player_count from. It
+            // is asked only in team mode: in 1v1 the answer is "every match is 1v1".
+            const formatRows = mode === 'team'
+                ? await ctx.db.prepare(
+                    `SELECT players, COUNT(*) AS matches FROM (
+                         SELECT mp.match_id AS id, COUNT(*) AS players
+                           FROM match_participants mp
+                           JOIN matches m ON m.id = mp.match_id
+                          WHERE m.created_at >= datetime('now', ?)${modSql}${modeSql}
+                          GROUP BY mp.match_id)
+                      GROUP BY players
+                      ORDER BY players ASC`,
+                ).bind(`-${ACTIVITY_WINDOW_DAYS} days`, ...modArgs)
+                    .all<{ players: number; matches: number }>()
+                : { results: [] as { players: number; matches: number }[] };
+
+            const payload = {
+                generated_at: new Date(now).toISOString(),
+                min_decided: MIN_DECIDED,
+                mode,
+                leaderboard,
+                // The team ladder rides the same payload. An older launcher ignores the extra
+                // field; a newer one against an older server deserializes it to null, which it
+                // reads as "this backend has no team ladder" rather than as an empty one.
+                leaderboard_team,
+                // How many players are on each ladder in total, which is NOT the length of the
+                // lists above once the league outgrows the page. The profile's "rank 7 of 18"
+                // reads these; a launcher older than them shows the rank alone.
+                ranked_players,
+                ranked_players_team,
+                // Which mod this whole payload is about, echoed back. The launcher draws it beside
+                // the figures; without it a cached page and a fresh one are indistinguishable.
+                mod: mod,
+                totals: {
+                    window_days: ACTIVITY_WINDOW_DAYS,
+                    matches: totals?.matches ?? 0,
+                    // The subset that moved a rating, and the commonest reason the rest did not.
+                    rated: totals?.rated ?? 0,
+                    unrated_top_reason: unratedRows?.reason ?? null,
+                    unrated_top_reason_matches: unratedRows?.n ?? 0,
+                    // The window, day by day. Zero-filled by the client, which knows its own
+                    // calendar; the server sends only the days it has.
+                    matches_per_day: (perDayRows.results ?? []).map(
+                        r => ({ day: r.day, matches: r.n })),
+                    // Empty outside team mode, where the question does not arise.
+                    team_formats: (formatRows.results ?? []).map(
+                        r => ({ players: r.players, matches: r.matches })),
+                    players_window_days: ACTIVE_PLAYERS_WINDOW_DAYS,
+                    players: totals?.players ?? 0,
+                    // null, never "" — the client shows the row only when there IS a map, and
+                    // an empty string would render as a blank value under a live heading.
+                    //
+                    // KEPT once top_maps arrived: every launcher shipped before it reads these two
+                    // and nothing else, so dropping them empties that card with no error to explain
+                    // it. They are the head of the list below, never a second query — see
+                    // TOP_MAPS_SQL.
+                    top_map: topMap?.map_name ?? null,
+                    top_map_matches: topMap?.n ?? 0,
+                    // The launcher's ranking summary card takes the first few and its STATS table
+                    // shows them all. A launcher older than this field deserializes it to null and
+                    // hides both, which is why it can ship before anyone updates.
+                    top_maps,
+                },
+                recent_matches,
+                activity: {
+                    source: 'lobbies_created',
+                    window_days: ACTIVITY_WINDOW_DAYS,
+                    // UTC, and said out loud. The server has no idea where any given
+                    // player lives; the launcher knows its own offset and shifts the
+                    // buckets when it draws them.
+                    timezone: 'UTC',
+                    total,
+                    hours: counts.map((c, h) => ({ hour: h, count: c })),
+                },
+            };
+
+            const done = Date.now();
+            communityCache.set(key, { at: done, payload });
+            pruneCommunityCache(done);
+            return payload;
+        })();
+
+        communityInFlight.set(key, compute);
+        try {
+            reply.header('Cache-Control', 'public, max-age=60');
+            return await compute;
+        } finally {
+            // Always, including on a throw: a failed computation must not wedge the key
+            // so that every later request awaits a promise that already rejected.
+            communityInFlight.delete(key);
+        }
     });
 
     /**

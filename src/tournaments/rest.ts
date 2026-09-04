@@ -682,6 +682,81 @@ export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): 
         return { ok: true, tournament_done: result.tournamentDone };
     });
 
+    /**
+     * Hand an UNDECIDED tie back to its two entrants, and tell them.
+     *
+     * <p><b>Nothing is undone here, because nothing was decided.</b> A game whose recording
+     * names no winner leaves the bracket slot `pending` and closes the room, and from that
+     * moment either entrant can already open a fresh one - `activeLobbyForMatch` only looks at
+     * live rooms. The capability was never missing; the ANNOUNCEMENT was. Both players were
+     * left staring at a bracket that had quietly given them their match back.</p>
+     *
+     * <p><b>Refuses a decided match, and that is the line.</b> Its winner is already seated in
+     * the round above and its game already counted for the ladder; reversing that has to
+     * un-seat one and cannot un-rate the other, which is why it lives in the maintainer's CLI
+     * with a dry run and a snapshot. See the note at the head of this file.</p>
+     *
+     * <p>The one write is closing whatever room is still standing on the slot. Without it the
+     * pair hit `closePreviousRooms`' 409 - "you still have a tournament match room open" - the
+     * moment they try to do the thing they have just been told to do.</p>
+     */
+    app.post('/tournaments/:id/matches/:mid/replay', {
+        preHandler: [requireTournamentManager(ctx), userRateLimit(ctx, Limits.TournamentWriteUser)],
+    }, async (req) => {
+        const id = paramId(req, 'id');
+        const mid = paramId(req, 'mid');
+
+        const t = await store.getTournament(ctx.db, id);
+        if (!t) throw Errors.NotFound('Tournament');
+        if (t.status !== 'running') throw Errors.Conflict('That tournament is not running.');
+
+        const bracket = await store.loadBracket(ctx.db, id);
+        const m = bracket.find((x) => x.id === mid);
+        if (!m) throw Errors.NotFound('Match');
+        if (m.status !== 'pending') {
+            throw Errors.Conflict('That match has already been decided.');
+        }
+        if (!m.entrant1Id || !m.entrant2Id) {
+            throw Errors.Conflict('That match does not have both sides yet.');
+        }
+
+        // Close the leftover, if there is one. Named rather than deleted: the row is history,
+        // and POST /matches may still arrive late for a game played in it.
+        const stale = await store.activeLobbyForMatch(ctx.db, mid);
+        if (stale) {
+            await ctx.db.prepare(
+                `UPDATE lobbies SET status = 'closed', closed_at = datetime('now') WHERE id = ?`,
+            ).bind(stale.id).run();
+            await ctx.db.prepare(
+                `DELETE FROM lobby_members WHERE lobby_id = ?`,
+            ).bind(stale.id).run();
+            ctx.rooms.close(stale.id, 4006, 'lobby_closed');
+        }
+
+        await store.touch(ctx.db, id);
+        invalidate(id);
+
+        // BOTH sides, including whoever asked - unlike room_opened, where the opener can see
+        // their own room. Here nobody has done anything yet; the point is that they are told.
+        const sides = [
+            ...(await memberIdsOf(ctx, m.entrant1Id)),
+            ...(await memberIdsOf(ctx, m.entrant2Id)),
+        ];
+        ctx.globalChat.announceTournamentUpdate({
+            kind: 'match_replay',
+            tournamentId: t.id,
+            tournamentName: t.name,
+            tournamentMatchId: mid,
+            round: m.round,
+            // Rounds are derived from the bracket, exactly as the room_opened path does it:
+            // the tournament row carries bracket_size, not a round count.
+            roundsTotal: Math.max(...bracket.map((x) => x.round)),
+            perUser: new Map(sides.map((u) => [u, { youWon: null }])),
+        });
+
+        return { ok: true, closed_lobby_id: stale?.id ?? null };
+    });
+
     app.post('/tournaments/:id/entrants/:eid/disqualify', {
         preHandler: [requireTournamentManager(ctx), userRateLimit(ctx, Limits.TournamentWriteUser)],
     }, async (req) => {

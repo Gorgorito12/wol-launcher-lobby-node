@@ -1,4 +1,4 @@
-import type { FastifyRequest, preHandlerHookHandler } from 'fastify';
+import type { FastifyReply, FastifyRequest, preHandlerHookHandler } from 'fastify';
 import { Errors } from '../lib/errors';
 import type { AppContext } from '../context';
 
@@ -89,6 +89,32 @@ export function ipRateLimit(ctx: AppContext, rule: RateLimitRule): preHandlerHoo
             throw Errors.RateLimited(r.retryAfter);
         }
     };
+}
+
+/**
+ * The same per-IP check as {@link ipRateLimit}, but callable from INSIDE a handler.
+ *
+ * A preHandler runs before the route knows anything, so a request answered entirely out of
+ * a memo still spent quota. `/stats/community` polls once a minute per launcher - 1440 a
+ * day against a 2000/day cap - so two machines behind one address ran the cap out and got
+ * 429 for the rest of the UTC day, with the launcher rendering that identically to "not
+ * enough data yet". A cached answer costs no query, so it must cost no quota; this lets the
+ * handler charge only when it is going to hit the database.
+ *
+ * Same counter, same rule, same 429 with `Retry-After` - only the moment moves.
+ */
+export async function chargeIpQuota(
+    ctx: AppContext,
+    req: FastifyRequest,
+    reply: FastifyReply,
+    rule: RateLimitRule,
+): Promise<void> {
+    if (ctx.config.devAuthBypass) return;
+    const r = await checkAndBump(ctx, rule, clientIp(req));
+    if (!r.allowed) {
+        reply.header('Retry-After', String(r.retryAfter));
+        throw Errors.RateLimited(r.retryAfter);
+    }
 }
 
 /** preHandler that bumps a per-user counter (falls back to IP when anonymous). */

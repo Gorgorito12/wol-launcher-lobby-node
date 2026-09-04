@@ -311,7 +311,8 @@ export class GlobalChatRoom {
      * allowed to throw.</p>
      */
     announceTournamentUpdate(notice: {
-        kind: 'match_ready' | 'room_opened' | 'match_done' | 'entry_accepted' | 'entry_promoted';
+        kind: 'match_ready' | 'room_opened' | 'match_done' | 'match_replay'
+            | 'entry_accepted' | 'entry_promoted';
         tournamentId: string;
         tournamentName: string;
         tournamentMatchId?: string | null;
