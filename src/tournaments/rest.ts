@@ -4,10 +4,17 @@
  * ---------------------------------------------------------------------------
  * Permission model
  * ---------------------------------------------------------------------------
- * There is no role anywhere. Anybody signed in may create a tournament and becomes its
- * OWNER, with every power over that tournament and none over anybody else's. The guard is
- * `requireTournamentOwner`, which reads `tournaments.owner_user_id` — the same shape as
- * `lobbies.host_user_id` gating kick and start.
+ * There is no GLOBAL role anywhere — no moderator, no staff flag on `users`. Anybody
+ * signed in may create a tournament and becomes its OWNER, with every power over that
+ * tournament and none over anybody else's. The guard is `requireTournamentOwner`, which
+ * reads `tournaments.owner_user_id` — the same shape as `lobbies.host_user_id` gating kick
+ * and start.
+ *
+ * Since 0016 an owner may let somebody help run THAT tournament: `tournament_managers`, and
+ * `requireTournamentManager` on the ten routes that run a bracket. Three routes stay the
+ * owner's alone — `cancel`, and appointing or removing a manager — because a co-organiser
+ * who can appoint co-organisers is the hole `tournament:transfer` is a maintainer command
+ * to avoid. The maintainer still grants nothing: the person handing it out is the owner.
  *
  * One power is deliberately absent: **there is no route that undoes a played result.**
  * Voiding a match that a recording decided touches the anti-cheat story and the ladder, so
@@ -32,7 +39,7 @@
 import type { FastifyInstance } from 'fastify';
 import { Errors } from '../lib/errors';
 import { uuid, shortId } from '../lib/ids';
-import { requireAuth, requireTournamentOwner } from '../middleware/auth';
+import { requireAuth, requireTournamentOwner, requireTournamentManager } from '../middleware/auth';
 import { ipRateLimit, userRateLimit, Limits } from '../middleware/rateLimit';
 import { createLobby } from '../lobbies/create';
 import type { AppContext } from '../context';
@@ -415,7 +422,7 @@ export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): 
     // ------------------------------------------------------------ owner actions
 
     app.patch('/tournaments/:id', {
-        preHandler: [requireTournamentOwner(ctx), userRateLimit(ctx, Limits.TournamentWriteUser)],
+        preHandler: [requireTournamentManager(ctx), userRateLimit(ctx, Limits.TournamentWriteUser)],
     }, async (req) => {
         const id = paramId(req, 'id');
         const t = (await store.getTournament(ctx.db, id))!;
@@ -450,7 +457,7 @@ export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): 
     });
 
     app.post('/tournaments/:id/open', {
-        preHandler: [requireTournamentOwner(ctx), userRateLimit(ctx, Limits.TournamentWriteUser)],
+        preHandler: [requireTournamentManager(ctx), userRateLimit(ctx, Limits.TournamentWriteUser)],
     }, async (req) => {
         const id = paramId(req, 'id');
         const ok = await store.setTournamentStatus(
@@ -461,7 +468,7 @@ export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): 
     });
 
     app.post('/tournaments/:id/close', {
-        preHandler: [requireTournamentOwner(ctx), userRateLimit(ctx, Limits.TournamentWriteUser)],
+        preHandler: [requireTournamentManager(ctx), userRateLimit(ctx, Limits.TournamentWriteUser)],
     }, async (req) => {
         const id = paramId(req, 'id');
         const ok = await store.setTournamentStatus(ctx.db, id, 'ready', ['registration']);
@@ -471,7 +478,7 @@ export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): 
     });
 
     app.post('/tournaments/:id/entrants/:eid/accept', {
-        preHandler: [requireTournamentOwner(ctx), userRateLimit(ctx, Limits.TournamentWriteUser)],
+        preHandler: [requireTournamentManager(ctx), userRateLimit(ctx, Limits.TournamentWriteUser)],
     }, async (req) => {
         const id = paramId(req, 'id');
         const eid = paramId(req, 'eid');
@@ -494,7 +501,7 @@ export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): 
     });
 
     app.post('/tournaments/:id/entrants/:eid/reject', {
-        preHandler: [requireTournamentOwner(ctx), userRateLimit(ctx, Limits.TournamentWriteUser)],
+        preHandler: [requireTournamentManager(ctx), userRateLimit(ctx, Limits.TournamentWriteUser)],
     }, async (req) => {
         const id = paramId(req, 'id');
         const eid = paramId(req, 'eid');
@@ -517,7 +524,7 @@ export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): 
      * `start` the sides are seated in matches and merging would rewrite history.
      */
     app.post('/tournaments/:id/entrants/merge', {
-        preHandler: [requireTournamentOwner(ctx), userRateLimit(ctx, Limits.TournamentWriteUser)],
+        preHandler: [requireTournamentManager(ctx), userRateLimit(ctx, Limits.TournamentWriteUser)],
     }, async (req) => {
         const id = paramId(req, 'id');
         const t = (await store.getTournament(ctx.db, id))!;
@@ -581,7 +588,7 @@ export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): 
     });
 
     app.post('/tournaments/:id/seed', {
-        preHandler: [requireTournamentOwner(ctx), userRateLimit(ctx, Limits.TournamentWriteUser)],
+        preHandler: [requireTournamentManager(ctx), userRateLimit(ctx, Limits.TournamentWriteUser)],
     }, async (req) => {
         const id = paramId(req, 'id');
         const t = (await store.getTournament(ctx.db, id))!;
@@ -616,7 +623,7 @@ export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): 
     });
 
     app.post('/tournaments/:id/start', {
-        preHandler: [requireTournamentOwner(ctx), userRateLimit(ctx, Limits.TournamentWriteUser)],
+        preHandler: [requireTournamentManager(ctx), userRateLimit(ctx, Limits.TournamentWriteUser)],
     }, async (req) => {
         const id = paramId(req, 'id');
         const t = (await store.getTournament(ctx.db, id))!;
@@ -650,7 +657,7 @@ export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): 
     });
 
     app.post('/tournaments/:id/matches/:mid/walkover', {
-        preHandler: [requireTournamentOwner(ctx), userRateLimit(ctx, Limits.TournamentWriteUser)],
+        preHandler: [requireTournamentManager(ctx), userRateLimit(ctx, Limits.TournamentWriteUser)],
     }, async (req) => {
         const id = paramId(req, 'id');
         const mid = paramId(req, 'mid');
@@ -676,7 +683,7 @@ export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): 
     });
 
     app.post('/tournaments/:id/entrants/:eid/disqualify', {
-        preHandler: [requireTournamentOwner(ctx), userRateLimit(ctx, Limits.TournamentWriteUser)],
+        preHandler: [requireTournamentManager(ctx), userRateLimit(ctx, Limits.TournamentWriteUser)],
     }, async (req) => {
         const id = paramId(req, 'id');
         const eid = paramId(req, 'eid');
@@ -695,6 +702,54 @@ export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): 
         await store.touch(ctx.db, id);
         invalidate(id);
         return { ok: true, matches_awarded: updates.length };
+    });
+
+    // ---- and these three stay the OWNER's, whatever else they delegate.
+    //
+    // Cancelling is irreversible. Appointing is the `tournament:transfer` hole with more
+    // steps: a co-organiser who can appoint co-organisers can be talked into handing the
+    // tournament around, which is exactly why transferring is a maintainer command.
+
+    app.post('/tournaments/:id/managers', {
+        preHandler: [requireTournamentOwner(ctx), userRateLimit(ctx, Limits.TournamentWriteUser)],
+    }, async (req) => {
+        const id = paramId(req, 'id');
+        const body = (req.body ?? {}) as { user_id?: unknown };
+        const userId = typeof body.user_id === 'string' ? body.user_id.trim() : '';
+        if (!userId) throw Errors.BadRequest('user_id is required');
+
+        const t = (await store.getTournament(ctx.db, id))!;
+        // The owner already has every power a manager has; a row saying otherwise would be
+        // a second source of truth for the same person.
+        if (userId === t.owner_user_id) throw Errors.BadRequest('The owner already runs it.');
+
+        // Checked rather than left to the foreign key: an unknown id is the caller's
+        // mistake and deserves a 400, not the 500 a constraint violation would produce.
+        const known = await ctx.db.prepare(
+            `SELECT 1 AS ok FROM users WHERE id = ?`,
+        ).bind(userId).first<{ ok: number }>();
+        if (!known) throw Errors.BadRequest('No such player.');
+
+        await store.insertManager(ctx.db, id, userId, req.userId!);
+        invalidate(id);
+        return { ok: true };
+    });
+
+    app.post('/tournaments/:id/managers/:uid/remove', {
+        preHandler: [requireTournamentOwner(ctx), userRateLimit(ctx, Limits.TournamentWriteUser)],
+    }, async (req) => {
+        const id = paramId(req, 'id');
+        const uid = paramId(req, 'uid');
+
+        // The `changes` count is the answer, the same shape as every other status move
+        // here: removing somebody who was never appointed is a mistake worth reporting,
+        // not a no-op to smile at.
+        const removed = await store.deleteManager(ctx.db, id, uid);
+        if (!removed) throw Errors.NotFound('Co-organiser');
+
+        await store.touch(ctx.db, id);
+        invalidate(id);
+        return { ok: true };
     });
 
     app.post('/tournaments/:id/cancel', {
@@ -830,6 +885,7 @@ async function buildDetail(ctx: AppContext, id: string): Promise<unknown> {
     const entrants = await store.listEntrants(ctx.db, id);
     const rosters = await store.loadRosterMembers(ctx.db, id);
     const bracket = await store.loadBracket(ctx.db, id);
+    const managers = await store.listManagers(ctx.db, id);
 
     const lobbies = new Map<string, { id: string; host_user_id: string; status: string }>();
     for (const m of bracket) {
@@ -843,6 +899,12 @@ async function buildDetail(ctx: AppContext, id: string): Promise<unknown> {
         name: t.name,
         mod_id: t.mod_id,
         owner_user_id: t.owner_user_id,
+        // Both shapes, for the reason `member_ids` and `members` carry below: the ids
+        // answer "may I run this", which is what every permission check asks, and the
+        // names answer "who are they", which is the only thing a list can draw. A launcher
+        // that predates either reads neither and behaves as it always did.
+        manager_user_ids: managers.map((m) => m.user_id),
+        managers,
         format: t.format,
         team_source: t.team_source,
         entry_mode: t.entry_mode,

@@ -140,10 +140,14 @@ export function requireAuth(): preHandlerHookHandler {
 /**
  * Refuse anybody who is not the owner of the tournament named in the path.
  *
- * The permission model has no ROLE anywhere: whoever created a tournament may do
- * everything to it and nothing at all to anybody else's. That is the same shape as
- * `lobbies.host_user_id` gating kick and start, and it needs no administration — which is
- * the whole point, since nobody wants to be granting permissions by hand.
+ * There is no GLOBAL role anywhere in this database — no moderator, no staff flag on
+ * `users` — and that is still the point: nobody wants to be granting permissions by hand.
+ * The permission is a row. Whoever created a tournament may do everything to it and
+ * nothing at all to anybody else's, the same shape as `lobbies.host_user_id` gating kick
+ * and start.
+ *
+ * What changed in 0016 is that a tournament's owner may let somebody help run THAT
+ * tournament — see `requireTournamentManager` below. The maintainer still grants nothing.
  *
  * Shaped like `requireLauncherVersion` (a factory closing over `ctx`) rather than
  * `requireAuth` (which needs none), because it has to read a row.
@@ -168,6 +172,52 @@ export function requireTournamentOwner(ctx: AppContext): preHandlerHookHandler {
 
         if (!row) throw Errors.NotFound('Tournament');
         if (row.owner_user_id !== req.userId) throw Errors.Forbidden();
+    };
+}
+
+/**
+ * Refuse anybody who is neither the owner of the tournament named in the path nor one of
+ * the co-organisers its owner appointed.
+ *
+ * Everything `requireTournamentOwner` says applies here unchanged, and all four of its
+ * load-bearing properties are kept deliberately:
+ *
+ *   * auth and ban first;
+ *   * **fails CLOSED** — no try/catch at all, so a database error becomes a 500 and the
+ *     action does not happen. This guard GRANTS, and a check that grants must deny when it
+ *     cannot read;
+ *   * **404 before 403**, so a mistyped id is never reported as somebody else's tournament;
+ *   * raw statements here rather than a call into `tournaments/store`, because this file
+ *     imports nothing from a feature store and one exception would start the cycle.
+ *
+ * **Two reads and not one join.** `SELECT ... FROM tournaments t LEFT JOIN
+ * tournament_managers m ... WHERE t.id = ? AND (owner = ? OR m.user_id = ?)` would answer
+ * the question in one round trip and collapse "no such tournament" into "not allowed",
+ * which is exactly the distinction the ordering above exists to preserve. The second read
+ * only happens for somebody who is not the owner.
+ *
+ * What this does NOT guard: cancelling, and appointing or removing a manager. Those keep
+ * `requireTournamentOwner` — a manager who can appoint managers is the same hole
+ * `tournament:transfer` is a maintainer command to avoid.
+ */
+export function requireTournamentManager(ctx: AppContext): preHandlerHookHandler {
+    return async (req: FastifyRequest, _reply: FastifyReply): Promise<void> => {
+        if (!req.authenticated) throw Errors.Unauthorized();
+        if (req.banned) throw Errors.UserBanned();
+
+        const id = (req.params as { id?: string }).id ?? '';
+        const row = await ctx.db.prepare(
+            `SELECT owner_user_id FROM tournaments WHERE id = ?`,
+        ).bind(id).first<{ owner_user_id: string }>();
+
+        if (!row) throw Errors.NotFound('Tournament');
+        if (row.owner_user_id === req.userId) return;
+
+        const manager = await ctx.db.prepare(
+            `SELECT 1 AS ok FROM tournament_managers WHERE tournament_id = ? AND user_id = ?`,
+        ).bind(id, req.userId).first<{ ok: number }>();
+
+        if (!manager) throw Errors.Forbidden();
     };
 }
 

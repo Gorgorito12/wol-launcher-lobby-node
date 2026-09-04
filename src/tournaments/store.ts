@@ -190,6 +190,48 @@ export async function loadRosters(
     return out;
 }
 
+/** One co-organiser, with the name to draw for them. */
+export interface ManagerRow {
+    user_id: string;
+    display_name: string;
+}
+
+/**
+ * Whether this person may help run this tournament.
+ *
+ * <p>The guard in `auth.ts` does NOT call this: middleware there reads its own rows with a
+ * raw statement and imports nothing from a feature store, which is what keeps it free of
+ * the import cycle every other guard would start. This is for the routes and the CLI.</p>
+ */
+export async function isManager(
+    db: Db,
+    tournamentId: string,
+    userId: string,
+): Promise<boolean> {
+    const row = await db.prepare(
+        `SELECT 1 AS ok FROM tournament_managers WHERE tournament_id = ? AND user_id = ?`,
+    ).bind(tournamentId, userId).first<{ ok: number }>();
+    return !!row;
+}
+
+/**
+ * The co-organisers of one tournament, ids AND names.
+ *
+ * <p>Names for the same reason `loadRosterMembers` carries them: a list of people has to be
+ * drawable, and an id cannot be drawn. Ordered by when they were appointed, so the list does
+ * not reshuffle itself between reads.</p>
+ */
+export async function listManagers(db: Db, tournamentId: string): Promise<ManagerRow[]> {
+    const r = await db.prepare(
+        `SELECT m.user_id, ${USER_DISPLAY_NAME_SQL} AS display_name
+           FROM tournament_managers m
+           LEFT JOIN users u ON u.id = m.user_id
+          WHERE m.tournament_id = ?
+          ORDER BY m.added_at, m.user_id`,
+    ).bind(tournamentId).all<ManagerRow>();
+    return r.results ?? [];
+}
+
 /**
  * Everyone already spoken for in this tournament.
  *
@@ -681,6 +723,46 @@ export async function setBracketSize(db: Db, tournamentId: string, size: number)
 }
 
 /** Rename / retune before the bracket exists. Capacity is clamped by the route, not here. */
+/**
+ * Appoint a co-organiser. Idempotent: appointing somebody twice is not an error, it is a
+ * second click, and `INSERT OR IGNORE` says so without a read first.
+ *
+ * <p>Batched with the activity stamp, the way `insertEntrant` is: somebody arranging who
+ * runs their tournament is somebody who still cares about it, and a tournament that goes
+ * stale while being organised would be archived out from under them.</p>
+ */
+export async function insertManager(
+    db: Db,
+    tournamentId: string,
+    userId: string,
+    addedBy: string,
+): Promise<void> {
+    await db.batch([
+        db.prepare(
+            `INSERT OR IGNORE INTO tournament_managers (tournament_id, user_id, added_by)
+             VALUES (?, ?, ?)`,
+        ).bind(tournamentId, userId, addedBy),
+        db.prepare(
+            `UPDATE tournaments SET last_activity_at = datetime('now') WHERE id = ?`,
+        ).bind(tournamentId),
+    ]);
+}
+
+/**
+ * Take it away again. Returns whether there was anything to take, so a route can answer
+ * honestly rather than reporting success for somebody who was never appointed.
+ */
+export async function deleteManager(
+    db: Db,
+    tournamentId: string,
+    userId: string,
+): Promise<boolean> {
+    const r = await db.prepare(
+        `DELETE FROM tournament_managers WHERE tournament_id = ? AND user_id = ?`,
+    ).bind(tournamentId, userId).run();
+    return r.changes > 0;
+}
+
 export async function updateTournamentSettings(
     db: Db,
     tournamentId: string,
