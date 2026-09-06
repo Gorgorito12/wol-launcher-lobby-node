@@ -67,12 +67,27 @@ export const Errors = {
         details,
     ),
     UserBanned:      () => new HttpError(403, 'user_banned',    'This account is banned from multiplayer.'),
+    // BOTH LANGUAGES, and this is the one error where that is not decoration.
+    //
+    // Everything else here is localised by the launcher from the CODE, so the sentence is a
+    // fallback nobody reads. This one is the exception by construction: the clients it refuses
+    // are the ones too old to know the code. Both X-Launcher-Version and the launcher_too_old
+    // handling arrive in v1.0.13, so anything at v1.0.12e or below fails the minimum
+    // automatically AND has no idea what to do with the code - what it puts on screen is this
+    // string, verbatim (CreateLobbyDialog calls ShowError(ex.Message); the join path uses it as
+    // the body of its notice). It cannot be fixed for them later by shipping a launcher: they
+    // are refused precisely because they will not take one.
+    //
+    // Spanish first because most of this community reads it and the launcher's own default is
+    // es. A modern launcher never renders any of it - see MpNoticeLauncherTooOldBody.
+    //
     // Carries the required version in the payload so the launcher can name it instead of
     // telling somebody they are "too old" and leaving them to work out what to do.
     LauncherTooOld:  (minVersion: string) => new HttpError(
         426,
         'launcher_too_old',
-        'This launcher is too old for multiplayer. Update it and try again.',
+        'Este launcher es demasiado antiguo para el multijugador. Actualízalo y vuelve a '
+        + 'intentarlo. · This launcher is too old for multiplayer. Update it and try again.',
         { min_version: minVersion },
     ),
     // A room bound to a bracket slot is not a public room: only the two entrants'
