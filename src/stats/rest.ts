@@ -284,9 +284,26 @@ const ACTIVITY_WINDOW_DAYS = 30;
  *  visitor is not an answer to that. */
 const ACTIVE_PLAYERS_WINDOW_DAYS = 7;
 
-/** How many finished matches the strip lists. Five is what fits the card without the
- *  panel growing into the room list above it. */
-const RECENT_MATCHES_LIMIT = 5;
+/** How many finished matches the strip lists when the caller does not say. Five is what
+ *  fits the Rooms card without the panel growing into the room list above it. */
+export const RECENT_MATCHES_LIMIT = 5;
+
+/** The most a caller may ask for with `recent=N`. The Ranking page's history list asks
+ *  for 30; forty is a page and a half of that, and every match costs a participants row
+ *  in the same payload, so this is a cap on payload size rather than on curiosity. */
+export const RECENT_MATCHES_MAX = 40;
+
+/**
+ * `recent=N`: how many of the community's latest matches ride the payload. Absent means
+ * what it always was; anything unparseable means the same, so a launcher that has never
+ * heard of the parameter — or one that sends nonsense — keeps getting five.
+ */
+export function recentParam(raw: unknown): number {
+    if (typeof raw !== 'string' || !raw.trim()) return RECENT_MATCHES_LIMIT;
+    const n = parseInt(raw, 10);
+    if (!Number.isFinite(n)) return RECENT_MATCHES_LIMIT;
+    return Math.min(RECENT_MATCHES_MAX, Math.max(1, n));
+}
 
 /** Server-side memo. The contents change at most once per finished match, and a
  *  minute of staleness on a decorative card is invisible; what it buys is that a
@@ -318,8 +335,16 @@ const communityCache = new Map<string, CacheEntry>();
  */
 const communityInFlight = new Map<string, Promise<unknown>>();
 
-function communityKey(limit: number, mod: string | null, mode: string): string {
-    return `${limit}\u0000${mod ?? ''}\u0000${mode}`;
+/**
+ * Every dimension the payload varies by is IN the key, or the memo hands one caller
+ * another caller's answer. `recent` joined the triple the day the Ranking page started
+ * asking for thirty matches: without it, the Rooms strip's five-row answer would have
+ * been served to the ranking for a minute, and the other way round.
+ */
+export function communityKey(
+    limit: number, mod: string | null, mode: string, recent: number = RECENT_MATCHES_LIMIT,
+): string {
+    return `${limit}\u0000${mod ?? ''}\u0000${mode}\u0000${recent}`;
 }
 
 /** Drop expired entries. Called on write, which is the only time the map grows. */
@@ -333,6 +358,19 @@ function pruneCommunityCache(now: number): void {
  *  page and a different set of clients, so sharing one would evict the busy one constantly. */
 let civCache: { at: number; mod: string | null; mode: string; payload: unknown } | null = null;
 let matchupCache: { at: number; mod: string | null; mode: string; payload: unknown } | null = null;
+
+/**
+ * Forget the civilization and matchup tables, and the community payloads that carry
+ * `top_civs`. Called by the matches routes when a confirmation has just filled in a
+ * civilization a report left blank (migration 0019): the memo is a minute long, and a match
+ * that just learned who played what should show up on the next request, not the next
+ * minute. Cheap — three slots and a small map — and a no-op when nothing was cached.
+ */
+export function invalidateCivStatsCaches(): void {
+    civCache = null;
+    matchupCache = null;
+    communityCache.clear();
+}
 let deckCache: { at: number; mod: string | null; payload: unknown } | null = null;
 
 /** The list of mods that have matches. Its own slot; it is tiny and asked once a page. */
@@ -387,6 +425,63 @@ interface LeaderRow {
     games_played: number;
     wins: number;
     losses: number;
+}
+
+/** One civilization a player has been seen with, and how often. */
+export interface TopCiv { civ: string; played: number }
+
+/** How many civilizations a ladder row names. Three flags fit the column the launcher
+ *  gives them; the STATS page holds the whole distribution. */
+export const TOP_CIVS_PER_PLAYER = 3;
+
+/**
+ * Who played what, for a set of players: one row per (player, civilization) with a count.
+ *
+ * <p>RATED matches of the ladder's own mode, and NO time window, on purpose. The ladder is
+ * not windowed either — a rating is the sum of everything — and with the data there is
+ * today (civilizations only started arriving with launcher 1.0.14, and mostly through the
+ * confirmation path since migration 0019) a thirty-day window would answer "nothing" for
+ * almost everybody almost all the time, which is not what a player asking "what does he
+ * play" wants to hear.</p>
+ *
+ * <p>Blank civilizations are excluded here and not merely counted as "unknown": an unknown
+ * is not a civilization somebody plays, and on today's data it would top every list.</p>
+ */
+export function topCivsSql(players: number): string {
+    const marks = Array.from({ length: players }, () => '?').join(', ');
+    return `SELECT mp.user_id, mp.civ, COUNT(*) AS played
+              FROM match_participants mp
+              JOIN matches m ON m.id = mp.match_id
+             WHERE m.rated = 1
+               AND COALESCE(m.rating_mode, 'default') = ?
+               AND mp.civ IS NOT NULL AND TRIM(mp.civ) <> ''
+               AND mp.user_id IN (${marks})
+             GROUP BY mp.user_id, mp.civ`;
+}
+
+/**
+ * The top few per player, from the grouped rows. Most played first; on a tie the
+ * civilization's name decides, so two players with the same record are listed the same
+ * way every time rather than in whatever order SQLite grouped them today.
+ *
+ * <p>Pure, and exported for the tests: the SQL above is checked against a real database
+ * on deploy, the CUT is checked here.</p>
+ */
+export function topCivsFor(
+    rows: ReadonlyArray<{ user_id: string; civ: string; played: number }>,
+    perPlayer: number = TOP_CIVS_PER_PLAYER,
+): Map<string, TopCiv[]> {
+    const byUser = new Map<string, TopCiv[]>();
+    for (const r of rows) {
+        const list = byUser.get(r.user_id) ?? [];
+        list.push({ civ: r.civ, played: r.played });
+        byUser.set(r.user_id, list);
+    }
+    for (const [user, list] of byUser) {
+        list.sort((a, b) => b.played - a.played || a.civ.localeCompare(b.civ));
+        byUser.set(user, list.slice(0, perPlayer));
+    }
+    return byUser;
 }
 
 interface HourRow { h: number; c: number }
@@ -452,10 +547,23 @@ async function ladder(ctx: AppContext, mode: 'default' | 'team', limit: number) 
          LIMIT ?`,
     ).bind(WIN_AT, LOSS_AT, mode, mode, MIN_DECIDED, limit).all<LeaderRow>();
 
+    const players = rows.results ?? [];
+
+    // What each of them plays: ONE query for the page, never one per row. The launcher
+    // draws these as flags beside the name; a player with none gets an empty list, which
+    // the launcher reads as "nothing known" and a launcher older than the field ignores.
+    let topCivs = new Map<string, TopCiv[]>();
+    if (players.length > 0) {
+        const civRows = await ctx.db.prepare(topCivsSql(players.length))
+            .bind(mode, ...players.map((p) => p.id))
+            .all<{ user_id: string; civ: string; played: number }>();
+        topCivs = topCivsFor(civRows.results ?? []);
+    }
+
     // The rank is decided HERE, by the same ordering that produced the list. A client
     // filtering its copy must not renumber: the third row is the third player, not the
     // third thing that survived the client's own filter.
-    return (rows.results ?? []).map((r, i) => ({
+    return players.map((r, i) => ({
         rank: i + 1,
         user_id: r.id,
         discord_username: r.discord_username,
@@ -466,6 +574,7 @@ async function ladder(ctx: AppContext, mode: 'default' | 'team', limit: number) 
         games_played: r.games_played,
         wins: r.wins,
         losses: r.losses,
+        top_civs: topCivs.get(r.id) ?? [],
     }));
 }
 
@@ -493,12 +602,15 @@ export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
     // NO ipRateLimit preHandler here, on purpose - see the cache check below. The quota is
     // charged inside the handler, and only when the request is actually going to do work.
     app.get('/stats/community', async (req, reply) => {
-        const query = req.query as { limit?: string; mod?: string } | undefined;
+        const query = req.query as { limit?: string; mod?: string; recent?: string } | undefined;
         const raw = query?.limit;
         const parsed = raw ? parseInt(raw, 10) : DEFAULT_LIMIT;
         const limit = Number.isFinite(parsed)
             ? Math.min(MAX_LIMIT, Math.max(1, parsed))
             : DEFAULT_LIMIT;
+        // How many recent matches. The Rooms strip is happy with the default; the Ranking
+        // page's history asks for thirty.
+        const recent = recentParam(query?.recent);
 
         // Optional. Absent means every mod, which is exactly what this endpoint did before —
         // so a launcher that has never heard of the parameter keeps getting what it got.
@@ -512,7 +624,7 @@ export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
         const modArgs = modClause(mod).args;
 
         const now = Date.now();
-        const key = communityKey(limit, mod, mode);
+        const key = communityKey(limit, mod, mode, recent);
 
         // THE MEMO IS CHECKED BEFORE THE QUOTA, and that ordering is the fix rather than a
         // shortcut. ipRateLimit used to be a preHandler, so a request answered entirely out
@@ -651,7 +763,7 @@ export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
                   ${mod ? 'WHERE mod_id = ?' : ''}
                   ORDER BY created_at DESC
                   LIMIT ?`,
-            ).bind(...modArgs, RECENT_MATCHES_LIMIT)
+            ).bind(...modArgs, recent)
                 .all<Record<string, unknown> & { id: string }>();
 
             const recent_matches = recentRows.results ?? [];

@@ -581,6 +581,41 @@ journalctl -u wol-lobby | grep 'match decided by a late reading'
 journalctl -u wol-lobby | grep 'late reading refused'      # and WHY, per attempt
 ```
 
+### Civilizations by confirmation
+
+The same late reading now carries **who played what**. Until migration `0019` the only thing
+that ever wrote `match_participants.civ` was the host's first-pass report — which goes out
+before the recording usually exists — so a match whose recording arrived seconds later was
+decided but civ-less for good (43 of 44 matches on the live server the day this landed, and
+the Statistics page showed one row).
+
+- `POST /matches/confirm` accepts `civs` and `home_cities`: `{"<user_id>": "Ethiopians"}`,
+  one entry per player the confirmer's recording named. Only ids in `roster_at_start` are
+  kept, values are trimmed and capped at 64 characters; the rest is dropped silently. They
+  are stored on the confirmation row (`match_confirmations.civs / home_cities`, JSON) and
+  applied in **either order**: a confirmation after the report fills the report's blanks
+  right away, and a report finds any confirmations already stored for its lobby.
+- **Gaps only, never an overwrite.** The UPDATE carries `civ IS NULL OR TRIM(civ) = ''`.
+  The host's report outranks every later reading; two confirmations that disagree leave the
+  first one standing. A confirmer can add a civilization; nobody can repaint one.
+- `0019` runs on start like every other migration. Nothing to do by hand; nothing is
+  backfilled for old matches, because there is nothing to backfill it from.
+
+```bash
+# Matches that gained a civilization after the fact.
+journalctl -u wol-lobby | grep 'civilizations filled'
+```
+
+Two more things on `/stats/community` for the launcher's Ranking page:
+
+- `?recent=N` — how many of the community's latest matches ride the payload (default 5, the
+  Rooms strip; the Ranking history asks for 30; capped at 40). It is part of the memo key, so
+  the two pages never get each other's answer.
+- every `leaderboard[]` / `leaderboard_team[]` row carries `top_civs: [{civ, played}]` — up
+  to three, most played first, from **rated matches of that ladder's mode, no time window**
+  (with today's data a window would be empty for almost everybody). An empty list means
+  nothing is known; an older launcher ignores the field.
+
 ### The number that decides whether agreement can be REQUIRED
 
 `match_confirmations.agreement` is now **stored**, not only logged — the log rotates and

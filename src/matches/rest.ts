@@ -13,6 +13,7 @@ import { sqliteTimestampToMs } from '../lib/time';
 import { finalizeRoom } from '../lobbies/discordAnnounce';
 import { advanceTournamentFromMatch } from '../tournaments/advance';
 import { getTournament, loadBracket } from '../tournaments/store';
+import { invalidateCivStatsCaches } from '../stats/rest';
 import type { AppContext } from '../context';
 
 interface ReportMatchBody {
@@ -68,6 +69,125 @@ interface ConfirmationRow {
     replay_sha256: string | null;
     game_seed: number | null;
     game_host_time: number | null;
+}
+
+/** A confirmation's reading of who played what: user id → civilization / home city. */
+type NameMap = Record<string, string>;
+
+/**
+ * The longest civilization or home city name a confirmation may carry. A display name is a
+ * word or two ("Ethiopians", "Ahí Ba La Bala"); this is a cap against a client sending a
+ * paragraph into a column that every stats query groups on, not a format.
+ */
+export const NAME_MAP_MAX_LEN = 64;
+
+/**
+ * Keep only what a confirmation is allowed to say: a string per user WHO WAS IN THE ROOM,
+ * trimmed, non-empty, capped. Everything else is dropped silently — a name for somebody
+ * outside the roster is not an error worth refusing the whole reading over, it is a claim
+ * about a player this match never had.
+ *
+ * <p>Exported for the tests: there is no database harness here, so the decision is pinned
+ * where it is made.</p>
+ */
+export function sanitiseNameMap(raw: unknown, roster: ReadonlySet<string>): NameMap {
+    const out: NameMap = {};
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+    for (const [userId, value] of Object.entries(raw as Record<string, unknown>)) {
+        if (!roster.has(userId) || typeof value !== 'string') continue;
+        const name = value.trim().slice(0, NAME_MAP_MAX_LEN);
+        if (name) out[userId] = name;
+    }
+    return out;
+}
+
+/** The stored JSON, or null when there is nothing to store — never "{}". */
+function nameMapJson(map: NameMap): string | null {
+    return Object.keys(map).length > 0 ? JSON.stringify(map) : null;
+}
+
+function parseNameMap(json: string | null | undefined): NameMap {
+    if (!json) return {};
+    try {
+        const parsed = JSON.parse(json);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+        const out: NameMap = {};
+        for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+            if (typeof v === 'string' && v.trim()) out[k] = v.trim().slice(0, NAME_MAP_MAX_LEN);
+        }
+        return out;
+    } catch {
+        return {};
+    }
+}
+
+/**
+ * Fill gaps only. The predicate is the whole rule: a participant row that already names a
+ * civilization keeps it, whoever says otherwise afterwards — the host's first-pass report
+ * outranks every later reading, and two confirmations that disagree leave the first one
+ * standing. Exported so the test can pin that the WHERE never loses its guard.
+ */
+export const FILL_CIV_SQL =
+    `UPDATE match_participants SET civ = ?
+      WHERE match_id = ? AND user_id = ? AND (civ IS NULL OR TRIM(civ) = '')`;
+export const FILL_HOME_CITY_SQL =
+    `UPDATE match_participants SET home_city = ?
+      WHERE match_id = ? AND user_id = ? AND (home_city IS NULL OR TRIM(home_city) = '')`;
+
+/**
+ * Write a reading's civilizations and home cities into the match's participant rows,
+ * where those rows have none. Returns how many cells were actually filled.
+ *
+ * <p>This is the fix for "the civilization table has one match in it": until this existed,
+ * `match_participants.civ` was written by the host's report and by nothing else, and the
+ * host's report goes out before the recording usually exists. See migration 0019.</p>
+ */
+async function fillMissingCivs(
+    ctx: AppContext,
+    matchId: string,
+    civs: NameMap,
+    homeCities: NameMap,
+): Promise<number> {
+    let filled = 0;
+    for (const [userId, civ] of Object.entries(civs)) {
+        const r = await ctx.db.prepare(FILL_CIV_SQL).bind(civ, matchId, userId).run();
+        filled += r.changes;
+    }
+    for (const [userId, city] of Object.entries(homeCities)) {
+        const r = await ctx.db.prepare(FILL_HOME_CITY_SQL).bind(city, matchId, userId).run();
+        filled += r.changes;
+    }
+    // The civilization and matchup tables are memoised for a minute; a match that just
+    // gained its civilizations should show up on the next request, not the next minute.
+    if (filled > 0) invalidateCivStatsCaches();
+    return filled;
+}
+
+/**
+ * Apply every confirmation already stored for this lobby to a match that has just been
+ * reported. The order is not guaranteed — the player who lost usually leaves first, so a
+ * guest's confirmation routinely lands before the host has reported — and this is the
+ * half that covers that order; POST /matches/confirm covers the other.
+ */
+async function applyConfirmedCivs(
+    ctx: AppContext,
+    log: FastifyBaseLogger,
+    lobbyId: string,
+    matchId: string,
+): Promise<void> {
+    const rows = await ctx.db.prepare(
+        `SELECT user_id, civs, home_cities FROM match_confirmations
+          WHERE lobby_id = ? AND (civs IS NOT NULL OR home_cities IS NOT NULL)`,
+    ).bind(lobbyId).all<{ user_id: string; civs: string | null; home_cities: string | null }>();
+
+    for (const row of rows.results ?? []) {
+        const filled = await fillMissingCivs(
+            ctx, matchId, parseNameMap(row.civs), parseNameMap(row.home_cities));
+        if (filled > 0) {
+            log.info({ match_id: matchId, user_id: row.user_id, filled },
+                'civilizations filled from an earlier confirmation');
+        }
+    }
 }
 
 /** The match's own fingerprint, to compare a confirmation against. */
@@ -861,6 +981,18 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
         }
         await ctx.db.batch(inserts);
 
+        // Whoever confirmed before this report arrived may have read civilizations the
+        // report did not carry — the host reports before the recording exists, the guest
+        // who lost is out of the room first. Gaps only; see fillMissingCivs.
+        if (body.lobby_id) {
+            try {
+                await applyConfirmedCivs(ctx, req.log, body.lobby_id, matchId);
+            } catch (err) {
+                req.log.info({ match_id: matchId, err: String(err) },
+                    'earlier confirmations could not fill civilizations');
+            }
+        }
+
         // Decide ONCE whether this scores, and keep the reason: it goes back in the
         // response so the launcher can tell the player the truth without owning a
         // copy of the policy. A match that does not score is still stored above —
@@ -1106,6 +1238,11 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
             replay_sha256?: string;
             game_seed?: number | null;
             game_host_time?: number | null;
+            /** What THIS reading's recording said each player played: user id → civilization
+             *  display name. Optional; a launcher older than migration 0019 never sends it. */
+            civs?: Record<string, string>;
+            /** Same shape, the home city each player brought. */
+            home_cities?: Record<string, string>;
         } | null;
         if (!body?.lobby_id) throw Errors.BadRequest('lobby_id required');
 
@@ -1126,21 +1263,31 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
         const roster = parseRoster(lobby.roster_at_start);
         if (roster === null || !roster.has(userId)) throw Errors.Forbidden();
 
+        // The reading's civilizations, kept only for players who were in the room. Stored
+        // with the confirmation so that a report arriving AFTER this can still use them.
+        const civs = sanitiseNameMap(body.civs, roster);
+        const homeCities = sanitiseNameMap(body.home_cities, roster);
+
         await ctx.db.prepare(
             `INSERT INTO match_confirmations
-                 (lobby_id, user_id, result, replay_sha256, game_seed, game_host_time)
-             VALUES (?, ?, ?, ?, ?, ?)
+                 (lobby_id, user_id, result, replay_sha256, game_seed, game_host_time,
+                  civs, home_cities)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT (lobby_id, user_id) DO UPDATE SET
                result = excluded.result,
                replay_sha256 = excluded.replay_sha256,
                game_seed = excluded.game_seed,
                game_host_time = excluded.game_host_time,
+               civs = excluded.civs,
+               home_cities = excluded.home_cities,
                created_at = datetime('now')`,
         ).bind(
             body.lobby_id, userId, result,
             normaliseSha256(body.replay_sha256),
             normaliseFingerprint(body.game_seed),
             normaliseFingerprint(body.game_host_time),
+            nameMapJson(civs),
+            nameMapJson(homeCities),
         ).run();
 
         // If the host already reported, compare now; otherwise the report will, when it
@@ -1153,6 +1300,18 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
         }>();
 
         if (match) {
+            // The report is already in: whatever it left blank, this reading fills now.
+            try {
+                const filled = await fillMissingCivs(ctx, match.id, civs, homeCities);
+                if (filled > 0) {
+                    req.log.info({ match_id: match.id, user_id: userId, filled },
+                        'civilizations filled from a confirmation');
+                }
+            } catch (err) {
+                req.log.info({ match_id: match.id, err: String(err) },
+                    'confirmation could not fill civilizations');
+            }
+
             const reported = await ctx.db.prepare(
                 `SELECT user_id, result FROM match_participants WHERE match_id = ?`,
             ).bind(match.id).all<{ user_id: string; result: number }>();
