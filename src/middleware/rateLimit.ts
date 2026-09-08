@@ -176,7 +176,15 @@ export const Limits = {
     // Registering, withdrawing, seeding, starting. Keyed by USER and not by IP, the same
     // decision as StatsDeckUpload: two players behind one Radmin NAT each enter their own
     // tournaments, and an IP budget would make the second silently fail.
-    TournamentWriteUser: { scope: 'tourn-u', keyKind: 'user', perMinute: 10, perDay: 100 } as const,
+    //
+    // TEN A MINUTE WAS LESS THAN ONE USE OF THE FEATURE. Running a tournament is a burst,
+    // not a trickle: close registration, seed eight entrants one at a time, then open a room
+    // per first-round match. An organiser hit the wall in the middle of that — and CANCELLING
+    // comes out of this same bucket, so the escape hatch was the one thing locked out after a
+    // few minutes of trying things. Forty leaves room for the whole burst twice over and
+    // still stops a script; the real ceilings on abuse are the per-user and server-wide
+    // tournament caps in tournaments/rest.ts and TournamentCreateUser below.
+    TournamentWriteUser: { scope: 'tourn-u', keyKind: 'user', perMinute: 40, perDay: 400 } as const,
     // Creating one is the expensive, abusable action — anybody signed in may do it, and
     // there is no moderator. Deliberately tiny; the per-user and server-wide caps in
     // tournaments/rest.ts are the real limit, this only slows a script down.
