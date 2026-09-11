@@ -509,40 +509,60 @@ sudo -u wol-lobby ./node_modules/.bin/tsx scripts/admin.ts match:show <matchId>
 
 ### Walking out counts as a loss
 
-**Two things count as walking out**, and the server watches both:
+**The server watches two things, and only ONE of them decides.**
 
 1. the player's **connection** dies and does not come back (`lobby_abandons`, written when the
-   socket closes);
+   socket closes) — **this is the one that forfeits**;
 2. the player's **game closes** mid-match (`lobby_game_exits`, written from the `game_exited`
-   frame every launcher sends when its own Age of Empires III exits).
+   frame every launcher sends when its own Age of Empires III exits) — **evidence only**.
 
-The second one was added because the first one could not see the commonest dodge. The game runs
-re-parented under `explorer.exe`, so it and the launcher outlive each other: a player who alt-F4s
-Age of Empires III **stays connected to the room**, leaves no `lobby_abandons` row, and used to be
-indistinguishable from somebody still playing. His own engine writes no recording either — a
-terminated process writes nothing — so the match went down a draw and he kept his rating. AoE3 has
-no rejoin, so a closed game *is* a left match.
+⚠ **Why a closed game does not decide, even though it was built to.** In a 1v1 both games end
+together: when one player leaves, AoE3 hands the other the victory, and each then closes his
+window whenever he gets round to it. So the two timestamps look the same after a dodge and after
+a perfectly ordinary ending, and nothing in `lobby_game_exits` can separate them.
 
-⚠ **A crash counts too, and there is no way to tell one from a dodge.** That is the standard
-bargain of a ranked ladder, the launcher says so before every competitive start, and `match:void`
-below is the correction.
+Worse, deciding on it was biased rather than merely imprecise. The verdict runs inside the host's
+`POST /matches`, which is itself triggered by **his** game closing — so the reporter always has a
+row — while the opponent's row is only written while the room is still `in_game`, i.e. before that
+same report closes it:
 
-A walkout **more than `COMPETITIVE_ABANDON_SECONDS` into the match** (default **300**) forfeits a
-competitive match the recording could not settle. This is the only rule here that moves rating
-from an *absence* of evidence, so it is fenced in hard — the decision is the pure
+| who closes first | rows when the verdict runs | outcome |
+|---|---|---|
+| guest, then host | both | draw ✅ |
+| **host, then guest** | **only the host's** (the guest's frame arrives after the room closed and is refused) | **the host forfeits** ✗ |
+
+So a normally-finished match with no readable ending handed a loss to whoever shut his window
+first — disproportionately the host, the player who stayed to report it. The rows are kept,
+stored and printed because they are the only record of when a player's match really ended, and
+because a discriminator may yet be found; they simply do not decide today.
+
+**What closes the dodge instead is the recording, and it already does.** The quitter's own client
+is killed mid-match and writes no ending, while his opponent's writes one naming him the loser.
+That reading now reaches the server on both routes — the host's report carries a fingerprint
+(the launcher makes a few attempts before reporting in a competitive room), and
+`canUpgradeFromConfirmation` accepts the opponent's victory claim against it.
+
+⚠ **A crash still counts as a loss on the SOCKET route, and there is no way to tell one from a
+dodge.** That is the standard bargain of a ranked ladder, the launcher says so before every
+competitive start, and `match:void` below is the correction.
+
+A **socket** walkout more than `COMPETITIVE_ABANDON_SECONDS` into the match (default **300**)
+forfeits a competitive match the recording could not settle. This is the only rule here that moves
+rating from an *absence* of evidence, so it is fenced in hard — the decision is the pure
 `src/elo/abandon.ts` and its refusals are what the tests pin:
 
 - competitive rooms only, and only when ratability said `no_decided_result` — **a recording that
   names a winner always wins**;
 - exactly two players, and exactly one of them gone (both gone is a draw: the usual causes are the
   host's connection dying and taking the room with it, or a crash that took down both games);
-- **a player with a real ending did not abandon anything** — the winner closes his game the moment
-  the match finishes, and that looks identical from here. A stored reading naming a decided result
-  *with a recording fingerprint* is what tells the two apart, and it is derived on the server: a
-  client that could claim it would turn its own dodge into a draw;
-- a **socket** walkout must be at least **90 s** old — closing the launcher the moment a match ends
-  is normal and drops the connection exactly like a rage-quit does. A **game** walkout skips that
-  grace: it is affirmative and irreversible, so there is nothing to wait for;
+- **a closed game is never a walkout** — see above. A player whose game we saw close is out of the
+  verdict entirely, so a socket that dropped later cannot forfeit him either;
+- **a player with a real ending did not abandon anything** — the winner closes his launcher the
+  moment the match finishes, and that looks identical from here. A stored reading naming a decided
+  result *with a recording fingerprint* is what tells the two apart, and it is derived on the
+  server: a client that could claim it would turn its own dodge into a draw;
+- the walkout must be at least **90 s** old — closing the launcher the moment a match ends is
+  normal and drops the connection exactly like a rage-quit does;
 - the walkout must be **at least `COMPETITIVE_ABANDON_SECONDS` after the room started**, measured
   from the moment the socket dropped. It used to be measured from the moment the host REPORTED,
   which is when the host closed *his* game and says nothing about when the other player left: a
@@ -559,9 +579,7 @@ room's mode, any dropped sockets (`walked out`) and any closed games (`closed ga
 
 **It is evaluated twice**, because the opponent's reading routinely lands after the host's report:
 once inside `POST /matches`, and again inside `POST /matches/confirm` — after the confirmation has
-had its own chance to decide the match outright, since evidence outranks inference. The second
-pass is what catches a host who dodged, whose own report could never carry the fingerprint the
-brake demands.
+had its own chance to decide the match outright, since evidence outranks inference.
 
 **If it ever gets one wrong** — a power cut is indistinguishable from a dodge, and always will
 be — that is what the corrections are for:

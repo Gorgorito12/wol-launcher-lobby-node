@@ -46,54 +46,45 @@ test('one player walks out of a long game and the other is credited', () => {
 
 // --- the game-exit source --------------------------------------------------------
 //
-// The dodge this closes: the losing player closes Age of Empires III without closing the
-// launcher. His socket stays up, so `lobby_abandons` never sees him, and his own engine
-// writes no recording — a terminated process writes nothing. Every clause below is about
-// telling that apart from the two innocent things that look identical from here.
+// A `lobby_game_exits` row is EVIDENCE, never a verdict, and the reason is physical rather
+// than cautious: in a 1v1 both games end together. When one player leaves, AoE3 hands the
+// other the victory, and each then closes his window whenever he gets round to it — so the
+// two timestamps look the same after a dodge and after a perfectly ordinary ending. What
+// CAN tell them apart is the opponent's recording (the quitter's client is killed mid-match
+// and writes no ending, the opponent's writes one naming him the loser), and that route
+// decides the match on its own.
 
-test('THE DODGE — closing the game mid-match forfeits it', () => {
+test('closing the game decides nothing — a 1v1 cannot tell it from a normal ending', () => {
     const d = decideByAbandon(ok({ abandons: [gameExit('beto', STARTED + 600 * 1000)] }));
-    assert.equal(d.loserId, 'beto');
-    assert.equal(d.winnerId, 'ana');
+    assert.equal(d.loserId, null);
+    assert.equal(d.winnerId, null);
+    assert.match(d.reason, /closed his game/);
 });
 
-test('a game closed after a real ending is not a walkout', () => {
-    // The winner shuts his game the moment the match finishes, which drops him off here in
-    // exactly the same way as a rage-quit. `hasOutcome` is the only thing separating the
+test('THE_ONE_THAT_MATTERS_TheReporterIsNeverForfeitedForClosingFirst', () => {
+    // The regression this clause exists for, and it was systematic rather than an edge
+    // case. The verdict runs inside the host's POST /matches, which is itself triggered by
+    // HIS game closing — so the reporter always has a row — while the opponent's row is
+    // only written while the room is still `in_game`, i.e. before that same report closes
+    // it. Host shuts his window first, opponent is still on the score screen, and deciding
+    // on that hands a loss to the player who stayed to report the match.
+    const d = decideByAbandon(ok({ abandons: [gameExit('ana', STARTED + 1200 * 1000)] }));
+    assert.equal(d.loserId, null);
+    assert.equal(d.winnerId, null);
+    assert.match(d.reason, /closed his game/);
+});
+
+test('a socket that dropped after a real ending is not a walkout', () => {
+    // The winner shuts his launcher the moment the match finishes, which drops him off here
+    // in exactly the same way as a rage-quit. `hasOutcome` is the only thing separating the
     // two, and it is derived on the server from a stored reading with a fingerprint —
     // never from anything the client said, or this is the exploit arriving through its fix.
-    const d = decideByAbandon(ok({
-        abandons: [gameExit('beto', STARTED + 600 * 1000, true)],
-    }));
+    const d = decideByAbandon(ok({ abandons: [socket('beto', LONG_GONE, true)] }));
     assert.equal(d.winnerId, null);
     assert.match(d.reason, /already finished/);
 });
 
-test('a closed game does not wait out the reconnect grace', () => {
-    // The grace belongs to the SOCKET: the launcher reconnects on its own, so a dropped
-    // connection has to be given time to come back. A closed game has nothing to come back
-    // to — AoE3 has no rejoin — so waiting would only delay a verdict that cannot change.
-    const justClosed = NOW - 5 * 1000;
-    const d = decideByAbandon(ok({
-        abandons: [gameExit('beto', justClosed)],
-        startedAtMs: justClosed - 600 * 1000,
-    }));
-    assert.equal(d.loserId, 'beto');
-});
-
-test('closing the game inside the first five minutes is still too early', () => {
-    // The threshold is about the match, not about the source. Same protection a dropped
-    // socket gets, and the same refusal text.
-    const started = NOW - 900 * 1000;
-    const d = decideByAbandon(ok({
-        startedAtMs: started,
-        abandons: [gameExit('beto', started + 280 * 1000)],
-    }));
-    assert.equal(d.winnerId, null);
-    assert.match(d.reason, /280s into the match/);
-});
-
-test('both games closing is a draw — a crash takes down two, not one', () => {
+test('both games closing is still a draw — and so is one, now', () => {
     const d = decideByAbandon(ok({
         abandons: [
             gameExit('beto', STARTED + 600 * 1000),
@@ -101,13 +92,14 @@ test('both games closing is a draw — a crash takes down two, not one', () => {
         ],
     }));
     assert.equal(d.winnerId, null);
-    assert.match(d.reason, /both/);
+    assert.match(d.reason, /closed his game/);
 });
 
 test('the game a player closed outranks the launcher he closed afterwards', () => {
-    // He alt-F4s at 4:00 (too early to forfeit) and shuts the launcher at 12:00. The two
-    // rows say different things, and the GAME is when the match actually ended for him —
-    // so a socket that dropped later must not be able to turn it into a forfeit.
+    // He alt-F4s at 4:00 and shuts the launcher at 12:00. The two rows say different
+    // things, and the GAME is when the match actually ended for him — so a socket that
+    // dropped later must not be able to turn it into a forfeit. Since a game row now
+    // decides nothing, the preference takes him out of the verdict entirely.
     const started = NOW - 900 * 1000;
     const d = decideByAbandon(ok({
         startedAtMs: started,
@@ -117,7 +109,7 @@ test('the game a player closed outranks the launcher he closed afterwards', () =
         ],
     }));
     assert.equal(d.winnerId, null);
-    assert.match(d.reason, /240s into the match/);
+    assert.match(d.reason, /closed his game/);
 });
 
 // --- the refusals ----------------------------------------------------------------
@@ -209,8 +201,8 @@ test('every refusal names its cause', () => {
         ok({ pairDecidedRecently: true }),
         ok({ abandons: [socket('beto', NOW - 10 * 1000)] }),
         ok({ startedAtMs: NOW - 60 * 1000 }),
-        ok({ abandons: [gameExit('beto', STARTED + 600 * 1000, true)] }),
-        ok({ abandons: [gameExit('beto', STARTED + 60 * 1000)] }),
+        ok({ abandons: [socket('beto', LONG_GONE, true)] }),
+        ok({ abandons: [gameExit('beto', STARTED + 600 * 1000)] }),
     ]) {
         const d = decideByAbandon(bad);
         assert.equal(d.winnerId, null);

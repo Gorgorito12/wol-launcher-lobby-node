@@ -29,9 +29,8 @@
  * client: the LobbyWebSocket reconnects on its own with backoff up to 30 s, so a blip is
  * not a departure either. 90 s is that plus margin.</p>
  *
- * <p><b>This grace belongs to the SOCKET and to nothing else.</b> A `game` walkout is an
- * affirmative report that the player's own Age of Empires III closed, and AoE3 has no
- * rejoin — so there is nothing to wait for and the grace does not apply to it.</p>
+ * <p><b>This grace belongs to the SOCKET and to nothing else</b>, which since a `game` row
+ * stopped deciding is the only place it could apply anyway.</p>
  */
 export const RECONNECT_GRACE_SECONDS = 90;
 
@@ -52,11 +51,14 @@ export const PAIR_COOLDOWN_MS = 24 * 60 * 60 * 1000;
  * reconnects on its own and a blip is not a departure.</p>
  *
  * <p><b>`game`</b> — a `lobby_game_exits` row: that player's launcher reported that ITS OWN
- * Age of Empires III closed while the match was running. <b>This is the source that closes the
- * dodge.</b> The socket alone could never see it: the game is launched re-parented under
- * explorer.exe, so it outlives the launcher and, symmetrically, the launcher outlives it — a
- * player who alt-F4s the game stays connected to the room and used to look, from here, exactly
- * like somebody who was still playing.</p>
+ * Age of Empires III closed while the match was running. The socket alone cannot see it, because
+ * the game is launched re-parented under explorer.exe and the two outlive each other: a player
+ * who alt-F4s the game stays connected to the room.</p>
+ *
+ * <p><b>A `game` row is EVIDENCE AND PROTECTION, never a verdict</b> — see the skip at the top of
+ * the loop for the physics, and {@link pickRecord} for what it protects against. It is kept,
+ * stored and printed by `admin.ts` because it is the only record of when a player's match really
+ * ended, and because a discriminator may yet be found; it simply does not decide today.</p>
  */
 export interface AbandonRecord {
     userId: string;
@@ -67,9 +69,10 @@ export interface AbandonRecord {
      * Whether some stored reading of THIS match names a decided result for THIS player,
      * backed by a recording fingerprint.
      *
-     * <p>It is what separates <i>the winner closing his game the moment it ended</i> from
-     * <i>the loser closing his game to dodge</i>, and both of them drop off here identically.
-     * A player who has a real ending did not abandon anything.</p>
+     * <p>It is what separates <i>the winner closing his launcher the moment the match ended</i>
+     * from <i>the loser closing it to dodge</i>, and both of them drop off here identically. A
+     * player who has a real ending did not abandon anything. (It rides on `game` rows too, but
+     * those never decide, so in practice this clause guards the socket.)</p>
      *
      * <p><b>Derived on the server from what is stored, never taken from the frame.</b> A
      * client that could set this would turn its own defeat into a draw by claiming it — which
@@ -162,15 +165,29 @@ export function decideByAbandon(input: AbandonInput): AbandonDecision {
     const walkedOut: string[] = [];
     let tooRecent = 0;
     let finished = 0;
+    let endedGame = 0;
     let latestTooEarlySeconds: number | null = null;
 
     for (const id of input.participantIds) {
         const row = pickRecord(input.abandons, id);
         if (row === undefined) continue;
 
+        // A CLOSED GAME NEVER DECIDES ANYTHING, and the reason is physical rather than
+        // cautious: in a 1v1 both games end together. When one player leaves, AoE3 hands
+        // the other the victory, and each then closes his window whenever he gets round to
+        // it — so the two timestamps look the same after a dodge and after a perfectly
+        // ordinary ending, and nothing here can separate them. What CAN is the opponent's
+        // recording: the quitter's own client is killed mid-match and writes no ending,
+        // while the opponent's writes one naming him the loser. That route decides the
+        // match by evidence and needs no inference from us.
+        //
+        // Checked FIRST, before hasOutcome and before any clock, because it is
+        // unconditional — a game row is skipped whether or not a reading exists.
+        if (row.source === 'game') { endedGame++; continue; }
+
         // A player with a real ending did not abandon anything — and the two look identical
-        // from here, because the winner closes his game the moment the match finishes.
-        // Checked FIRST, before any clock: it is the stronger fact, and a timestamp cannot
+        // from here, because the winner closes his launcher the moment the match finishes.
+        // Checked before any clock: it is the stronger fact, and a timestamp cannot
         // overrule it.
         if (row.hasOutcome) { finished++; continue; }
 
@@ -210,6 +227,13 @@ export function decideByAbandon(input: AbandonInput): AbandonDecision {
         }
         if (tooRecent > 0) return no('the dropped socket is still inside the reconnect grace');
         if (finished > 0) return no('whoever left had already finished the match');
+        // Last of the four, because it is the one that fires on almost every competitive
+        // report: the host's own game closing is what triggers the report in the first
+        // place, so his row is always there. The other three say something that could
+        // still change; this one says the source cannot answer the question.
+        if (endedGame > 0) {
+            return no('whoever left closed his game, which a 1v1 cannot tell from a normal ending');
+        }
         return no('nobody abandoned');
     }
 
@@ -231,6 +255,11 @@ export function decideByAbandon(input: AbandonInput): AbandonDecision {
  * whenever he got round to shutting the window. The game row is the earlier and the truer of
  * the two, so it wins — which also means a game closed inside the first five minutes cannot
  * be turned into a forfeit by a socket that dropped at twenty.</p>
+ *
+ * <p>Now that a game row never decides, this preference does more than reorder two timestamps:
+ * <b>a player whose game we saw close is out of the verdict entirely.</b> That is the intended
+ * reading — his match ended when his game did, and closing the window afterwards is not a
+ * second event worth punishing.</p>
  *
  * <p>Each table has (lobby, user) as its primary key, so there is at most one row per source
  * and this is a choice between two, never a search through many.</p>
