@@ -19,6 +19,31 @@ export function attachGlobalChat(gc: { refreshPlayers(): void }): void {
 }
 
 /**
+ * The write behind the `game_exited` frame: a member's own Age of Empires III closed while
+ * the match was running.
+ *
+ * <p>Exported — unlike the class, which stays module-private — so its GATE can be pinned by
+ * a test. This repo has no database harness, so the SQL string is the only place the rule is
+ * assertable, and the rule is the whole safety of the frame.</p>
+ *
+ * <p><b>Both conditions live in the SELECT</b>, the same idiom the socket-drop row uses: one
+ * statement, no extra round trip on a hot path, and it asks the AUTHORITATIVE lobby row
+ * rather than the room object's in-memory state, which a restart would have cleared while
+ * the game carried on. A casual room records nothing at all.</p>
+ *
+ * <p><b>INSERT OR IGNORE, so the FIRST exit is the one that counts.</b> Reopening the game
+ * and closing it again must not be able to move the mark later into the match and out of
+ * forfeit range — which is exactly what somebody just told it counts as a loss would try.</p>
+ *
+ * <p><b>`exited_at` is never bound</b>: it defaults to the server's own clock at INSERT. The
+ * number the client sent goes into `client_seconds`, which no verdict reads.</p>
+ */
+export const GAME_EXIT_INSERT_SQL =
+    `INSERT OR IGNORE INTO lobby_game_exits (lobby_id, user_id, client_seconds)
+     SELECT ?, ?, ? FROM lobbies
+      WHERE id = ? AND status = 'in_game' AND competitive = 1`;
+
+/**
  * Per-lobby room state, in-process replacement for the Cloudflare
  * Durable Object that backed the same protocol on the Worker.
  *
@@ -239,6 +264,9 @@ class LobbyRoom {
                 break;
             case 'game_ended':
                 await this.handleGameEnded(ws, ctx, attached);
+                break;
+            case 'game_exited':
+                await this.handleGameExited(ctx, attached, f);
                 break;
             case 'set_radmin_ip':
                 this.handleSetRadminIp(attached, f);
@@ -663,6 +691,49 @@ class LobbyRoom {
             reason: 'ended',
             cancelled_by: attached.userId,
         }, ws);
+    }
+
+    /**
+     * A member's OWN Age of Empires III closed while the match was running.
+     *
+     * <p><b>This is the only way the server can see the thing that matters.</b> A socket drop
+     * is the launcher leaving; this is the GAME leaving, and they are not the same event —
+     * the game is launched re-parented under explorer.exe, so each outlives the other. A
+     * player who alt-F4s his game to dodge a loss stays connected to the room and, until
+     * this frame existed, was indistinguishable from somebody still playing.</p>
+     *
+     * <p><b>Any member, not host-only</b> — unlike `game_ended`, which is a statement about
+     * the ROOM (put it back to open) and therefore the host's to make. This is a statement
+     * about the sender's own machine, and the sender is the only one who can make it.</p>
+     *
+     * <p>Records nothing outside a live competitive match, and nothing decides here: the row
+     * is read much later by `decideByAbandon`, which still has to find it late enough into
+     * the match, still refuses without a recording somewhere, and still refuses a pair that
+     * already had one decided this way today.</p>
+     */
+    private async handleGameExited(
+        ctx: AppContext,
+        attached: AttachedSocket,
+        frame: { type: string } & Record<string, unknown>,
+    ): Promise<void> {
+        // Advisory only, so junk is dropped rather than refused: the verdict reads the
+        // server's own `exited_at`. Bounded so a client cannot write a wild number into a
+        // column an operator reads.
+        const raw = frame.seconds_into_match;
+        const clientSeconds =
+            typeof raw === 'number' && Number.isFinite(raw) && raw >= 0 && raw <= 86_400
+                ? Math.round(raw)
+                : null;
+
+        try {
+            await ctx.db.prepare(GAME_EXIT_INSERT_SQL)
+                .bind(this.lobbyId, attached.userId, clientSeconds, this.lobbyId)
+                .run();
+        } catch {
+            // Best-effort, exactly like the socket-drop row: a DB hiccup must not take down
+            // the frame loop, and the worst case is a dodge that goes unpunished — which is
+            // where we were before this existed.
+        }
     }
 
     /**

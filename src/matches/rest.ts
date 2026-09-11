@@ -5,7 +5,7 @@ import { requireAuth } from '../middleware/auth';
 import { ipRateLimit, Limits } from '../middleware/rateLimit';
 import { applyMatch, DEFAULT_RATING, DEFAULT_RD, DEFAULT_VOLATILITY,
          type ParticipantOutcome, type RatingMode } from '../elo/glicko2';
-import { ratabilityReason, compareReadings, canUpgradeFromConfirmation, WIN_AT,
+import { ratabilityReason, compareReadings, canUpgradeFromConfirmation, WIN_AT, LOSS_AT,
          matchShape, teamEvidenceMet,
          type UnratedReason } from '../elo/ratability';
 import { decideByAbandon, PAIR_COOLDOWN_MS } from '../elo/abandon';
@@ -349,6 +349,135 @@ async function maybeAdvanceTournament(
         });
     } catch (err) {
         log.info({ match_id: matchId, err: String(err) }, 'bracket could not be advanced');
+    }
+}
+
+/**
+ * Decide a match by ABANDONMENT after the fact, once a later arrival has supplied what the
+ * rule was missing at report time.
+ *
+ * <p><b>The gap this closes.</b> The verdict used to be computed in exactly one place —
+ * inside `POST /matches`, at the instant the host reported — and two of its inputs routinely
+ * are not there yet at that instant. The anti-farm brake needs a recording fingerprint, and
+ * when the DODGER is the host his report has none; the one that exists is on the opponent's
+ * confirmation, which lands afterwards. So the match went down a draw and nothing ever
+ * looked again. This is the second look.</p>
+ *
+ * <p><b>Evidence before inference, in call order.</b> The caller runs
+ * {@link maybeUpgradeFromConfirmation} first: a recording that names a winner always
+ * outranks a walkout, and if it decided the match this finds nothing eligible and returns.</p>
+ *
+ * <p>Shaped deliberately like its sibling: same eligibility gate, same CLAIM-then-apply
+ * against a concurrent decider, same rollback. Never throws.</p>
+ */
+async function maybeDecideByAbandonLater(
+    ctx: AppContext,
+    log: FastifyBaseLogger,
+    lobbyId: string,
+    matchId: string,
+): Promise<void> {
+    try {
+        const match = await ctx.db.prepare(
+            `SELECT id, mod_id, map_name, unrated_reason FROM matches WHERE id = ?`,
+        ).bind(matchId).first<{
+            id: string; mod_id: string; map_name: string | null; unrated_reason: string | null;
+        }>();
+        if (!match || match.unrated_reason !== 'no_decided_result') return;
+
+        // Competitive rooms only — the same fence POST /matches puts around the first look,
+        // and asked of the room rather than the match because the match never carried the flag.
+        const room = await ctx.db.prepare(
+            `SELECT competitive, started_at FROM lobbies WHERE id = ?`,
+        ).bind(lobbyId).first<{ competitive: number; started_at: string | null }>();
+        if (!room || room.competitive !== 1) return;
+
+        const participants = await ctx.db.prepare(
+            `SELECT user_id FROM match_participants WHERE match_id = ?`,
+        ).bind(matchId).all<{ user_id: string }>();
+        const players = (participants.results ?? []).map((r) => r.user_id);
+        if (players.length !== 2) return;
+
+        // false: the report's own fingerprint is already on the match row if it had one, and
+        // abandonVerdict widens this to any stored confirmation anyway — which is the whole
+        // reason this second look can succeed where the first one could not.
+        const verdict = await abandonVerdict(
+            ctx, lobbyId, players, sqliteTimestampToMs(room.started_at), false);
+        if (!verdict.winnerId || !verdict.loserId) {
+            log.info({ match_id: matchId, reason: verdict.reason },
+                'late abandonment check did not decide the match');
+            return;
+        }
+
+        // CLAIM the row, exactly as the late-reading path does: both can fire for one match
+        // and a client can resend, and an await is where two requests interleave.
+        const claim = await ctx.db.prepare(
+            `UPDATE matches SET unrated_reason = NULL, rated = 1, decided_by = 'abandon'
+             WHERE id = ? AND unrated_reason = 'no_decided_result'`,
+        ).bind(matchId).run();
+        if (!claim.changes) {
+            log.info({ match_id: matchId }, 'late abandonment lost the race; already decided');
+            return;
+        }
+
+        try {
+            const outcomes: ParticipantOutcome[] = players.map((id) => ({
+                userId: id,
+                result: (id === verdict.winnerId ? 1 : 0) as 0 | 1,
+            }));
+            await ctx.db.batch(outcomes.map((o) => ctx.db.prepare(
+                `UPDATE match_participants SET result = ? WHERE match_id = ? AND user_id = ?`,
+            ).bind(o.result, matchId, o.userId)));
+
+            const diff = await applyMatch(ctx.db, outcomes);
+
+            const stamps = [];
+            for (const o of outcomes) {
+                const d = diff.get(o.userId);
+                if (!d) continue;
+                stamps.push(ctx.db.prepare(
+                    `UPDATE match_participants SET rating_before = ?, rating_after = ?
+                     WHERE match_id = ? AND user_id = ?`,
+                ).bind(d.before, d.after, matchId, o.userId));
+            }
+            if (stamps.length) await ctx.db.batch(stamps);
+
+            log.info(
+                { match_id: matchId, lobby_id: lobbyId,
+                  winner: verdict.winnerId, loser: verdict.loserId, reason: verdict.reason },
+                'match decided by abandonment, after the report',
+            );
+
+            // The room closed minutes ago, so this is the only way either player learns it.
+            ctx.globalChat.announceMatchRated({
+                matchId,
+                lobbyId,
+                modId: match.mod_id,
+                mapName: match.map_name,
+                perUser: new Map(outcomes.map((o) => {
+                    const d = diff.get(o.userId);
+                    return [o.userId, { result: o.result, before: d?.before ?? null, after: d?.after ?? null }];
+                })),
+            });
+
+            await maybeAdvanceTournament(ctx, log, matchId);
+        } catch (err) {
+            // Same rollback as the late-reading path, and for the same reason: a row marked
+            // rated with no ratings behind it, or participant scores naming a winner the
+            // match row calls undecided, are contradictions both players would then see.
+            await ctx.db.prepare(
+                `UPDATE matches SET unrated_reason = 'no_decided_result', rated = 0, decided_by = NULL
+                 WHERE id = ?`,
+            ).bind(matchId).run();
+            await ctx.db.prepare(
+                `UPDATE match_participants SET result = 0.5, rating_before = NULL, rating_after = NULL
+                 WHERE match_id = ?`,
+            ).bind(matchId).run();
+            log.error({ match_id: matchId, err: String(err) },
+                'late abandonment failed to apply; match left undecided');
+        }
+    } catch (err) {
+        // A match must never fail to be confirmed because this could not be answered.
+        log.info({ match_id: matchId, err: String(err) }, 'late abandonment check failed');
     }
 }
 
@@ -714,6 +843,11 @@ function normaliseSha256(value: string | undefined): string | null {
  * The I/O half of the abandonment rule; the decision itself is the pure
  * <c>decideByAbandon</c>. Never throws — a match must not fail to report because this
  * could not be answered.
+ *
+ * <p>Reads BOTH things the server can witness: the socket that dropped
+ * (<c>lobby_abandons</c>) and the game that closed (<c>lobby_game_exits</c>). See
+ * <c>AbandonRecord</c> for why they are different events and why only one of them needs
+ * the reconnect grace.</p>
  */
 async function abandonVerdict(
     ctx: AppContext,
@@ -722,14 +856,54 @@ async function abandonVerdict(
     roomStartedAtMs: number | null,
     reportHasRecording: boolean,
 ): Promise<ReturnType<typeof decideByAbandon>> {
+    // Who has a real ending on record. Derived HERE, from what is stored, and never from
+    // anything a client asserted: a player who could claim it would turn his own dodge into
+    // a draw. A reading only counts when it names a decided result AND carries the
+    // fingerprint of a recording, which is the same bar the rest of this file uses.
+    const finished = new Set<string>();
+    const decidedRows = await ctx.db.prepare(
+        `SELECT p.user_id AS user_id
+           FROM match_participants p JOIN matches m ON m.id = p.match_id
+          WHERE m.lobby_id = ? AND m.game_seed IS NOT NULL
+            AND (p.result >= ? OR p.result <= ?)
+          UNION
+         SELECT c.user_id AS user_id
+           FROM match_confirmations c
+          WHERE c.lobby_id = ? AND c.game_seed IS NOT NULL
+            AND (c.result >= ? OR c.result <= ?)`,
+    ).bind(lobbyId, WIN_AT, LOSS_AT, lobbyId, WIN_AT, LOSS_AT)
+        .all<{ user_id: string }>();
+    for (const r of decidedRows.results ?? []) finished.add(r.user_id);
+
+    const abandons: Array<{
+        userId: string; disconnectedAtMs: number;
+        source: 'socket' | 'game'; hasOutcome: boolean;
+    }> = [];
+
     const rows = await ctx.db.prepare(
         `SELECT user_id, disconnected_at FROM lobby_abandons WHERE lobby_id = ?`,
     ).bind(lobbyId).all<{ user_id: string; disconnected_at: string }>();
-
-    const abandons: Array<{ userId: string; disconnectedAtMs: number }> = [];
     for (const r of rows.results ?? []) {
         const ms = sqliteTimestampToMs(r.disconnected_at);
-        if (ms !== null) abandons.push({ userId: r.user_id, disconnectedAtMs: ms });
+        if (ms !== null) {
+            abandons.push({
+                userId: r.user_id, disconnectedAtMs: ms,
+                source: 'socket', hasOutcome: finished.has(r.user_id),
+            });
+        }
+    }
+
+    const exits = await ctx.db.prepare(
+        `SELECT user_id, exited_at FROM lobby_game_exits WHERE lobby_id = ?`,
+    ).bind(lobbyId).all<{ user_id: string; exited_at: string }>();
+    for (const r of exits.results ?? []) {
+        const ms = sqliteTimestampToMs(r.exited_at);
+        if (ms !== null) {
+            abandons.push({
+                userId: r.user_id, disconnectedAtMs: ms,
+                source: 'game', hasOutcome: finished.has(r.user_id),
+            });
+        }
     }
 
     // The widest anti-farm brake: real disconnections are rare and scattered, farming is
@@ -749,13 +923,29 @@ async function abandonVerdict(
         pairDecidedRecently = !!seen;
     }
 
+    // The anti-farm brake, widened from "the HOST's report" to "anybody's reading". When the
+    // dodger IS the host, his report is precisely the one with no recording — he killed the
+    // game before it wrote one — so asking only him fired the brake on his own behalf every
+    // time. The opponent's confirmation carries a real fingerprint; this looks at it. What
+    // the brake protects is unchanged: a recording still has to exist somewhere, and it
+    // still lands under the unique (game_seed, game_host_time) index.
+    let anyRecording = reportHasRecording;
+    if (!anyRecording) {
+        const confirmed = await ctx.db.prepare(
+            `SELECT 1 FROM match_confirmations
+              WHERE lobby_id = ? AND (game_seed IS NOT NULL OR replay_sha256 IS NOT NULL)
+              LIMIT 1`,
+        ).bind(lobbyId).first();
+        anyRecording = !!confirmed;
+    }
+
     return decideByAbandon({
         participantIds,
         abandons,
         startedAtMs: roomStartedAtMs,
         nowMs: Date.now(),
         abandonAfterSeconds: ctx.config.competitiveAbandonSeconds,
-        reportHasRecording,
+        reportHasRecording: anyRecording,
         pairDecidedRecently,
     });
 }
@@ -1343,6 +1533,13 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
                 req.log.info({ lobby_id: body.lobby_id, err: String(err) },
                     'late reading could not be applied');
             }
+
+            // LAST, and the order is the rule: a recording that names a winner outranks a
+            // walkout, so the reading above gets first refusal and this only ever sees a
+            // match it left undecided. This reading is also what the abandonment rule was
+            // missing at report time — the fingerprint that its anti-farm brake demands,
+            // which the host never has when the host is the one who walked out.
+            await maybeDecideByAbandonLater(ctx, req.log, body.lobby_id, match.id);
         }
 
         return reply.send({ ok: true, matched: !!match });

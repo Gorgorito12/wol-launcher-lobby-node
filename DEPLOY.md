@@ -509,28 +509,59 @@ sudo -u wol-lobby ./node_modules/.bin/tsx scripts/admin.ts match:show <matchId>
 
 ### Walking out counts as a loss
 
-A player whose connection dies **more than `COMPETITIVE_ABANDON_SECONDS` into the match**
-(default **300**) and does not come back forfeits a competitive match the recording could not
-settle. This is the only rule here that moves rating from an *absence* of evidence, so it is
-fenced in hard — the decision is the pure `src/elo/abandon.ts` and its refusals are what the
-tests pin:
+**Two things count as walking out**, and the server watches both:
+
+1. the player's **connection** dies and does not come back (`lobby_abandons`, written when the
+   socket closes);
+2. the player's **game closes** mid-match (`lobby_game_exits`, written from the `game_exited`
+   frame every launcher sends when its own Age of Empires III exits).
+
+The second one was added because the first one could not see the commonest dodge. The game runs
+re-parented under `explorer.exe`, so it and the launcher outlive each other: a player who alt-F4s
+Age of Empires III **stays connected to the room**, leaves no `lobby_abandons` row, and used to be
+indistinguishable from somebody still playing. His own engine writes no recording either — a
+terminated process writes nothing — so the match went down a draw and he kept his rating. AoE3 has
+no rejoin, so a closed game *is* a left match.
+
+⚠ **A crash counts too, and there is no way to tell one from a dodge.** That is the standard
+bargain of a ranked ladder, the launcher says so before every competitive start, and `match:void`
+below is the correction.
+
+A walkout **more than `COMPETITIVE_ABANDON_SECONDS` into the match** (default **300**) forfeits a
+competitive match the recording could not settle. This is the only rule here that moves rating
+from an *absence* of evidence, so it is fenced in hard — the decision is the pure
+`src/elo/abandon.ts` and its refusals are what the tests pin:
 
 - competitive rooms only, and only when ratability said `no_decided_result` — **a recording that
   names a winner always wins**;
-- exactly two players, and exactly one of them gone (both gone is a draw: the usual cause is the
-  host's connection dying and taking the room with it);
-- the walkout must be at least **90 s** old — closing the launcher the moment a match ends is
-  normal and drops the socket exactly like a rage-quit does;
+- exactly two players, and exactly one of them gone (both gone is a draw: the usual causes are the
+  host's connection dying and taking the room with it, or a crash that took down both games);
+- **a player with a real ending did not abandon anything** — the winner closes his game the moment
+  the match finishes, and that looks identical from here. A stored reading naming a decided result
+  *with a recording fingerprint* is what tells the two apart, and it is derived on the server: a
+  client that could claim it would turn its own dodge into a draw;
+- a **socket** walkout must be at least **90 s** old — closing the launcher the moment a match ends
+  is normal and drops the connection exactly like a rage-quit does. A **game** walkout skips that
+  grace: it is affirmative and irreversible, so there is nothing to wait for;
 - the walkout must be **at least `COMPETITIVE_ABANDON_SECONDS` after the room started**, measured
   from the moment the socket dropped. It used to be measured from the moment the host REPORTED,
   which is when the host closed *his* game and says nothing about when the other player left: a
   real player who left at 4:40 of a match the host kept open for fifteen minutes was forfeited
   176 points, and would have been forfeited leaving at thirty seconds just the same;
-- the report must have carried a recording, or farming is "open a room, wait, alt-F4, repeat";
+- **some** reading of the match must have carried a recording — the host's report or any player's
+  confirmation — or farming is "open a room, wait, alt-F4, repeat". It used to mean the host's
+  report alone, which fired the brake on the dodger's own behalf every time the dodger *was* the
+  host: his report is precisely the one with no recording;
 - at most **one per pair of players per 24 h**.
 
 Such a match is stored with `decided_by = 'abandon'`, which `match:show` prints along with the
-room's mode and any walkouts.
+room's mode, any dropped sockets (`walked out`) and any closed games (`closed game`).
+
+**It is evaluated twice**, because the opponent's reading routinely lands after the host's report:
+once inside `POST /matches`, and again inside `POST /matches/confirm` — after the confirmation has
+had its own chance to decide the match outright, since evidence outranks inference. The second
+pass is what catches a host who dodged, whose own report could never carry the fingerprint the
+brake demands.
 
 **If it ever gets one wrong** — a power cut is indistinguishable from a dodge, and always will
 be — that is what the corrections are for:

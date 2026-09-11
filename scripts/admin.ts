@@ -630,6 +630,23 @@ async function cmdMatchShow(db: Db): Promise<void> {
         for (const a of abandons.results ?? []) {
             console.log(`  walked out ${pad(a.display_name ?? a.user_id, 22)} at ${a.disconnected_at}`);
         }
+
+        // The OTHER walkout, and usually the one being disputed: the socket stayed up and the
+        // GAME closed. `at` is the server's clock when the frame landed, which is what the
+        // verdict used; `said` is the launcher's own count of the match, kept only so a wildly
+        // different number gives away a broken clock.
+        const exits = await db.prepare(
+            `SELECT e.user_id, e.exited_at, e.client_seconds, u.display_name
+               FROM lobby_game_exits e LEFT JOIN users u ON u.id = e.user_id
+              WHERE e.lobby_id = ?`,
+        ).bind(m.lobby_id).all<{
+            user_id: string; exited_at: string;
+            client_seconds: number | null; display_name: string | null;
+        }>();
+        for (const e of exits.results ?? []) {
+            const said = e.client_seconds === null ? '-' : `${e.client_seconds}s`;
+            console.log(`  closed game ${pad(e.display_name ?? e.user_id, 21)} at ${e.exited_at}  (launcher said ${said})`);
+        }
     }
     console.log(`  seed       ${m.game_seed ?? '-'}   hostTime ${m.game_host_time ?? '-'}`);
     console.log(`  replay     ${m.replay_sha256 ?? '-'}`);

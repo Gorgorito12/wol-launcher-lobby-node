@@ -8,17 +8,27 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { decideByAbandon, RECONNECT_GRACE_SECONDS } from './abandon';
+import { decideByAbandon, RECONNECT_GRACE_SECONDS, type AbandonRecord } from './abandon';
 
 const NOW = Date.parse('2026-08-24T18:30:00Z');
 const STARTED = Date.parse('2026-08-24T18:10:00Z');   // 20 minutes in
 const LONG_GONE = NOW - (RECONNECT_GRACE_SECONDS + 30) * 1000;
 
+/** A socket that dropped — what `lobby_abandons` records. */
+function socket(userId: string, atMs: number, hasOutcome = false): AbandonRecord {
+    return { userId, disconnectedAtMs: atMs, source: 'socket', hasOutcome };
+}
+
+/** A game that closed — what `lobby_game_exits` records. */
+function gameExit(userId: string, atMs: number, hasOutcome = false): AbandonRecord {
+    return { userId, disconnectedAtMs: atMs, source: 'game', hasOutcome };
+}
+
 /** A 20-minute competitive 1v1 that 'beto' walked out of ten minutes ago. */
 function ok(over: Partial<Parameters<typeof decideByAbandon>[0]> = {}) {
     return {
         participantIds: ['ana', 'beto'],
-        abandons: [{ userId: 'beto', disconnectedAtMs: LONG_GONE }],
+        abandons: [socket('beto', LONG_GONE)],
         startedAtMs: STARTED,
         nowMs: NOW,
         abandonAfterSeconds: 300,
@@ -34,13 +44,89 @@ test('one player walks out of a long game and the other is credited', () => {
     assert.equal(d.winnerId, 'ana');
 });
 
+// --- the game-exit source --------------------------------------------------------
+//
+// The dodge this closes: the losing player closes Age of Empires III without closing the
+// launcher. His socket stays up, so `lobby_abandons` never sees him, and his own engine
+// writes no recording — a terminated process writes nothing. Every clause below is about
+// telling that apart from the two innocent things that look identical from here.
+
+test('THE DODGE — closing the game mid-match forfeits it', () => {
+    const d = decideByAbandon(ok({ abandons: [gameExit('beto', STARTED + 600 * 1000)] }));
+    assert.equal(d.loserId, 'beto');
+    assert.equal(d.winnerId, 'ana');
+});
+
+test('a game closed after a real ending is not a walkout', () => {
+    // The winner shuts his game the moment the match finishes, which drops him off here in
+    // exactly the same way as a rage-quit. `hasOutcome` is the only thing separating the
+    // two, and it is derived on the server from a stored reading with a fingerprint —
+    // never from anything the client said, or this is the exploit arriving through its fix.
+    const d = decideByAbandon(ok({
+        abandons: [gameExit('beto', STARTED + 600 * 1000, true)],
+    }));
+    assert.equal(d.winnerId, null);
+    assert.match(d.reason, /already finished/);
+});
+
+test('a closed game does not wait out the reconnect grace', () => {
+    // The grace belongs to the SOCKET: the launcher reconnects on its own, so a dropped
+    // connection has to be given time to come back. A closed game has nothing to come back
+    // to — AoE3 has no rejoin — so waiting would only delay a verdict that cannot change.
+    const justClosed = NOW - 5 * 1000;
+    const d = decideByAbandon(ok({
+        abandons: [gameExit('beto', justClosed)],
+        startedAtMs: justClosed - 600 * 1000,
+    }));
+    assert.equal(d.loserId, 'beto');
+});
+
+test('closing the game inside the first five minutes is still too early', () => {
+    // The threshold is about the match, not about the source. Same protection a dropped
+    // socket gets, and the same refusal text.
+    const started = NOW - 900 * 1000;
+    const d = decideByAbandon(ok({
+        startedAtMs: started,
+        abandons: [gameExit('beto', started + 280 * 1000)],
+    }));
+    assert.equal(d.winnerId, null);
+    assert.match(d.reason, /280s into the match/);
+});
+
+test('both games closing is a draw — a crash takes down two, not one', () => {
+    const d = decideByAbandon(ok({
+        abandons: [
+            gameExit('beto', STARTED + 600 * 1000),
+            gameExit('ana', STARTED + 601 * 1000),
+        ],
+    }));
+    assert.equal(d.winnerId, null);
+    assert.match(d.reason, /both/);
+});
+
+test('the game a player closed outranks the launcher he closed afterwards', () => {
+    // He alt-F4s at 4:00 (too early to forfeit) and shuts the launcher at 12:00. The two
+    // rows say different things, and the GAME is when the match actually ended for him —
+    // so a socket that dropped later must not be able to turn it into a forfeit.
+    const started = NOW - 900 * 1000;
+    const d = decideByAbandon(ok({
+        startedAtMs: started,
+        abandons: [
+            socket('beto', started + 720 * 1000),
+            gameExit('beto', started + 240 * 1000),
+        ],
+    }));
+    assert.equal(d.winnerId, null);
+    assert.match(d.reason, /240s into the match/);
+});
+
 // --- the refusals ----------------------------------------------------------------
 
 test('a socket gone for less than the reconnect grace is not a departure', () => {
     // The launcher reconnects on its own with backoff up to 30 s. Counting this would
     // turn a tunnel or a router hiccup into a forfeit.
     const justDropped = NOW - (RECONNECT_GRACE_SECONDS - 10) * 1000;
-    const d = decideByAbandon(ok({ abandons: [{ userId: 'beto', disconnectedAtMs: justDropped }] }));
+    const d = decideByAbandon(ok({ abandons: [socket('beto', justDropped)] }));
     assert.equal(d.winnerId, null);
 });
 
@@ -60,7 +146,7 @@ test('a walkout inside the first five minutes is not rescued by a long match', (
     const started = NOW - 900 * 1000;
     const d = decideByAbandon(ok({
         startedAtMs: started,
-        abandons: [{ userId: 'beto', disconnectedAtMs: started + 280 * 1000 }],
+        abandons: [socket('beto', started + 280 * 1000)],
     }));
 
     assert.equal(d.winnerId, null);
@@ -76,7 +162,7 @@ test('a walkout past the threshold still decides, promptly', () => {
     const started = NOW - 480 * 1000;
     const d = decideByAbandon(ok({
         startedAtMs: started,
-        abandons: [{ userId: 'beto', disconnectedAtMs: started + 360 * 1000 }],
+        abandons: [socket('beto', started + 360 * 1000)],
     }));
 
     assert.equal(d.loserId, 'beto');
@@ -86,10 +172,7 @@ test('a walkout past the threshold still decides, promptly', () => {
 test('both players gone is a draw, not a win for whoever dropped second', () => {
     // The usual cause is the host's connection dying and taking the room with it.
     const d = decideByAbandon(ok({
-        abandons: [
-            { userId: 'beto', disconnectedAtMs: LONG_GONE },
-            { userId: 'ana', disconnectedAtMs: LONG_GONE },
-        ],
+        abandons: [socket('beto', LONG_GONE), socket('ana', LONG_GONE)],
     }));
     assert.equal(d.winnerId, null);
 });
@@ -124,8 +207,10 @@ test('every refusal names its cause', () => {
         ok({ reportHasRecording: false }),
         ok({ startedAtMs: null }),
         ok({ pairDecidedRecently: true }),
-        ok({ abandons: [{ userId: 'beto', disconnectedAtMs: NOW - 10 * 1000 }] }),
+        ok({ abandons: [socket('beto', NOW - 10 * 1000)] }),
         ok({ startedAtMs: NOW - 60 * 1000 }),
+        ok({ abandons: [gameExit('beto', STARTED + 600 * 1000, true)] }),
+        ok({ abandons: [gameExit('beto', STARTED + 60 * 1000)] }),
     ]) {
         const d = decideByAbandon(bad);
         assert.equal(d.winnerId, null);
