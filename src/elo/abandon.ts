@@ -264,7 +264,7 @@ export function decideByAbandon(input: AbandonInput): AbandonDecision {
  * <p>Each table has (lobby, user) as its primary key, so there is at most one row per source
  * and this is a choice between two, never a search through many.</p>
  */
-function pickRecord(
+export function pickRecord(
     records: readonly AbandonRecord[],
     userId: string,
 ): AbandonRecord | undefined {

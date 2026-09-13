@@ -4,6 +4,7 @@ import { sha256Hex, uuid } from '../lib/ids';
 import { requireAuth, requireLauncherVersion } from '../middleware/auth';
 import { ipRateLimit, userRateLimit, Limits } from '../middleware/rateLimit';
 import { finalizeRoom } from './discordAnnounce';
+import { runFoundingHook } from '../matches/foundingHook';
 import { createLobby } from './create';
 import { isEntrantMember } from '../tournaments/store';
 import { DEFAULT_RATING, DEFAULT_RD } from '../elo/glicko2';
@@ -383,6 +384,9 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
                 ).bind(lobbyId).run();
                 ctx.rooms.close(lobbyId);
                 finalizeRoom(lobbyId);
+                // Nobody is left to report. Whatever readings the players sent are all the
+                // server will ever hear about this match — see foundingHook.
+                runFoundingHook(lobbyId);
             }
         } else {
             await ctx.db.batch([

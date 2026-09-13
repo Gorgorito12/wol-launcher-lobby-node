@@ -96,6 +96,8 @@ export interface Config {
     // opening phase of an AoE3 1v1. Policy, like rankedModIds — tune it with a
     // restart, not a deploy.
     competitiveAbandonSeconds: number;
+    crashVoidPerWindow: number;
+    crashVoidWindowSeconds: number;
 
     /**
      * The oldest launcher allowed into multiplayer, e.g. "v1.0.14". EMPTY (the
@@ -235,6 +237,10 @@ export function loadConfig(): Config {
         rankedModIds: idListEnv('RANKED_MOD_IDS', ['wol']),
 
         competitiveAbandonSeconds: intEnv('COMPETITIVE_ABANDON_SECONDS', 300),
+        // A verified crash voids a rated 1v1 at most this many times per player per window;
+        // past that the standard bargain applies and the crash is a loss. See crashVoid.ts.
+        crashVoidPerWindow: intEnv('CRASH_VOID_PER_WINDOW', 1),
+        crashVoidWindowSeconds: intEnv('CRASH_VOID_WINDOW_SECONDS', 24 * 60 * 60),
         minLauncherVersion: strEnv('MIN_LAUNCHER_VERSION', ''),
     };
 

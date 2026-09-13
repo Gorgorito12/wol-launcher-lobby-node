@@ -6,10 +6,14 @@ import { ipRateLimit, Limits } from '../middleware/rateLimit';
 import { applyMatch, DEFAULT_RATING, DEFAULT_RD, DEFAULT_VOLATILITY,
          type ParticipantOutcome, type RatingMode } from '../elo/glicko2';
 import { ratabilityReason, compareReadings, canUpgradeFromConfirmation, WIN_AT, LOSS_AT,
-         matchShape, teamEvidenceMet,
+         matchShape, teamEvidenceMet, isDecided, MIN_DURATION_SECONDS, MAX_AGE_MS,
          type UnratedReason } from '../elo/ratability';
-import { decideByAbandon, PAIR_COOLDOWN_MS } from '../elo/abandon';
-import { sqliteTimestampToMs } from '../lib/time';
+import { decideByAbandon, PAIR_COOLDOWN_MS, type AbandonRecord } from '../elo/abandon';
+import { decideFounding } from '../elo/founding';
+import { decideCrashVoid } from '../elo/crashVoid';
+import { recomputeLadder, withLadderLock } from '../elo/replay';
+import { attachFoundingHook } from './foundingHook';
+import { sqliteTimestampToMs, normaliseSqliteTimestamp } from '../lib/time';
 import { finalizeRoom } from '../lobbies/discordAnnounce';
 import { advanceTournamentFromMatch } from '../tournaments/advance';
 import { getTournament, loadBracket } from '../tournaments/store';
@@ -428,7 +432,7 @@ async function maybeDecideByAbandonLater(
                 `UPDATE match_participants SET result = ? WHERE match_id = ? AND user_id = ?`,
             ).bind(o.result, matchId, o.userId)));
 
-            const diff = await applyMatch(ctx.db, outcomes);
+            const diff = await withLadderLock(() => applyMatch(ctx.db, outcomes));
 
             const stamps = [];
             for (const o of outcomes) {
@@ -594,7 +598,7 @@ async function maybeUpgradeFromConfirmation(
                 await ctx.db.batch(resultWrites);
             }
 
-            const diff = await applyMatch(ctx.db, outcomes);
+            const diff = await withLadderLock(() => applyMatch(ctx.db, outcomes));
 
             const stamps = [];
             for (const o of outcomes) {
@@ -771,7 +775,7 @@ async function maybeRateAwaitingTeamMatch(
             team: p.team | 0,
         }));
 
-        const diff = await applyMatch(ctx.db, outcomes, mode);
+        const diff = await withLadderLock(() => applyMatch(ctx.db, outcomes, mode));
 
         const stamps = [];
         for (const o of outcomes) {
@@ -840,6 +844,67 @@ function normaliseSha256(value: string | undefined): string | null {
 }
 
 /**
+ * Every walkout still standing for a room, from both things the server can witness: the
+ * socket that dropped (`lobby_abandons`) and the game that closed (`lobby_game_exits`).
+ * Shared by the abandonment verdict and by founding, which must read the same evidence.
+ */
+async function loadWalkouts(
+    ctx: AppContext,
+    lobbyId: string,
+    finished: ReadonlySet<string>,
+): Promise<AbandonRecord[]> {
+    const abandons: AbandonRecord[] = [];
+
+    const rows = await ctx.db.prepare(
+        `SELECT user_id, disconnected_at FROM lobby_abandons WHERE lobby_id = ?`,
+    ).bind(lobbyId).all<{ user_id: string; disconnected_at: string }>();
+    for (const r of rows.results ?? []) {
+        const ms = sqliteTimestampToMs(r.disconnected_at);
+        if (ms !== null) {
+            abandons.push({
+                userId: r.user_id, disconnectedAtMs: ms,
+                source: 'socket', hasOutcome: finished.has(r.user_id),
+            });
+        }
+    }
+
+    const exits = await ctx.db.prepare(
+        `SELECT user_id, exited_at FROM lobby_game_exits WHERE lobby_id = ?`,
+    ).bind(lobbyId).all<{ user_id: string; exited_at: string }>();
+    for (const r of exits.results ?? []) {
+        const ms = sqliteTimestampToMs(r.exited_at);
+        if (ms !== null) {
+            abandons.push({
+                userId: r.user_id, disconnectedAtMs: ms,
+                source: 'game', hasOutcome: finished.has(r.user_id),
+            });
+        }
+    }
+    return abandons;
+}
+
+/**
+ * The widest anti-farm brake: real disconnections are rare and scattered, farming is the
+ * same two accounts over and over. Derived from the constant rather than written as
+ * SQLite's '-1 day' so there is one number, not two that can drift.
+ *
+ * <p>Covers BOTH inferences — a match decided by abandonment and a match founded from a
+ * reading — under one cooldown, because they are the same brake against the same recipe.</p>
+ */
+async function pairInferredRecently(ctx: AppContext, a: string, b: string): Promise<boolean> {
+    const since = new Date(Date.now() - PAIR_COOLDOWN_MS)
+        .toISOString().replace('T', ' ').slice(0, 19);
+    const seen = await ctx.db.prepare(
+        `SELECT 1 FROM matches m
+           JOIN match_participants a ON a.match_id = m.id AND a.user_id = ?
+           JOIN match_participants b ON b.match_id = m.id AND b.user_id = ?
+          WHERE m.decided_by IN ('abandon', 'founded') AND m.created_at >= ?
+          LIMIT 1`,
+    ).bind(a, b, since).first();
+    return !!seen;
+}
+
+/**
  * The I/O half of the abandonment rule; the decision itself is the pure
  * <c>decideByAbandon</c>. Never throws — a match must not fail to report because this
  * could not be answered.
@@ -875,53 +940,10 @@ async function abandonVerdict(
         .all<{ user_id: string }>();
     for (const r of decidedRows.results ?? []) finished.add(r.user_id);
 
-    const abandons: Array<{
-        userId: string; disconnectedAtMs: number;
-        source: 'socket' | 'game'; hasOutcome: boolean;
-    }> = [];
-
-    const rows = await ctx.db.prepare(
-        `SELECT user_id, disconnected_at FROM lobby_abandons WHERE lobby_id = ?`,
-    ).bind(lobbyId).all<{ user_id: string; disconnected_at: string }>();
-    for (const r of rows.results ?? []) {
-        const ms = sqliteTimestampToMs(r.disconnected_at);
-        if (ms !== null) {
-            abandons.push({
-                userId: r.user_id, disconnectedAtMs: ms,
-                source: 'socket', hasOutcome: finished.has(r.user_id),
-            });
-        }
-    }
-
-    const exits = await ctx.db.prepare(
-        `SELECT user_id, exited_at FROM lobby_game_exits WHERE lobby_id = ?`,
-    ).bind(lobbyId).all<{ user_id: string; exited_at: string }>();
-    for (const r of exits.results ?? []) {
-        const ms = sqliteTimestampToMs(r.exited_at);
-        if (ms !== null) {
-            abandons.push({
-                userId: r.user_id, disconnectedAtMs: ms,
-                source: 'game', hasOutcome: finished.has(r.user_id),
-            });
-        }
-    }
-
-    // The widest anti-farm brake: real disconnections are rare and scattered, farming is
-    // the same two accounts over and over. Derived from the constant rather than written
-    // as SQLite's '-1 day' so there is one number, not two that can drift.
-    let pairDecidedRecently = false;
-    if (participantIds.length === 2) {
-        const since = new Date(Date.now() - PAIR_COOLDOWN_MS)
-            .toISOString().replace('T', ' ').slice(0, 19);
-        const seen = await ctx.db.prepare(
-            `SELECT 1 FROM matches m
-               JOIN match_participants a ON a.match_id = m.id AND a.user_id = ?
-               JOIN match_participants b ON b.match_id = m.id AND b.user_id = ?
-              WHERE m.decided_by = 'abandon' AND m.created_at >= ?
-              LIMIT 1`,
-        ).bind(participantIds[0], participantIds[1], since).first();
-        pairDecidedRecently = !!seen;
-    }
+    const abandons = await loadWalkouts(ctx, lobbyId, finished);
+    const pairDecidedRecently = participantIds.length === 2
+        ? await pairInferredRecently(ctx, participantIds[0]!, participantIds[1]!)
+        : false;
 
     // The anti-farm brake, widened from "the HOST's report" to "anybody's reading". When the
     // dodger IS the host, his report is precisely the one with no recording — he killed the
@@ -1031,7 +1053,531 @@ export async function attachParticipants(
     for (const m of matches) m.participants = byMatch.get(m.id) ?? [];
 }
 
+// ---------------------------------------------------------------------------
+// Founding a match nobody reported
+// ---------------------------------------------------------------------------
+
+interface ReadingRow {
+    user_id: string;
+    result: number;
+    replay_sha256: string | null;
+    game_seed: number | null;
+    game_host_time: number | null;
+    created_at: string;
+    civs: string | null;
+    home_cities: string | null;
+}
+
+/** Store one player's reading of a room's match — the write behind POST /matches/confirm. */
+async function upsertReading(
+    ctx: AppContext,
+    lobbyId: string,
+    userId: string,
+    result: number,
+    fingerprint: { replaySha: string | null; gameSeed: number | null; gameHostTime: number | null },
+    civs: NameMap,
+    homeCities: NameMap,
+): Promise<void> {
+    await ctx.db.prepare(
+        `INSERT INTO match_confirmations
+             (lobby_id, user_id, result, replay_sha256, game_seed, game_host_time,
+              civs, home_cities)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (lobby_id, user_id) DO UPDATE SET
+           result = excluded.result,
+           replay_sha256 = excluded.replay_sha256,
+           game_seed = excluded.game_seed,
+           game_host_time = excluded.game_host_time,
+           civs = excluded.civs,
+           home_cities = excluded.home_cities,
+           created_at = datetime('now')`,
+    ).bind(
+        lobbyId, userId, result,
+        fingerprint.replaySha, fingerprint.gameSeed, fingerprint.gameHostTime,
+        nameMapJson(civs), nameMapJson(homeCities),
+    ).run();
+}
+
+async function findFoundedMatch(ctx: AppContext, lobbyId: string): Promise<{ id: string } | null> {
+    const row = await ctx.db.prepare(
+        `SELECT id FROM matches WHERE lobby_id = ? AND decided_by = 'founded' LIMIT 1`,
+    ).bind(lobbyId).first<{ id: string }>();
+    return row ?? null;
+}
+
+/** One founding per room at a time: two hooks can fire for one room inside the same second. */
+const foundingInFlight = new Set<string>();
+
+/** Resolved once per process; `undefined` means "not looked up yet". */
+let foundingEpochMs: number | null | undefined;
+
+/**
+ * When this server learned to found matches — the `_migrations` row of the migration that
+ * shipped it.
+ *
+ * <p><b>Why the migration's own timestamp and not a configured date.</b> It is exact, it needs
+ * nobody to set it, and it cannot be set wrong; a fresh database gets the install date, and a
+ * restored backup brings its original one back, which is the right answer in both cases. What
+ * it buys is that the backlog of orphaned readings — every room a host ever failed to report —
+ * is out of reach for ever, instead of being founded in bulk the first time somebody opened
+ * their History after the deploy.</p>
+ *
+ * <p>A missing row falls back to NOW, which refuses everything: the safe direction.</p>
+ */
+async function foundingEnabledFromMs(ctx: AppContext): Promise<number> {
+    if (foundingEpochMs === undefined) {
+        try {
+            const row = await ctx.db.prepare(
+                `SELECT applied_at FROM _migrations WHERE filename = ?`,
+            ).bind(FOUNDING_MIGRATION).first<{ applied_at: string }>();
+            foundingEpochMs = sqliteTimestampToMs(row?.applied_at ?? null);
+        } catch {
+            foundingEpochMs = null;
+        }
+    }
+    return foundingEpochMs ?? Date.now();
+}
+
+const FOUNDING_MIGRATION = '0021_founding.sql';
+
+/**
+ * Found the match nobody reported, from the readings the players sent on their own.
+ *
+ * <p><b>The gap this closes.</b> Only the host reports. A host whose launcher died — or who
+ * closed it to dodge — never does, and the match then did not exist: the opponent's reading
+ * sat in `match_confirmations` with `match_id NULL`, decided and fingerprinted, and nothing
+ * ever looked at it. The rule is the pure `decideFounding`; this is its I/O, and it runs from
+ * every moment the server can notice that nobody is left to report — the last socket leaving
+ * an in-game room, a reading arriving for a closed one, the startup sweep, and a history
+ * read by somebody whose reading is still waiting. No timer, by house rule.</p>
+ *
+ * <p>Returns the founded match id, or null. Never throws.</p>
+ */
+export async function foundMatchFromReadings(
+    ctx: AppContext,
+    log: FastifyBaseLogger,
+    lobbyId: string,
+): Promise<string | null> {
+    if (foundingInFlight.has(lobbyId)) return null;
+    foundingInFlight.add(lobbyId);
+    try {
+        return await foundMatchFromReadingsInner(ctx, log, lobbyId);
+    } catch (err) {
+        log.info({ lobby_id: lobbyId, err: String(err) }, 'founding check failed');
+        return null;
+    } finally {
+        foundingInFlight.delete(lobbyId);
+    }
+}
+
+async function foundMatchFromReadingsInner(
+    ctx: AppContext,
+    log: FastifyBaseLogger,
+    lobbyId: string,
+): Promise<string | null> {
+    const lobby = await ctx.db.prepare(
+        `SELECT host_user_id, mod_id, mod_combined_hash, status, started_at, roster_at_start,
+                competitive
+           FROM lobbies WHERE id = ?`,
+    ).bind(lobbyId).first<{
+        host_user_id: string; mod_id: string; mod_combined_hash: string; status: string;
+        started_at: string | null; roster_at_start: string | null; competitive: number;
+    }>();
+    if (!lobby || lobby.competitive !== 1) return null;
+
+    // A report — even an undecided one — is the host's account and takes the ordinary path.
+    const existing = await ctx.db.prepare(
+        `SELECT id FROM matches WHERE lobby_id = ? LIMIT 1`,
+    ).bind(lobbyId).first();
+    if (existing) return null;
+
+    // Somebody still attached can still report, and the ordinary path outranks this one.
+    // Only a room nobody is left in — closed, or empty — is founded from readings.
+    const room = ctx.rooms.get(lobbyId);
+    const roomClosed = lobby.status === 'closed';
+    if (!roomClosed && room && room.socketCount > 0) return null;
+
+    const roster = parseRoster(lobby.roster_at_start);
+    if (roster === null) return null;
+    const participantIds = [...roster];
+
+    const confs = await ctx.db.prepare(
+        `SELECT user_id, result, replay_sha256, game_seed, game_host_time, created_at,
+                civs, home_cities
+           FROM match_confirmations WHERE lobby_id = ?`,
+    ).bind(lobbyId).all<ReadingRow>();
+    const readings = confs.results ?? [];
+    if (readings.length === 0) return null;
+
+    // Which readings carry a fingerprint that already decided some other match. Asked for
+    // every decided reading up front, so the pure rule can refuse before choosing a founder.
+    let fingerprintAlreadyUsed = false;
+    for (const r of readings) {
+        if (!isDecided(r.result)) continue;
+        if (r.game_seed !== null && r.game_host_time !== null) {
+            const seen = await ctx.db.prepare(
+                `SELECT 1 FROM matches WHERE game_seed = ? AND game_host_time = ? LIMIT 1`,
+            ).bind(r.game_seed, r.game_host_time).first();
+            if (seen) fingerprintAlreadyUsed = true;
+        }
+        if (r.replay_sha256 !== null) {
+            const seen = await ctx.db.prepare(
+                `SELECT 1 FROM matches WHERE replay_sha256 = ? LIMIT 1`,
+            ).bind(r.replay_sha256).first();
+            if (seen) fingerprintAlreadyUsed = true;
+        }
+    }
+
+    const startedAtMs = sqliteTimestampToMs(lobby.started_at);
+    const decision = decideFounding({
+        participantIds,
+        readings: readings.map((r) => ({
+            userId: r.user_id,
+            result: r.result,
+            hasFingerprint: r.game_seed !== null && r.game_host_time !== null,
+        })),
+        walkouts: await loadWalkouts(ctx, lobbyId, new Set()),
+        startedAtMs,
+        nowMs: Date.now(),
+        abandonAfterSeconds: ctx.config.competitiveAbandonSeconds,
+        hasReport: false,
+        pairDecidedRecently: participantIds.length === 2
+            ? await pairInferredRecently(ctx, participantIds[0]!, participantIds[1]!)
+            : false,
+        fingerprintAlreadyUsed,
+        roomClosed,
+        foundingEnabledFromMs: await foundingEnabledFromMs(ctx),
+        maxAgeMs: MAX_AGE_MS,
+    });
+    if (!decision.founderId || !decision.winnerId || !decision.loserId || startedAtMs === null) {
+        log.info({ lobby_id: lobbyId, reason: decision.reason }, 'readings did not found a match');
+        return null;
+    }
+    const founder = readings.find((r) => r.user_id === decision.founderId)!;
+
+    // The eligibility a report has to pass, asked of what the server itself knows: the mod
+    // is the room's, the clock runs from the room's start to the moment the founding reading
+    // arrived — the launcher confirms within seconds of its game closing.
+    const mod = (lobby.mod_id || '').trim().toLowerCase();
+    if (!ctx.config.rankedModIds.some((m) => m === mod)) {
+        log.info({ lobby_id: lobbyId, mod_id: lobby.mod_id }, 'founding refused: mod not ranked');
+        return null;
+    }
+    const endedAtMs = sqliteTimestampToMs(founder.created_at) ?? Date.now();
+    const durationSeconds = Math.max(0, Math.round((endedAtMs - startedAtMs) / 1000));
+    if (durationSeconds < MIN_DURATION_SECONDS) {
+        log.info({ lobby_id: lobbyId, duration: durationSeconds }, 'founding refused: too short');
+        return null;
+    }
+
+    const matchId = uuid();
+    const results = new Map<string, 0 | 1>([[decision.winnerId, 1], [decision.loserId, 0]]);
+    const civs = parseNameMap(founder.civs);
+    const homeCities = parseNameMap(founder.home_cities);
+
+    // Inserted UNRATED first and promoted only once the ratings are in — a row claiming
+    // `rated = 1` with no ratings behind it is the inconsistency every other path here goes
+    // to some length to avoid. The row is 'founded' from the start so a concurrent report
+    // is demoted to a reading rather than inserted as a second match.
+    const inserts = [
+        ctx.db.prepare(
+            `INSERT INTO matches (id, lobby_id, host_user_id, mod_id, mod_combined_hash,
+                                  map_name, map_pool, duration_seconds, started_at, ended_at,
+                                  replay_sha256, game_seed, game_host_time,
+                                  unrated_reason, rated, decided_by, rating_mode)
+             VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, 'no_decided_result', 0, 'founded', 'default')`,
+        ).bind(
+            matchId, lobbyId, lobby.host_user_id, lobby.mod_id, lobby.mod_combined_hash,
+            durationSeconds,
+            normaliseSqliteTimestamp(lobby.started_at!),
+            new Date(endedAtMs).toISOString(),
+            founder.replay_sha256, founder.game_seed, founder.game_host_time,
+        ),
+    ];
+    for (const id of participantIds) {
+        inserts.push(ctx.db.prepare(
+            `INSERT INTO match_participants (match_id, user_id, team, civ, home_city, score, result)
+             VALUES (?, ?, 0, ?, ?, 0, ?)`,
+        ).bind(matchId, id, civs[id] ?? null, homeCities[id] ?? null, results.get(id) ?? 0.5));
+    }
+    await ctx.db.batch(inserts);
+
+    try {
+        const outcomes: ParticipantOutcome[] = participantIds.map((id) => ({
+            userId: id, result: results.get(id) ?? 0.5,
+        }));
+        const diff = await withLadderLock(() => applyMatch(ctx.db, outcomes));
+
+        const stamps = [ctx.db.prepare(
+            `UPDATE matches SET unrated_reason = NULL, rated = 1 WHERE id = ?`,
+        ).bind(matchId)];
+        for (const o of outcomes) {
+            const d = diff.get(o.userId);
+            if (!d) continue;
+            stamps.push(ctx.db.prepare(
+                `UPDATE match_participants SET rating_before = ?, rating_after = ?
+                 WHERE match_id = ? AND user_id = ?`,
+            ).bind(d.before, d.after, matchId, o.userId));
+        }
+        await ctx.db.batch(stamps);
+
+        await tieConfirmations(
+            ctx, log, lobbyId, matchId,
+            new Map(participantIds.map((id) => [id, results.get(id) ?? 0.5] as [string, number])),
+            { seed: founder.game_seed, hostTime: founder.game_host_time },
+        );
+
+        log.info(
+            { match_id: matchId, lobby_id: lobbyId, founder: decision.founderId,
+              winner: decision.winnerId, loser: decision.loserId, reason: decision.reason },
+            'match founded from a reading — the host never reported',
+        );
+
+        // Nobody is in the room any more, so this is the only way either player learns it.
+        ctx.globalChat.announceMatchRated({
+            matchId,
+            lobbyId,
+            modId: lobby.mod_id,
+            mapName: null,
+            perUser: new Map(outcomes.map((o) => {
+                const d = diff.get(o.userId);
+                return [o.userId, { result: o.result, before: d?.before ?? null, after: d?.after ?? null }];
+            })),
+        });
+
+        await maybeAdvanceTournament(ctx, log, matchId);
+        // A founded match can be voided like any other: the loser's crash, verified, stops
+        // it counting.
+        await maybeVoidByCrashLater(ctx, log, lobbyId, matchId);
+        return matchId;
+    } catch (err) {
+        // Nothing founded, and nothing left behind to block the next attempt: the rows go,
+        // the readings stay exactly where they were.
+        await ctx.db.prepare(`DELETE FROM match_participants WHERE match_id = ?`).bind(matchId).run();
+        await ctx.db.prepare(`DELETE FROM matches WHERE id = ?`).bind(matchId).run();
+        log.error({ match_id: matchId, lobby_id: lobbyId, err: String(err) },
+            'founding failed to apply; rows removed');
+        return null;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A verified crash voids the match
+// ---------------------------------------------------------------------------
+
+/**
+ * The I/O half of the crash rule; the decision is the pure `decideCrashVoid`. Reads the
+ * server's own verdict on how each player's game closed (`lobby_game_exits.crash_verified`,
+ * derived by the room from the launcher's signals), the loser's budget, and whether the room
+ * is a tournament match. Never throws.
+ */
+async function crashVoidFor(
+    ctx: AppContext,
+    lobbyId: string,
+    participantIds: readonly string[],
+    loserId: string | null,
+): Promise<ReturnType<typeof decideCrashVoid>> {
+    const crashed = await ctx.db.prepare(
+        `SELECT user_id FROM lobby_game_exits WHERE lobby_id = ? AND crash_verified = 1`,
+    ).bind(lobbyId).all<{ user_id: string }>();
+    const crashedIds = new Set((crashed.results ?? []).map((r) => r.user_id));
+
+    let priorVoidsForLoser = 0;
+    if (loserId !== null) {
+        const since = new Date(Date.now() - ctx.config.crashVoidWindowSeconds * 1000)
+            .toISOString().replace('T', ' ').slice(0, 19);
+        const row = await ctx.db.prepare(
+            `SELECT COUNT(*) AS n FROM matches WHERE crashed_user_id = ? AND created_at >= ?`,
+        ).bind(loserId, since).first<{ n: number }>();
+        priorVoidsForLoser = row?.n ?? 0;
+    }
+
+    const lobby = await ctx.db.prepare(
+        `SELECT tournament_match_id FROM lobbies WHERE id = ?`,
+    ).bind(lobbyId).first<{ tournament_match_id: string | null }>();
+
+    return decideCrashVoid({
+        participantIds,
+        loserId,
+        crashedIds,
+        priorVoidsForLoser,
+        perWindow: ctx.config.crashVoidPerWindow,
+        isTournament: !!lobby?.tournament_match_id,
+    });
+}
+
+/**
+ * A match already RATED whose loser's game turns out to have crashed. The evidence frame
+ * lands a few seconds after `game_exited`, and the opponent's report can beat it — so this
+ * is the second look, the same shape as the abandonment rule's. Voids, replays the ladder,
+ * tells both players. Never throws.
+ */
+async function maybeVoidByCrashLater(
+    ctx: AppContext,
+    log: FastifyBaseLogger,
+    lobbyId: string,
+    matchId: string,
+): Promise<void> {
+    try {
+        const match = await ctx.db.prepare(
+            `SELECT rated, rating_mode, mod_id, map_name FROM matches WHERE id = ?`,
+        ).bind(matchId).first<{
+            rated: number | null; rating_mode: string | null; mod_id: string; map_name: string | null;
+        }>();
+        if (!match || match.rated !== 1) return;
+        if (match.rating_mode === 'team') return;
+
+        const parts = await ctx.db.prepare(
+            `SELECT user_id, result FROM match_participants WHERE match_id = ?`,
+        ).bind(matchId).all<{ user_id: string; result: number }>();
+        const players = parts.results ?? [];
+        if (players.length !== 2) return;
+        const loser = players.find((p) => p.result <= LOSS_AT)?.user_id ?? null;
+
+        const verdict = await crashVoidFor(ctx, lobbyId, players.map((p) => p.user_id), loser);
+        if (!verdict.voidFor) return;
+
+        const claim = await ctx.db.prepare(
+            `UPDATE matches SET rated = 0, unrated_reason = 'game_crashed', crashed_user_id = ?
+              WHERE id = ? AND rated = 1`,
+        ).bind(verdict.voidFor, matchId).run();
+        if (!claim.changes) return;
+
+        const replayed = await withLadderLock(() => recomputeLadder(ctx.db));
+        log.info(
+            { match_id: matchId, lobby_id: lobbyId, crashed: verdict.voidFor, replayed },
+            'rated match voided after its loser\'s game was verified as a crash; ladder replayed',
+        );
+
+        // Both players learn it stopped counting. Results are kept — the card shows what the
+        // recording said — and the ratings are null: nothing moved.
+        ctx.globalChat.announceMatchRated({
+            matchId,
+            lobbyId,
+            modId: match.mod_id,
+            mapName: match.map_name,
+            perUser: new Map(players.map((p) => [p.user_id, { result: p.result, before: null, after: null }])),
+            unratedReason: 'game_crashed',
+        });
+    } catch (err) {
+        log.info({ match_id: matchId, err: String(err) }, 'crash void check failed');
+    }
+}
+
+/**
+ * The readings of THIS user that are still waiting on a match that never came. A history
+ * read is the one moment the server can be sure somebody is looking, and the last hook that
+ * can fire for a room whose readings arrived before its walkouts had aged past the grace.
+ */
+async function foundPendingForUser(
+    ctx: AppContext,
+    log: FastifyBaseLogger,
+    userId: string,
+): Promise<void> {
+    try {
+        // The same floor the rule applies, asked in SQL as well so the backlog is not even
+        // walked. Both limits live here: nothing from before founding existed, nothing older
+        // than a report would be allowed to be. See foundingEnabledFromMs.
+        const floorMs = Math.max(
+            await foundingEnabledFromMs(ctx), Date.now() - MAX_AGE_MS);
+        const floor = new Date(floorMs).toISOString().replace('T', ' ').slice(0, 19);
+        const rows = await ctx.db.prepare(
+            `SELECT DISTINCT c.lobby_id AS lobby_id
+               FROM match_confirmations c
+               JOIN lobbies l ON l.id = c.lobby_id
+              WHERE c.user_id = ? AND c.match_id IS NULL
+                AND l.competitive = 1 AND l.status = 'closed'
+                AND l.started_at IS NOT NULL AND l.started_at >= ?
+                AND NOT EXISTS (SELECT 1 FROM matches m WHERE m.lobby_id = c.lobby_id)
+              ORDER BY c.created_at DESC
+              LIMIT 10`,
+        ).bind(userId, floor).all<{ lobby_id: string }>();
+        for (const r of rows.results ?? []) {
+            await foundMatchFromReadings(ctx, log, r.lobby_id);
+        }
+    } catch (err) {
+        log.info({ user_id: userId, err: String(err) }, 'pending founding check failed');
+    }
+}
+
+/**
+ * A founded match is an INFERENCE, and a later reading of the same game that contradicts
+ * it undoes it — the rating is replayed out of the ladder and the row is kept, marked
+ * `contradicted_founding`. A match decided by a recording is never touched here.
+ *
+ * <p><b>Except when the contradiction comes from the player who walked out.</b> That is the
+ * dodger's own late reading, and letting it undo his loss would hand him the exact escape
+ * founding exists to close. His socket row still stands; his reading is logged and ignored.</p>
+ */
+async function maybeRevertContradictedFounding(
+    ctx: AppContext,
+    log: FastifyBaseLogger,
+    lobbyId: string,
+    matchId: string,
+): Promise<void> {
+    try {
+        const match = await ctx.db.prepare(
+            `SELECT decided_by, rated, game_seed, game_host_time FROM matches WHERE id = ?`,
+        ).bind(matchId).first<{
+            decided_by: string | null; rated: number | null;
+            game_seed: number | null; game_host_time: number | null;
+        }>();
+        if (!match || match.decided_by !== 'founded' || match.rated !== 1) return;
+
+        const parts = await ctx.db.prepare(
+            `SELECT user_id, result FROM match_participants WHERE match_id = ?`,
+        ).bind(matchId).all<{ user_id: string; result: number }>();
+        const stored = new Map((parts.results ?? []).map((p) => [p.user_id, p.result] as [string, number]));
+
+        const confs = await ctx.db.prepare(
+            `SELECT user_id, result, game_seed, game_host_time FROM match_confirmations WHERE lobby_id = ?`,
+        ).bind(lobbyId).all<{ user_id: string; result: number; game_seed: number | null; game_host_time: number | null }>();
+
+        const walkouts = await loadWalkouts(ctx, lobbyId, new Set());
+        const walkedOut = new Set(walkouts.filter((w) => w.source === 'socket').map((w) => w.userId));
+
+        for (const c of confs.results ?? []) {
+            const mine = stored.get(c.user_id);
+            if (mine === undefined || !isDecided(c.result)) continue;
+            // Same game, or it is not a reading of this match at all.
+            if (c.game_seed === null || c.game_host_time === null) continue;
+            if (match.game_seed !== null
+                && (c.game_seed !== match.game_seed || c.game_host_time !== match.game_host_time)) continue;
+            if (compareReadings(mine, c.result) !== 'disagree') continue;
+
+            if (walkedOut.has(c.user_id)) {
+                log.warn({ match_id: matchId, user_id: c.user_id },
+                    'a founded match is contradicted by the player who walked out; ignored');
+                continue;
+            }
+
+            const claim = await ctx.db.prepare(
+                `UPDATE matches SET rated = 0, unrated_reason = 'contradicted_founding'
+                 WHERE id = ? AND decided_by = 'founded' AND rated = 1`,
+            ).bind(matchId).run();
+            if (!claim.changes) return;
+            await ctx.db.prepare(
+                `UPDATE match_participants SET result = 0.5 WHERE match_id = ?`,
+            ).bind(matchId).run();
+            const replayed = await withLadderLock(() => recomputeLadder(ctx.db));
+            log.warn(
+                { match_id: matchId, lobby_id: lobbyId, contradicted_by: c.user_id, replayed },
+                'founded match contradicted by a later reading; reverted and ladder replayed',
+            );
+            return;
+        }
+    } catch (err) {
+        log.info({ match_id: matchId, err: String(err) }, 'contradiction check failed');
+    }
+}
+
 export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void {
+    // The rooms ask through this door — see foundingHook for why it is a door and not an
+    // import.
+    attachFoundingHook(async (lobbyId) => {
+        await foundMatchFromReadings(ctx, app.log, lobbyId);
+    });
+
     // POST /matches — host reports a finished game.
     app.post('/matches', {
         preHandler: [requireAuth(), ipRateLimit(ctx, Limits.LobbyCreateIp)],
@@ -1076,6 +1622,41 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
         } else {
             const self = body.participants.find((p) => p.user_id === userId);
             if (!self) throw Errors.Forbidden();
+        }
+
+        // A match the server already FOUNDED from the players' readings — the host never
+        // reported in time: his launcher died, or he left. This report is late, and it is not
+        // a second match: it is his reading of the same game, stored beside the others and
+        // given exactly one power, to contradict the inference and undo it.
+        if (body.lobby_id) {
+            const founded = await findFoundedMatch(ctx, body.lobby_id);
+            if (founded) {
+                const own = body.participants.find((p) => p.user_id === userId);
+                const civs: NameMap = {};
+                const homeCities: NameMap = {};
+                for (const p of body.participants) {
+                    if (p.civ?.trim()) civs[p.user_id] = p.civ.trim().slice(0, NAME_MAP_MAX_LEN);
+                    if (p.home_city?.trim()) homeCities[p.user_id] = p.home_city.trim().slice(0, NAME_MAP_MAX_LEN);
+                }
+                await upsertReading(ctx, body.lobby_id, userId, own?.result ?? 0.5, {
+                    replaySha: normaliseSha256(body.replay_sha256),
+                    gameSeed: normaliseFingerprint(body.game_seed),
+                    gameHostTime: normaliseFingerprint(body.game_host_time),
+                }, civs, homeCities);
+                await maybeRevertContradictedFounding(ctx, req.log, body.lobby_id, founded.id);
+                const state = await ctx.db.prepare(
+                    `SELECT rated, unrated_reason FROM matches WHERE id = ?`,
+                ).bind(founded.id).first<{ rated: number | null; unrated_reason: string | null }>();
+                req.log.info({ match_id: founded.id, lobby_id: body.lobby_id, user_id: userId },
+                    'late report stored as a reading of a founded match');
+                return reply.send({
+                    match_id: founded.id,
+                    rated: state?.rated === 1,
+                    unrated_reason: state?.unrated_reason ?? null,
+                    rating_changes: [],
+                    founded: true,
+                });
+            }
         }
 
         // Every reported player must actually have been in the room when the game
@@ -1272,6 +1853,30 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
             }
         }
 
+        // A verified crash of the LOSER voids the match instead of scoring it. Asked after
+        // every other verdict, because it applies to a decided match only, and bounded per
+        // player per window in decideCrashVoid. The evidence frame may still be on its way —
+        // maybeVoidByCrashLater is the second look, from the crasher's own confirmation.
+        let crashedUserId: string | null = null;
+        if (unratedReason === null && roomIsCompetitive && body.lobby_id && shape === 'default') {
+            try {
+                const loser = body.participants.find((p) => p.result <= LOSS_AT)?.user_id ?? null;
+                const verdict = await crashVoidFor(
+                    ctx, body.lobby_id, body.participants.map((p) => p.user_id), loser);
+                if (verdict.voidFor) {
+                    unratedReason = 'game_crashed';
+                    crashedUserId = verdict.voidFor;
+                    req.log.info({ match_id: matchId, crashed: verdict.voidFor },
+                        'match voided: the loser\'s game crashed, verified');
+                } else if (loser !== null) {
+                    req.log.info({ match_id: matchId, reason: verdict.reason },
+                        'crash did not void the match');
+                }
+            } catch (err) {
+                req.log.info({ match_id: matchId, err: String(err) }, 'crash void check failed');
+            }
+        }
+
         let diff = new Map<string, { before: number; after: number; rdBefore: number; rdAfter: number }>();
         if (unratedReason === null) {
             const outcomes: ParticipantOutcome[] = body.participants.map((p) => ({
@@ -1283,7 +1888,7 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
                 // players on the SAME side and skip the only pairing there is.
                 team: shape === 'team' ? (p.team | 0) : undefined,
             }));
-            diff = await applyMatch(ctx.db, outcomes, ratingMode);
+            diff = await withLadderLock(() => applyMatch(ctx.db, outcomes, ratingMode));
         } else {
             req.log.info(
                 { match_id: matchId, mod_id: body.mod_id, players: body.participants.length,
@@ -1301,14 +1906,15 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
         // `rated = 1` with no ratings behind it is exactly the inconsistency the correction
         // path goes to some length to avoid creating.
         await ctx.db.prepare(
-            `UPDATE matches SET unrated_reason = ?, rated = ?, decided_by = ?, rating_mode = ?
+            `UPDATE matches SET unrated_reason = ?, rated = ?, decided_by = ?, rating_mode = ?,
+                                crashed_user_id = ?
              WHERE id = ?`,
         ).bind(
             unratedReason, unratedReason === null ? 1 : 0, decidedBy,
             // Stored even when the match did not rate, and that is deliberate: a row
             // waiting on a confirmation has to remember which ladder it is waiting FOR,
             // or the upgrade below would have to guess.
-            ratingMode, matchId,
+            ratingMode, crashedUserId, matchId,
         ).run();
 
         const updates = [];
@@ -1458,27 +2064,16 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
         const civs = sanitiseNameMap(body.civs, roster);
         const homeCities = sanitiseNameMap(body.home_cities, roster);
 
-        await ctx.db.prepare(
-            `INSERT INTO match_confirmations
-                 (lobby_id, user_id, result, replay_sha256, game_seed, game_host_time,
-                  civs, home_cities)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT (lobby_id, user_id) DO UPDATE SET
-               result = excluded.result,
-               replay_sha256 = excluded.replay_sha256,
-               game_seed = excluded.game_seed,
-               game_host_time = excluded.game_host_time,
-               civs = excluded.civs,
-               home_cities = excluded.home_cities,
-               created_at = datetime('now')`,
-        ).bind(
-            body.lobby_id, userId, result,
-            normaliseSha256(body.replay_sha256),
-            normaliseFingerprint(body.game_seed),
-            normaliseFingerprint(body.game_host_time),
-            nameMapJson(civs),
-            nameMapJson(homeCities),
-        ).run();
+        await upsertReading(ctx, body.lobby_id, userId, result, {
+            replaySha: normaliseSha256(body.replay_sha256),
+            gameSeed: normaliseFingerprint(body.game_seed),
+            gameHostTime: normaliseFingerprint(body.game_host_time),
+        }, civs, homeCities);
+
+        // A reading is the one moment the server can be sure a game just ended for somebody.
+        // If anyone else in the room has quietly gone, this is when to find out — before the
+        // verdicts below read their socket as still alive.
+        ctx.rooms.get(body.lobby_id)?.probeLiveness();
 
         // If the host already reported, compare now; otherwise the report will, when it
         // arrives. Either order works, which is the point of keying by lobby.
@@ -1488,6 +2083,22 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
         ).bind(body.lobby_id).first<{
             id: string; game_seed: number | null; game_host_time: number | null;
         }>();
+
+        if (!match) {
+            // No report yet. If nobody is left in the room to make one, the readings are all
+            // the server will ever hear — see foundMatchFromReadings for what they may found.
+            const foundedId = await foundMatchFromReadings(ctx, req.log, body.lobby_id);
+            return reply.send({ ok: true, matched: foundedId !== null, founded: foundedId !== null });
+        }
+
+        // A founded match is an inference; this reading may be the one that contradicts it.
+        // Asked FIRST, before anything below could act on a row that is about to be undone.
+        await maybeRevertContradictedFounding(ctx, req.log, body.lobby_id, match.id);
+
+        // The crasher's own launcher sends its evidence a moment before this reading, so this
+        // is where a match the opponent already reported and scored learns the loser's game
+        // crashed.
+        await maybeVoidByCrashLater(ctx, req.log, body.lobby_id, match.id);
 
         if (match) {
             // The report is already in: whatever it left blank, this reading fills now.
@@ -1549,6 +2160,10 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
         preHandler: [ipRateLimit(ctx, Limits.StatsIp)],
     }, async (req, reply) => {
         const userId = (req.params as { userId: string }).userId;
+        // A reading of this user's that is still waiting on a report that never came may be
+        // foundable by now — its walkouts have aged, the room has closed. Somebody is looking;
+        // answer them with the match rather than with its absence.
+        await foundPendingForUser(ctx, req.log, userId);
         const rows = await ctx.db.prepare(
             // m.rated / m.unrated_reason are stored columns (migration 0006) that this
             // endpoint simply never selected, so a history row could show that a match did

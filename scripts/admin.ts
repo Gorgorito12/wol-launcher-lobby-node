@@ -215,88 +215,13 @@ async function withSnapshot<T>(dbPath: string, fn: (snap: Db) => Promise<T>): Pr
 /**
  * Rebuild the whole ladder by replaying every rated match in order.
  *
- * <p>This is the tool's centre of gravity. <c>applyMatch</c> has no inverse and nothing
- * snapshots a player's prior state, so "undo this match" cannot be computed — but "recompute
- * the ladder as though this match had always read the way it now reads" can, and it is
- * exactly as correct. Every correction command therefore edits the row and calls this.</p>
- *
- * <p>It also repairs a corruption nothing else detects. If anything throws after
- * <c>applyMatch</c> inside <c>maybeUpgradeFromConfirmation</c>, that path rolls back the
- * match and participant rows but NOT <c>elo_ratings</c> — the players keep the points and the
- * match becomes eligible to be rated a second time. A replay simply cannot express that
- * state.</p>
- *
- * <p><b>Order is <c>created_at</c>, not <c>started_at</c></b>: ratings were applied when each
- * match was REPORTED, and reports do not always arrive in the order the games were played.
- * Replaying by report order is the faithful reproduction.</p>
- *
- * <p>Ratings rows are reset in place rather than deleted, so a player who signed up and never
- * played keeps the 1500/350 row the signup created. Deleting would silently change who has a
- * row at all.</p>
+ * <p>Moved to <c>src/elo/replay.ts</c> the day the SERVER needed it too — a founded match
+ * contradicted by a later reading is undone by exactly this replay. Re-exported here so the
+ * commands and <c>scripts/test-admin.ts</c> keep their import; the rule and its comments live
+ * beside the ladder maths now.</p>
  */
-export async function recomputeLadder(db: Db): Promise<{ matches: number; players: number }> {
-    // rating_mode travels with each match so the replay can feed it to the ladder it
-    // actually belongs to. NULL means a row written before migration 0010, all of which
-    // were 1v1 — so it reads as 'default' rather than as unknown.
-    const rated = await db.prepare(
-        `SELECT id, COALESCE(rating_mode, 'default') AS rating_mode FROM matches
-          WHERE rated = 1
-             OR (rated IS NULL AND EXISTS (
-                    SELECT 1 FROM match_participants p
-                     WHERE p.match_id = matches.id AND p.rating_after IS NOT NULL))
-          ORDER BY created_at ASC, id ASC`,
-    ).bind().all<{ id: string; rating_mode: string }>();
-
-    const ids = (rated.results ?? []).map((r) => ({ id: r.id, mode: r.rating_mode }));
-
-    // No WHERE mode: BOTH ladders are being replayed below, so both are reset here. This
-    // is correct only because the loop feeds every match back into its own mode — if this
-    // function is ever narrowed to one ladder, this statement has to be narrowed with it,
-    // or recomputing 1v1 would flatten the team ratings on its way past.
-    await db.prepare(
-        `UPDATE elo_ratings
-            SET rating = ?, rd = ?, volatility = ?, games_played = 0, updated_at = datetime('now')`,
-    ).bind(DEFAULT_RATING, DEFAULT_RD, DEFAULT_VOLATILITY).run();
-
-    // Every stamp is rewritten below for the matches that still count; clearing first is what
-    // removes stamps from a match that has just stopped counting.
-    await db.prepare(
-        `UPDATE match_participants SET rating_before = NULL, rating_after = NULL`,
-    ).bind().run();
-
-    const touched = new Set<string>();
-    for (const { id: matchId, mode } of ids) {
-        const parts = await db.prepare(
-            `SELECT match_id, user_id, team, result FROM match_participants
-              WHERE match_id = ? ORDER BY user_id ASC`,
-        ).bind(matchId).all<ParticipantRow & { team: number }>();
-
-        const isTeam = mode === 'team';
-        const outcomes: ParticipantOutcome[] = (parts.results ?? []).map((p) => ({
-            userId: p.user_id,
-            result: p.result as 0 | 0.5 | 1,
-            // Only for a team match. Handing applyMatch the 0 that every 1v1 carries
-            // would put both players on the same side and skip their only pairing.
-            team: isTeam ? (p.team | 0) : undefined,
-        }));
-        if (outcomes.length < 2) continue;
-
-        const diff = await applyMatch(db, outcomes, isTeam ? 'team' : 'default');
-        const stamps = [];
-        for (const o of outcomes) {
-            touched.add(o.userId);
-            const d = diff.get(o.userId);
-            if (!d) continue;
-            stamps.push(db.prepare(
-                `UPDATE match_participants SET rating_before = ?, rating_after = ?
-                  WHERE match_id = ? AND user_id = ?`,
-            ).bind(d.before, d.after, matchId, o.userId));
-        }
-        if (stamps.length) await db.batch(stamps);
-    }
-
-    return { matches: ids.length, players: touched.size };
-}
+import { recomputeLadder } from '../src/elo/replay';
+export { recomputeLadder };
 
 interface RatingRow {
     user_id: string;
@@ -636,16 +561,28 @@ async function cmdMatchShow(db: Db): Promise<void> {
         // verdict used; `said` is the launcher's own count of the match, kept only so a wildly
         // different number gives away a broken clock.
         const exits = await db.prepare(
-            `SELECT e.user_id, e.exited_at, e.client_seconds, u.display_name
+            `SELECT e.user_id, e.exited_at, e.client_seconds, u.display_name,
+                    e.exit_code, e.recording_outcome, e.stopped_by_user, e.crash_verified, e.crash_module
                FROM lobby_game_exits e LEFT JOIN users u ON u.id = e.user_id
               WHERE e.lobby_id = ?`,
         ).bind(m.lobby_id).all<{
             user_id: string; exited_at: string;
             client_seconds: number | null; display_name: string | null;
+            exit_code: number | null; recording_outcome: string | null;
+            stopped_by_user: number | null; crash_verified: number | null; crash_module: string | null;
         }>();
         for (const e of exits.results ?? []) {
             const said = e.client_seconds === null ? '-' : `${e.client_seconds}s`;
             console.log(`  closed game ${pad(e.display_name ?? e.user_id, 21)} at ${e.exited_at}  (launcher said ${said})`);
+            // HOW it closed — the evidence frame (migration 0022). Absent for a launcher older
+            // than it. `crash` is the server's own verdict from the four signals.
+            if (e.recording_outcome !== null || e.exit_code !== null) {
+                const code = e.exit_code === null ? '-' : `0x${(e.exit_code >>> 0).toString(16).toUpperCase()}`;
+                console.log(
+                    `             exit ${code}  recording ${e.recording_outcome ?? '-'}`
+                    + `  stopped-by-user ${e.stopped_by_user ? 'yes' : 'no'}`
+                    + `  crash ${e.crash_verified ? `VERIFIED (${e.crash_module ?? '?'})` : 'no'}`);
+            }
         }
     }
     console.log(`  seed       ${m.game_seed ?? '-'}   hostTime ${m.game_host_time ?? '-'}`);

@@ -1,0 +1,24 @@
+-- A match nobody reported can now be FOUNDED from the players' own readings, and a room
+-- remembers when its match ENDED as well as when it started.
+--
+-- Two things change, and neither adds a column to `matches`:
+--
+--   1. `matches.decided_by` gains the sentinel 'founded', beside 'abandon' (0008). A founded
+--      match is one the server assembled from `match_confirmations` when the host never
+--      posted `POST /matches` — his launcher died, or he closed it to dodge. The rule is in
+--      src/elo/founding.ts: a reading that concedes its own defeat founds at once; a reading
+--      that claims its own victory founds only when the opponent's socket walked out past the
+--      abandonment thresholds. Both sentinels mark an INFERENCE, and that is what lets a later
+--      contradicting reading undo it: `matches.unrated_reason` gains 'contradicted_founding'
+--      for a founded match that was reverted and replayed out of the ladder.
+--
+--   2. `lobbies.ended_at`. `game_ended` and `cancel_game` used to put `started_at` back to
+--      NULL, which made every later question about the match unanswerable: the abandonment
+--      verdict refused with "the room never recorded when it started", and a `game_exited`
+--      frame arriving after the host's game had already ended was dropped by the
+--      `status = 'in_game'` guard. The guest's game routinely outlives the host's — AoE3
+--      hands him the victory screen after the host's window is gone — so his frame, the one
+--      that keeps him OUT of a forfeit, was the one being thrown away. `started_at` now
+--      survives the end of the match, `ended_at` records it, and `handleStart` clears it
+--      when the room starts again.
+ALTER TABLE lobbies ADD COLUMN ended_at TEXT;

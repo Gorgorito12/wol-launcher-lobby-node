@@ -3,6 +3,8 @@ import { randomUUID } from 'node:crypto';
 import { verifyJwt } from '../lib/jwt';
 import { isBanned } from '../middleware/auth';
 import { notifyRoomChanged, finalizeRoom } from './discordAnnounce';
+import { runFoundingHook } from '../matches/foundingHook';
+import { verifyCrash, normaliseRecordingOutcome, isNtstatusFailure } from '../elo/crashEvidence';
 import { DEFAULT_RATING, DEFAULT_RD } from '../elo/glicko2';
 import type { AppContext } from '../context';
 
@@ -41,7 +43,22 @@ export function attachGlobalChat(gc: { refreshPlayers(): void }): void {
 export const GAME_EXIT_INSERT_SQL =
     `INSERT OR IGNORE INTO lobby_game_exits (lobby_id, user_id, client_seconds)
      SELECT ?, ?, ? FROM lobbies
-      WHERE id = ? AND status = 'in_game' AND competitive = 1`;
+      WHERE id = ? AND competitive = 1
+        AND (status = 'in_game'
+             OR (status = 'open' AND started_at IS NOT NULL AND ended_at IS NOT NULL
+                 AND ended_at >= datetime('now', '-10 minutes')))`;
+
+/**
+ * The write behind the `game_exit_evidence` frame: HOW a member's game closed, sent once the
+ * launcher has read its recording. An UPDATE and never an insert — the row is the one
+ * `game_exited` wrote, with the server's own timestamp, and evidence for a game the server
+ * never saw close is not evidence of anything. `crash_verified` is bound by the SERVER from
+ * the four signals (crashEvidence.ts), never copied from the client.
+ */
+export const GAME_EXIT_EVIDENCE_SQL =
+    `UPDATE lobby_game_exits
+        SET exit_code = ?, recording_outcome = ?, stopped_by_user = ?, crash_verified = ?, crash_module = ?
+      WHERE lobby_id = ? AND user_id = ?`;
 
 /**
  * Per-lobby room state, in-process replacement for the Cloudflare
@@ -66,6 +83,8 @@ export const GAME_EXIT_INSERT_SQL =
  */
 
 interface AttachedSocket {
+    /** When a liveness probe was sent and not yet answered — see probeLiveness. */
+    livenessProbeAt?: number;
     userId: string;
     discordUsername: string;
     /** Last frame timestamp, used for idle-kick. */
@@ -131,6 +150,10 @@ interface ChatLine {
 
 const CHAT_RING_MAX = 100;
 const IDLE_KICK_AFTER_MS = 90 * 1000;
+// A socket quiet for this long is asked whether it is still there when a match ends;
+// one that does not answer inside the timeout is dropped. See probeLiveness.
+const LIVENESS_QUIET_MS = 30 * 1000;
+const LIVENESS_TIMEOUT_MS = 5 * 1000;
 /**
  * Minimum gap between accepted renames, per room. Aligned with the Discord
  * edit debounce (EDIT_DEBOUNCE_MS) — a rename costs a DB write plus a PATCH to
@@ -267,6 +290,9 @@ class LobbyRoom {
                 break;
             case 'game_exited':
                 await this.handleGameExited(ctx, attached, f);
+                break;
+            case 'game_exit_evidence':
+                await this.handleGameExitEvidence(ctx, attached, f);
                 break;
             case 'set_radmin_ip':
                 this.handleSetRadminIp(attached, f);
@@ -614,7 +640,7 @@ class LobbyRoom {
         const rosterAtStart = JSON.stringify(Object.keys(this.members));
         await ctx.db.prepare(
             `UPDATE lobbies SET status = 'in_game', started_at = datetime('now'),
-                                roster_at_start = ?
+                                ended_at = NULL, roster_at_start = ?
              WHERE id = ?`,
         ).bind(rosterAtStart, this.lobbyId).run();
         this.startedAtMs = Date.now();
@@ -648,8 +674,11 @@ class LobbyRoom {
             return;
         }
         this.startedAtMs = null;
+        // `started_at` is KEPT — see migration 0021. Every later question about the match
+        // (a walkout's verdict, a guest's late `game_exited`) needs it; `ended_at` is what
+        // says the match is over, and handleStart clears it when the room starts again.
         await ctx.db.prepare(
-            `UPDATE lobbies SET status = 'open', started_at = NULL WHERE id = ?`,
+            `UPDATE lobbies SET status = 'open', ended_at = datetime('now') WHERE id = ?`,
         ).bind(this.lobbyId).run();
         this.broadcast({
             type: 'game_cancelled',
@@ -679,8 +708,9 @@ class LobbyRoom {
         }
         if (this.startedAtMs == null) return;   // no match running — nothing to reset
         this.startedAtMs = null;
+        // `started_at` is KEPT — see migration 0021 and handleCancelGame.
         await ctx.db.prepare(
-            `UPDATE lobbies SET status = 'open', started_at = NULL WHERE id = ?`,
+            `UPDATE lobbies SET status = 'open', ended_at = datetime('now') WHERE id = ?`,
         ).bind(this.lobbyId).run();
         // Reuse the game_cancelled frame (reflectToDiscord maps it → status open →
         // Discord "Waiting"; peers return to the lobby). Exclude the host — it already
@@ -733,6 +763,100 @@ class LobbyRoom {
             // Best-effort, exactly like the socket-drop row: a DB hiccup must not take down
             // the frame loop, and the worst case is a dodge that goes unpunished — which is
             // where we were before this existed.
+        }
+
+        // Somebody's game just ended: the one moment the room can be sure a match is
+        // finishing, and the moment to find out whether anyone else's connection quietly died
+        // during it. See probeLiveness.
+        this.probeLiveness();
+    }
+
+    /**
+     * HOW the sender's game closed, sent a few seconds after `game_exited` once the launcher
+     * has read its own recording. The four signals are stored raw and the verdict is derived
+     * HERE (crashEvidence.ts): the launcher sends whether it saw a Windows Application Error
+     * event, the recording's outcome, whether it killed the game itself, and the exit code —
+     * and a `crash_verified` it might have asserted is ignored. Best-effort like the first
+     * frame; the worst case is a crash that counts as the loss it always used to.
+     */
+    private async handleGameExitEvidence(
+        ctx: AppContext,
+        attached: AttachedSocket,
+        frame: { type: string } & Record<string, unknown>,
+    ): Promise<void> {
+        const rawCode = frame.exit_code;
+        const exitCode = typeof rawCode === 'number' && Number.isFinite(rawCode)
+            ? Math.trunc(rawCode) | 0
+            : null;
+        const recordingOutcome = normaliseRecordingOutcome(frame.recording_outcome);
+        const stoppedByUser = frame.stopped_by_user === true;
+        const event = frame.crash_event;
+        const eventSeen = !!event && typeof event === 'object';
+        const module = eventSeen
+            ? String((event as Record<string, unknown>).module ?? '').slice(0, 120)
+            : '';
+
+        const verified = verifyCrash({ exitCode, recordingOutcome, stoppedByUser, eventSeen });
+
+        try {
+            await ctx.db.prepare(GAME_EXIT_EVIDENCE_SQL)
+                .bind(exitCode, recordingOutcome, stoppedByUser ? 1 : 0, verified ? 1 : 0,
+                      module || null, this.lobbyId, attached.userId)
+                .run();
+        } catch {
+            // Best-effort — see handleGameExited.
+        }
+
+        if (verified || (exitCode !== null && isNtstatusFailure(exitCode))) {
+            // Worth a line either way: a failure exit code without the event is the shape a
+            // forged claim would have, and the log is where that would be noticed.
+            console.log(JSON.stringify({
+                level: 'info', lobby_id: this.lobbyId, user_id: attached.userId,
+                exit_code: exitCode, recording_outcome: recordingOutcome,
+                stopped_by_user: stoppedByUser, event_seen: eventSeen, crash_verified: verified,
+                msg: verified ? 'game exit verified as a crash' : 'game exit failed but no crash event',
+            }));
+        }
+    }
+
+    /**
+     * Ask every quiet socket whether it is still there, and drop the ones that are not.
+     *
+     * <p><b>The gap this closes.</b> The idle kick lives inside `broadcast()`, so a socket in
+     * a SILENT in-game room — nobody chats during a match — is never examined, and a
+     * connection that died without a FIN (power cut, cable, sleep) stays "attached" until the
+     * OS gives up on it, which can be never. Its `lobby_abandons` row is then written late or
+     * not at all, and the walkout the verdict needs to see is invisible. This is the same
+     * question asked on purpose, at the two moments a match is ending: a `game_exited` frame
+     * and a reading arriving.</p>
+     *
+     * <p>One probe per socket at a time, a bounded one-shot timer that never keeps the process
+     * alive, and only for sockets that have been quiet — a socket that spoke recently answered
+     * the question already. NOT a periodic timer, by house rule.</p>
+     */
+    probeLiveness(): void {
+        const now = Date.now();
+        for (const [ws, attached] of this.attached) {
+            if (ws.readyState !== 1 /* OPEN */) continue;
+            if (now - attached.lastFrameAt < LIVENESS_QUIET_MS) continue;
+            if (attached.livenessProbeAt !== undefined) continue;
+
+            attached.livenessProbeAt = now;
+            const timer = setTimeout(() => {
+                const a = this.attached.get(ws);
+                if (!a || a.livenessProbeAt !== now) return;
+                // No pong: the peer is gone. terminate() fires 'close', which runs the normal
+                // cleanup and writes the abandon row with the server's clock.
+                try { ws.terminate(); } catch { /* already gone */ }
+            }, LIVENESS_TIMEOUT_MS);
+            timer.unref?.();
+
+            ws.once('pong', () => {
+                clearTimeout(timer);
+                const a = this.attached.get(ws);
+                if (a) { a.livenessProbeAt = undefined; a.lastFrameAt = Date.now(); }
+            });
+            try { ws.ping(); } catch { clearTimeout(timer); attached.livenessProbeAt = undefined; }
         }
     }
 
@@ -857,17 +981,23 @@ class LobbyRoom {
         // A member left (and possibly the room closed) — refresh the global
         // players panel so they/everyone reflect the new status.
         ctx.globalChat.refreshPlayers();
-        if (!wasHost) return;
-        const migrated = await this.reassignHost(ctx, userId);
-        if (!migrated) {
-            try {
-                await ctx.db.prepare(
-                    `UPDATE lobbies SET status='closed', closed_at=datetime('now') WHERE id = ?`,
-                ).bind(this.lobbyId).run();
-            } catch { /* best-effort */ }
-            finalizeRoom(this.lobbyId);
-            ctx.globalChat.refreshPlayers(); // room closed → its members go idle
+        if (wasHost) {
+            const migrated = await this.reassignHost(ctx, userId);
+            if (!migrated) {
+                try {
+                    await ctx.db.prepare(
+                        `UPDATE lobbies SET status='closed', closed_at=datetime('now') WHERE id = ?`,
+                    ).bind(this.lobbyId).run();
+                } catch { /* best-effort */ }
+                finalizeRoom(this.lobbyId);
+                ctx.globalChat.refreshPlayers(); // room closed → its members go idle
+            }
         }
+        // Nobody is attached any more — host or not, this was the last one out. Whatever
+        // readings the players sent are all the server will ever hear about the match; ask
+        // whether they found one. AFTER the close above, so a closed room's walkouts are
+        // judged without a reconnect grace nobody can use. See foundingHook.
+        if (this.attached.size === 0) runFoundingHook(this.lobbyId);
     }
 
     /**

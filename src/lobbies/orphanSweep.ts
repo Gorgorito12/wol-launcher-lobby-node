@@ -1,6 +1,7 @@
 import type { FastifyBaseLogger } from 'fastify';
 import type { AppContext } from '../context';
 import { finalizeRoom } from './discordAnnounce';
+import { runFoundingHook } from '../matches/foundingHook';
 
 /**
  * Reap lobbies orphaned by a server restart.
@@ -89,6 +90,9 @@ export async function sweepOrphanLobbies(
             // Rehydrates from lobbies.discord_targets and edits the embed to
             // "Closed" — the whole reason those ids are persisted.
             finalizeRoom(id);
+            // The previous process may have died between the guest's confirmation and the
+            // host's report. The readings survived the restart; ask whether they found a match.
+            runFoundingHook(id);
             closed++;
         }
 

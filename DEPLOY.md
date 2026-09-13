@@ -194,6 +194,29 @@ curl -i -N -H "Connection: Upgrade" -H "Upgrade: websocket" \
 # → HTTP/1.1 101 Switching Protocols   (404 = route not deployed)
 ```
 
+### Did the migrations land, and how do I go back?
+
+The startup line is the first answer, and the table itself is the second — neither was written
+down here before, which is awkward on a deploy that carries migrations:
+
+```bash
+journalctl -u wol-lobby -n 50 --no-pager | grep migrate
+#   → [migrate] applied: 0021_founding.sql, 0022_crash_evidence.sql
+sqlite3 /var/lib/wol-lobby/lobby.db \
+  "SELECT filename, applied_at FROM _migrations ORDER BY filename DESC LIMIT 5"
+```
+
+**Going back is `git checkout <sha>` + `systemctl restart`, and it is safe as long as the
+migrations in between were ADDITIVE** — every one so far has been. A column that is NULLable or
+carries a default is simply ignored by the older code, so there is nothing to undo and no
+down-migration to write. What you must not do is restore a database backup over a schema the
+running code has already migrated past, or the `_migrations` table and the schema disagree.
+
+The one thing a rollback leaves behind is rows the older code has no name for — a match with
+`decided_by = 'founded'`, say. Those survive: the replay reads them by `rated`, and every late
+correction path refuses anything but `unrated_reason = 'no_decided_result'`, so an unknown value
+is inert rather than dangerous.
+
 ## Resetting the ratings
 
 Only ever needed on purpose — this throws every player's ELO away. It exists
@@ -581,6 +604,74 @@ room's mode, any dropped sockets (`walked out`) and any closed games (`closed ga
 once inside `POST /matches`, and again inside `POST /matches/confirm` — after the confirmation has
 had its own chance to decide the match outright, since evidence outranks inference.
 
+### A match nobody reported is FOUNDED from the readings
+
+Only the host reports, and a host whose launcher died — or who closed it to dodge — never does.
+Until migration `0021` the match then simply did not exist: the opponent's confirmation sat in
+`match_confirmations` with `match_id NULL` for ever, decided and fingerprinted, and nothing looked
+at it. The dodge was free, and so was the loss of every honest match whose host's machine died.
+
+The rule is the pure `src/elo/founding.ts`, and it is the mirror of the late-reading rule with one
+more witness:
+
+- a reading that **concedes its own defeat** founds the match at once — nobody lies to lose;
+- a reading that **claims its own victory** founds it only when the server itself saw the
+  opponent walk out: a `lobby_abandons` row past BOTH abandonment thresholds (≥ `COMPETITIVE_ABANDON_SECONDS`
+  into the match; ≥ 90 s old while the room is still open — a closed room waives the grace, since
+  nobody can say hello to it again). "I won" and "he left" is one story told by two witnesses;
+  either alone founds nothing, so an invented victory still has nothing to gain;
+- a closed **game** is never that witness (same physics as the abandonment rule); two readings
+  that contradict each other found nothing (two victories is the colluders' shape); the reading
+  must carry a fingerprint; 1v1 only; the same **pair cooldown** as abandonment, shared with it
+  (`decided_by IN ('abandon','founded')`).
+
+⚠ **It only ever reaches FORWARD, and that is not a detail — it is what stopped this feature
+from rating everybody's backlog on the day it deployed.** Two floors, both in the pure rule:
+
+- a room that started **before founding was installed** is never founded. The date is read from
+  `_migrations.applied_at` of `0021_founding.sql` — automatic, exact, and impossible to set
+  wrong, unlike a configured date. A missing row falls back to *now*, which refuses everything;
+- a match older than `MAX_AGE_MS` (7 days) is never founded — the same limit that already
+  refuses a *report* this old. If the host may not report it, the server may not invent it.
+
+Without them the arithmetic was ugly: orphaned confirmations accumulate for as long as hosts
+have been failing to report, `foundPendingForUser` hangs off `GET /matches/history` — which is
+what the launcher calls when somebody opens the History tab — and it took the ten most recent
+with no date filter at all. The first person to open that tab after the deploy would have had
+ten of their old rooms founded and rated in one go, passively. Nor would luck have helped: the
+old rooms still eligible are precisely the ones whose host vanished, because the old code only
+cleared `started_at` when the host closed properly.
+
+**It runs with no timer**, from the four moments the server can notice nobody is left to report:
+the last socket leaving an in-game room (`handleDisconnectCleanup`), a `POST /matches/confirm`
+arriving for a closed or empty room, the startup orphan sweep, and a `GET /matches/history` by
+somebody whose reading is still waiting. The match is stored `decided_by = 'founded'` and rated
+like any other; `match:show` prints it.
+
+**A founded match is an INFERENCE, and evidence undoes it.** A later fingerprinted reading of the
+SAME game that contradicts it — including the host's own late `POST /matches`, which is stored as
+a reading rather than as a second match — reverts it to `unrated_reason = 'contradicted_founding'`
+and replays the ladder (`src/elo/replay.ts`, the same replay every operator correction uses).
+The one exception: a contradiction from the player who **walked out** is logged and ignored, or
+the dodger's own late reading would undo his loss.
+
+### `started_at` survives the end of a match
+
+`game_ended` and `cancel_game` used to put `lobbies.started_at` back to NULL, which made every
+later question unanswerable — the abandonment verdict refused with "the room never recorded when
+it started", and a guest's `game_exited` arriving after the host's game had ended was dropped by
+the `status = 'in_game'` guard (AoE3 hands the guest the victory screen after the host's window is
+gone, so his frame, the one that keeps him OUT of a forfeit, was the one thrown away). Both keep
+`started_at` now and stamp `ended_at`; `game_exited` is accepted for ten minutes after it.
+
+### Silent rooms are probed when a match ends
+
+The idle kick only ran inside `broadcast()`, so a connection that died without a FIN (power cut,
+sleep) in a room where nobody chats stayed "attached" until the OS gave up on it — and its
+`lobby_abandons` row was written late or never. `probeLiveness()` pings every quiet socket when a
+`game_exited` frame or a reading arrives and drops the ones that do not answer in 5 s. A one-shot
+per socket, never a periodic timer.
+
 **If it ever gets one wrong** — a power cut is indistinguishable from a dodge, and always will
 be — that is what the corrections are for:
 
@@ -589,14 +680,53 @@ sudo -u wol-lobby ./node_modules/.bin/tsx scripts/admin.ts match:void <matchId> 
 sudo -u wol-lobby ./node_modules/.bin/tsx scripts/admin.ts match:void <matchId> --apply
 ```
 
+### A verified crash VOIDS the match — automatically, and never the other way round
+
+**This replaces the line above that said a crash counts as a loss.** It still does — unless the
+launcher can show Windows saw it crash. Migration `0022`, `src/elo/crashEvidence.ts`,
+`src/elo/crashVoid.ts`.
+
+A few seconds after `game_exited` the launcher sends `game_exit_evidence`: the game's exit code,
+whether its own recording carries an ending, whether the launcher killed the game itself, and
+whether the Windows Application log holds an **Application Error 1000** event for the executable
+inside the match's window (and for that pid, where known). The server derives `crash_verified`
+from those four ITSELF — a flag the client asserted would be ignored — and the rule is strict in
+the direction that matters: the event must be there (a `taskkill` leaves none), the recording must
+have NO ending (a game that crashed on the victory screen decided nothing), the user must not have
+stopped it, and the exit code must be an NTSTATUS failure or unknown (`-1`, what `Process.Kill()`
+and Task Manager leave, is excluded by name).
+
+When the **LOSER** of a decided competitive 1v1 has a verified crash, the match is stored
+`unrated_reason = 'game_crashed'`, `crashed_user_id = <loser>`, and nobody's rating moves. Both
+players are told (`match_rated` with `unrated_reason`). Two limits keep it a rule rather than an
+escape:
+
+- **a budget per player**: `CRASH_VOID_PER_WINDOW` (default **1**) voids per
+  `CRASH_VOID_WINDOW_SECONDS` (default **86400**). Past it the standard bargain applies and the
+  crash is the loss it always was;
+- **only ever a void**: the crashed player never wins, the winner crashing changes nothing, a
+  tournament match is never voided (a bracket cannot be undone without somebody deciding a
+  rematch by hand, and "nobody decides by hand" is the requirement), team rooms are untouched.
+
+It is evaluated inside `POST /matches` and again from the crasher's own `POST /matches/confirm`
+(`maybeVoidByCrashLater`), because the evidence frame lands after `game_exited` and the opponent's
+report can beat it. A match already rated is reverted by replaying the ladder. `match:show` prints
+the evidence under each closed game (`exit … recording … stopped-by-user … crash VERIFIED`).
+
+**What it does not close, stated plainly:** a patched launcher can claim the event. Forging it
+takes injecting a real fault into the process — code, not a click — and what it buys is one voided
+loss per day, on record in `lobby_game_exits` with the signals that produced it.
+
 ### Tuning it
 
 ```
 COMPETITIVE_ABANDON_SECONDS=300     # how far into a match a walkout must be to forfeit
 RANKED_MOD_IDS=wol                  # which mods have a ladder at all
+CRASH_VOID_PER_WINDOW=1             # verified crashes forgiven per player per window
+CRASH_VOID_WINDOW_SECONDS=86400     # the window
 ```
 
-Both are policy, not capability: change either in `/opt/wol-lobby/.env` and
+All four are policy, not capability: change any of them in `/opt/wol-lobby/.env` and
 `systemctl restart wol-lobby`. No rebuild.
 
 ## Matches decided by a late reading

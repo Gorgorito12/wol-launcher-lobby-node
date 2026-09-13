@@ -9,7 +9,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { GAME_EXIT_INSERT_SQL } from './LobbyRoom';
+import { GAME_EXIT_INSERT_SQL, GAME_EXIT_EVIDENCE_SQL } from './LobbyRoom';
 
 const SQL = GAME_EXIT_INSERT_SQL;
 
@@ -23,6 +23,30 @@ test('THE ONE THAT MATTERS: the row is only ever written for a LIVE COMPETITIVE 
     assert.match(SQL, /WHERE id = \?/);
     assert.match(SQL, /status = 'in_game'/);
     assert.match(SQL, /competitive = 1/);
+});
+
+test('a match that has just ENDED still accepts the frame — the guest\'s game outlives the host\'s', () => {
+    // AoE3 hands the guest the victory screen after the host's window is gone, so his frame
+    // routinely arrives after `game_ended` put the room back to 'open'. Dropping it threw
+    // away the one row that keeps HIM out of a forfeit. The window is bounded and keyed on
+    // `ended_at`, which migration 0021 introduced precisely so `started_at` could survive.
+    assert.match(SQL, /status = 'open'/);
+    assert.match(SQL, /started_at IS NOT NULL/);
+    assert.match(SQL, /ended_at >= datetime\('now', '-10 minutes'\)/);
+    // And never for a room that is merely idle: 'open' alone is not enough.
+    assert.doesNotMatch(SQL, /status = 'open'\s*\)/);
+});
+
+test('the evidence frame only ever UPDATES the row game_exited wrote — never inserts', () => {
+    // Evidence about a game the server never saw close is not evidence of anything, and an
+    // insert here would be a second door into the table with none of the first one's guard.
+    assert.match(GAME_EXIT_EVIDENCE_SQL, /^\s*UPDATE lobby_game_exits/);
+    assert.doesNotMatch(GAME_EXIT_EVIDENCE_SQL, /INSERT/);
+    assert.match(GAME_EXIT_EVIDENCE_SQL, /WHERE lobby_id = \? AND user_id = \?/);
+    // Seven placeholders: the five evidence columns, then the key.
+    assert.equal(GAME_EXIT_EVIDENCE_SQL.match(/\?/g)?.length, 7);
+    // And the timestamp is never touched: the verdict's clock is the first frame's.
+    assert.doesNotMatch(GAME_EXIT_EVIDENCE_SQL, /exited_at/);
 });
 
 test('the FIRST exit is the one that counts', () => {

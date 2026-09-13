@@ -275,6 +275,9 @@ export class GlobalChatRoom {
         modId: string;
         mapName: string | null;
         perUser: ReadonlyMap<string, { result: number; before: number | null; after: number | null }>;
+        /** Set when the announcement is that the match STOPPED counting — a verified crash
+         *  voided it. The launcher then says so instead of painting a result. */
+        unratedReason?: string | null;
     }): void {
         try {
             for (const [ws, attached] of this.attached) {
@@ -289,6 +292,7 @@ export class GlobalChatRoom {
                     result: mine.result,
                     rating_before: mine.before,
                     rating_after: mine.after,
+                    unrated_reason: notice.unratedReason ?? null,
                 });
             }
         } catch { /* a correction that cannot be announced is still a correction */ }

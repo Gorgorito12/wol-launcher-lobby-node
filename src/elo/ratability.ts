@@ -35,7 +35,14 @@ export type UnratedReason =
     /** The clock does not add up: too short, or the timestamps disagree with it. */
     | 'implausible_timing'
     /** This exact recording already scored a match. */
-    | 'duplicate_recording';
+    | 'duplicate_recording'
+    /** The loser's game CRASHED, verified against Windows (src/elo/crashEvidence.ts), and the
+     *  match was voided rather than scored (src/elo/crashVoid.ts). Only ever a void — the
+     *  crashed player never wins — and bounded per player per window. */
+    | 'game_crashed'
+    /** A match the server FOUNDED from a reading (src/elo/founding.ts) that a later reading
+     *  of the same game contradicted. Reverted and replayed out of the ladder. */
+    | 'contradicted_founding';
 
 /**
  * A win and a loss, as the stored `result` encodes them.
