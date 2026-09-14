@@ -586,8 +586,13 @@ rating from an *absence* of evidence, so it is fenced in hard — the decision i
   server: a client that could claim it would turn its own dodge into a draw;
 - the walkout must be at least **90 s** old — closing the launcher the moment a match ends is
   normal and drops the connection exactly like a rage-quit does;
-- the walkout must be **at least `COMPETITIVE_ABANDON_SECONDS` after the room started**, measured
-  from the moment the socket dropped. It used to be measured from the moment the host REPORTED,
+- the walkout must be **at least `COMPETITIVE_ABANDON_SECONDS` into the MATCH**, measured from the
+  moment the socket dropped. "Into the match" means since `lobbies.started_at`, which is written in
+  `LobbyRoom.handleStart` the moment the host presses Start, countdown included — never since the
+  room was created, which appears nowhere in this rule. This line used to say "after the room
+  started", twelve lines under one saying "into the match", and the launcher's own wording had the
+  same gap: it is what made a player ask whether the five minutes ran from opening the room. It
+  used to be measured from the moment the host REPORTED,
   which is when the host closed *his* game and says nothing about when the other player left: a
   real player who left at 4:40 of a match the host kept open for fifteen minutes was forfeited
   176 points, and would have been forfeited leaving at thirty seconds just the same;

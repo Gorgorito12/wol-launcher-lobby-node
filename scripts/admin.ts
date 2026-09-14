@@ -146,6 +146,13 @@ interface ParticipantRow {
     rating_before: number | null;
     rating_after: number | null;
     display_name: string | null;
+    /** What they played, and the deck they brought. Null is the ordinary case for anything
+     *  stored before the launcher could resolve them — and, for a long time, for everything.
+     *  PRINTED rather than merely selected: this column was missing from every admin command
+     *  in this file while 31 of 32 rated matches were arriving with it empty, so nobody could
+     *  tell whether the launcher had failed to send it or the server had failed to store it. */
+    civ: string | null;
+    home_city: string | null;
 }
 
 /**
@@ -498,23 +505,41 @@ async function cmdMatchList(db: Db): Promise<void> {
     if (since) { clauses.push(`m.started_at >= ?`); params.push(since); }
     const limit = Number(flag('limit') ?? 30);
 
+    // CIVS is counted here rather than left to match:show, because the question it answers is
+    // about the TREND: after a fix that is supposed to make civilizations arrive, the only thing
+    // worth looking at is whether new rows still have none. One at a time could never show that,
+    // and for weeks nothing in this file printed the column at all.
     const rows = await db.prepare(
         `SELECT m.id, m.mod_id, m.map_name, m.started_at, m.rated, m.unrated_reason,
-                m.duration_seconds
+                m.duration_seconds,
+                (SELECT COUNT(*) FROM match_participants p WHERE p.match_id = m.id) AS players,
+                (SELECT COUNT(*) FROM match_participants p
+                  WHERE p.match_id = m.id
+                    AND p.civ IS NOT NULL AND LENGTH(TRIM(p.civ)) > 0) AS with_civ
            FROM matches m
           ${clauses.length ? 'WHERE ' + clauses.join(' AND ') : ''}
           ORDER BY m.started_at DESC LIMIT ?`,
-    ).bind(...params, limit).all<MatchRow>();
+    ).bind(...params, limit).all<MatchRow & { players: number; with_civ: number }>();
 
     const found = rows.results ?? [];
     console.log(`${found.length} match(es).`);
     if (found.length === 0) return;
-    console.log(`  ${pad('ID', 38)} ${pad('WHEN', 20)} ${pad('MAP', 16)} ${pad('RATED', 6)} REASON`);
+    console.log(
+        `  ${pad('ID', 38)} ${pad('WHEN', 20)} ${pad('MAP', 16)} ${pad('RATED', 6)} `
+        + `${pad('CIVS', 6)} REASON`);
     for (const m of found) {
         console.log(
             `  ${pad(m.id, 38)} ${pad(m.started_at, 20)} ${pad(m.map_name, 16)}` +
-            ` ${pad(m.rated === 1 ? 'yes' : m.rated === 0 ? 'no' : '?', 6)} ${m.unrated_reason ?? ''}`,
+            ` ${pad(m.rated === 1 ? 'yes' : m.rated === 0 ? 'no' : '?', 6)}` +
+            ` ${pad(`${m.with_civ}/${m.players}`, 6)} ${m.unrated_reason ?? ''}`,
         );
+    }
+
+    const blind = found.filter((m) => m.rated === 1 && m.with_civ === 0).length;
+    if (blind > 0) {
+        console.log(
+            `\n  ${blind} of the rated match(es) above carry NO civilization. `
+            + 'Use match:show <id> to see whether the confirmations carried them.');
     }
 }
 
@@ -593,7 +618,7 @@ async function cmdMatchShow(db: Db): Promise<void> {
     // than the one being asked when a team match is disputed.
     const parts = await db.prepare(
         `SELECT p.match_id, p.user_id, p.team, p.result, p.rating_before, p.rating_after,
-                u.display_name
+                p.civ, p.home_city, u.display_name
            FROM match_participants p LEFT JOIN users u ON u.id = p.user_id
           WHERE p.match_id = ? ORDER BY p.team, p.result DESC`,
     ).bind(id).all<ParticipantRow>();
@@ -608,18 +633,23 @@ async function cmdMatchShow(db: Db): Promise<void> {
             `    ${pad(p.display_name ?? p.user_id, 22)}` +
             (showTeams ? ` team ${p.team}` : '') +
             ` result ${p.result}` +
-            `   elo ${pad(num(p.rating_before, 1), 8)} -> ${num(p.rating_after, 1)}`,
+            `   elo ${pad(num(p.rating_before, 1), 8)} -> ${num(p.rating_after, 1)}` +
+            // A dash rather than nothing: an absent civilization has to LOOK absent, or the
+            // line reads as if the question was never asked.
+            `   civ ${pad(p.civ ?? '-', 14)} city ${p.home_city ?? '-'}`,
         );
     }
 
     if (!m.lobby_id) return;
     const confs = await db.prepare(
-        `SELECT c.user_id, c.result, c.agreement, c.same_game, c.game_seed, u.display_name
+        `SELECT c.user_id, c.result, c.agreement, c.same_game, c.game_seed,
+                c.civs, c.home_cities, u.display_name
            FROM match_confirmations c LEFT JOIN users u ON u.id = c.user_id
           WHERE c.lobby_id = ?`,
     ).bind(m.lobby_id).all<{
         user_id: string; result: number; agreement: string | null;
-        same_game: string | null; game_seed: number | null; display_name: string | null;
+        same_game: string | null; game_seed: number | null;
+        civs: string | null; home_cities: string | null; display_name: string | null;
     }>();
 
     const rows = confs.results ?? [];
@@ -627,8 +657,29 @@ async function cmdMatchShow(db: Db): Promise<void> {
     for (const c of rows) {
         console.log(
             `    ${pad(c.display_name ?? c.user_id, 22)} said ${c.result}` +
-            `   agreement ${pad(c.agreement, 14)} same_game ${pad(c.same_game, 8)} seed ${c.game_seed ?? '-'}`,
+            `   agreement ${pad(c.agreement, 14)} same_game ${pad(c.same_game, 8)} seed ${c.game_seed ?? '-'}` +
+            // The count, not the JSON: what is being asked is "did this reading carry the
+            // civilizations at all", and a map with a seed and a result beside an empty civ
+            // list is the exact signature of the recording parsing and the identity join
+            // refusing. The names themselves are on the participant lines above.
+            `   civs ${nameMapSize(c.civs)} cities ${nameMapSize(c.home_cities)}`,
         );
+    }
+}
+
+/**
+ * How many players a stored `civs` / `home_cities` map names. `-` when the column is null,
+ * which is what a launcher too old to send them leaves behind, and `?` when it holds something
+ * that is not a JSON object — worth telling apart from "empty".
+ */
+function nameMapSize(json: string | null): string {
+    if (json === null || json.trim() === '') return '-';
+    try {
+        const parsed = JSON.parse(json);
+        if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return '?';
+        return String(Object.keys(parsed).length);
+    } catch {
+        return '?';
     }
 }
 
