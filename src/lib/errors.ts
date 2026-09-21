@@ -59,7 +59,11 @@ export const Errors = {
     BadRequest:      (msg: string, details?: Record<string, unknown>) =>
         new HttpError(400, 'bad_request', msg, details),
     LobbyFull:       () => new HttpError(409, 'lobby_full',     'Lobby has reached its player cap.'),
-    AlreadyInLobby:  () => new HttpError(409, 'already_in_lobby', 'You are already in another lobby.'),
+    // `details.lobby_id` names the room that is blocking, so a client can offer to leave it
+    // instead of only saying that something, somewhere, is in the way. Optional: an older
+    // caller that ignores details reads exactly the sentence it always did.
+    AlreadyInLobby:  (details?: Record<string, unknown>) =>
+        new HttpError(409, 'already_in_lobby', 'You are already in another lobby.', details),
     ModMismatch:     (details: Record<string, unknown>) => new HttpError(
         409,
         'mod_mismatch',

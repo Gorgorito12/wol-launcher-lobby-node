@@ -10,6 +10,24 @@ import { isEntrantMember } from '../tournaments/store';
 import { DEFAULT_RATING, DEFAULT_RD } from '../elo/glicko2';
 import type { AppContext } from '../context';
 
+/**
+ * The "one active lobby" guard: is this player a member of some OTHER room that is still
+ * alive?
+ *
+ * <p>Exported as a constant so a test can assert it still asks about `l.status`. It used to
+ * read `lobby_members` alone, with no join and no status filter, and the tempting
+ * "simplification" is to go back to that — it is one table and it needs no join. Doing so
+ * silently restores a permanent ban: one row left behind by a `/leave` that never landed or
+ * by a server restart refused that player every room, for ever, and he could not clear it
+ * because joining is what was being refused. `player:unstick` exists only because of it.</p>
+ */
+export const ALREADY_IN_LOBBY_SQL = `
+    SELECT m.lobby_id FROM lobby_members m
+      JOIN lobbies l ON l.id = m.lobby_id
+     WHERE m.user_id = ? AND m.lobby_id != ?
+       AND l.status IN ('open','locked','in_game')
+     LIMIT 1`;
+
 interface LobbyRow {
     id: string;
     host_user_id: string;
@@ -309,12 +327,19 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
             });
         }
 
-        const inOther = await ctx.db.prepare(
-            `SELECT lobby_id FROM lobby_members
-             WHERE user_id = ? AND lobby_id != ?
-             LIMIT 1`,
-        ).bind(userId, lobbyId).first();
-        if (inOther) throw Errors.AlreadyInLobby();
+        // A membership row that outlived its lobby used to be a permanent, silent ban from
+        // every room: this guard read `lobby_members` with no join and no status filter, and
+        // the player could not clear it himself because joining is exactly what was refused.
+        // Sweep his dead rows first — the same predicate `player:unstick` uses, self-served.
+        // Rows for LIVE lobbies are never touched, so a genuine membership still blocks.
+        await ctx.db.prepare(
+            `DELETE FROM lobby_members
+              WHERE user_id = ?
+                AND lobby_id NOT IN (SELECT id FROM lobbies WHERE status IN ('open','locked','in_game'))`,
+        ).bind(userId).run();
+
+        const inOther = await ctx.db.prepare(ALREADY_IN_LOBBY_SQL).bind(userId, lobbyId).first<{ lobby_id: string }>();
+        if (inOther) throw Errors.AlreadyInLobby({ lobby_id: inOther.lobby_id });
 
         await ctx.db.batch([
             ctx.db.prepare(
