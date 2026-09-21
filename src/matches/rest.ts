@@ -2174,13 +2174,21 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
             //
             // NULL on both means a row written before that migration: "we don't know",
             // which is not the same as "it counted", and the client treats it that way.
+            // `l.competitive` is what the ROOM was, which is a different question from
+            // `m.rated` beside it: a competitive match can end unrated because nobody could
+            // read a recording. It is not a column on `matches` and must not become one - the
+            // flag lives on the lobby precisely so a client can never claim it (migration
+            // 0007) - so it is joined. LEFT, because `matches.lobby_id` is nullable and the
+            // lobby may be gone; that yields NULL, which the client renders as nothing at all.
             `SELECT m.id, m.mod_id, m.map_name, m.map_pool, m.duration_seconds, m.started_at, m.ended_at,
                     m.replay_object_key, m.rated, m.unrated_reason,
+                    l.competitive,
                     mp.team, mp.civ, mp.score, mp.result,
                     mp.rating_before, mp.rating_after,
                     (SELECT COUNT(*) FROM match_participants WHERE match_id = m.id) AS player_count
              FROM match_participants mp
              JOIN matches m ON m.id = mp.match_id
+             LEFT JOIN lobbies l ON l.id = m.lobby_id
              WHERE mp.user_id = ?
              ORDER BY m.started_at DESC
              LIMIT 50`,
@@ -2199,6 +2207,9 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
         const matches = (rows.results ?? []).map((m) => ({
             ...m,
             rated: m.rated == null ? null : Boolean(m.rated),
+            // Same coercion and the same NULL rule, for the same two reasons. A match whose
+            // lobby row is gone is "we don't know what kind of room this was", never "casual".
+            competitive: m.competitive == null ? null : Boolean(m.competitive),
         }));
         await attachParticipants(ctx, matches);
         return reply.send({ matches });

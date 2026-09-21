@@ -37,15 +37,21 @@ import type { AppContext } from '../context';
  * maintains — so it counts RATED matches only, and no subquery decides who is eligible. The
  * win/loss tally below stays, but purely to fill the DECIDED column.</p>
  *
- * <p><b>Raised to 5, and it is NOT what fixes the newcomer problem — the ORDER BY is.</b> The
- * complaint was a player sitting first with three rated matches above one with thirteen, and
- * measured against the live table a threshold could not answer it: he had exactly 3, so a bar
- * of 3 still crowned him, and a bar of 5 left the whole table with TWO names. This is a floor
- * against a lucky first night, nothing more; the confidence-adjusted ordering below is the
- * mechanism. Keep it low for the same reason it was lowered before — this community plays
- * about 35 rated matches a month, and a table nobody is on teaches nobody anything.</p>
+ * <p><b>ONE, so the ladder lists everyone who has played a rated match.</b> It was raised to
+ * 5 to stop a three-match newcomer sitting first, and that was the wrong instrument: measured
+ * against the live table a threshold could not answer it either way — he had exactly 3, so a
+ * bar of 3 still crowned him, and 5 left the table with TWO names out of eighteen active
+ * players. The `ORDER BY` below is what answers it, and it always was: a one-match player
+ * carries rd ≈ 290, so `rating - 2*rd` puts him near 920 and he sinks to the bottom on his own
+ * and climbs as the deviation shrinks. A bar was only ever hiding people the ordering had
+ * already placed correctly.</p>
+ *
+ * <p>What it still refuses is somebody with NO rated match, which is not a judgement at all:
+ * `elo_ratings` gains a row when `applyMatch` first runs, so a player with nothing decided has
+ * no rating to rank. Keep this at 1 rather than removing the condition — the launcher prints
+ * it (`min_decided`) and a ladder that promised entry at zero would be lying.</p>
  */
-export const MIN_DECIDED = 5;
+export const MIN_DECIDED = 1;
 
 /**
  * How good a player is AT LEAST — Glicko-2's conservative estimate, the number the ladder is
@@ -756,17 +762,36 @@ export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
             // headed "community activity" and used to fill this from the viewer's own history,
             // so a player who had never played saw an empty panel with nothing to suggest
             // anyone else was here.
+            //
+            // EVERY COLUMN IS QUALIFIED because of the join below: `lobbies` also has `id`,
+            // `mod_id` and `created_at`, so an unqualified name here is ambiguous - including
+            // the interpolated mod filter, which is why it reads `m.mod_id`.
+            //
+            // `l.competitive` is what the ROOM was and `m.rated` is whether it scored; they are
+            // different questions and a competitive match can be unrated. The flag is on the
+            // lobby on purpose (migration 0007) so a client can never claim it, hence the join
+            // rather than a column on `matches`. LEFT: `lobby_id` is nullable and old rows may
+            // point at nothing, which yields NULL - "we don't know", never "casual".
             const recentRows = await ctx.db.prepare(
-                `SELECT id, mod_id, map_name, duration_seconds,
-                        created_at AS reported_at
-                   FROM matches
-                  ${mod ? 'WHERE mod_id = ?' : ''}
-                  ORDER BY created_at DESC
+                `SELECT m.id, m.mod_id, m.map_name, m.duration_seconds,
+                        m.created_at AS reported_at,
+                        m.rated, m.unrated_reason,
+                        l.competitive
+                   FROM matches m
+                   LEFT JOIN lobbies l ON l.id = m.lobby_id
+                  ${mod ? 'WHERE m.mod_id = ?' : ''}
+                  ORDER BY m.created_at DESC
                   LIMIT ?`,
             ).bind(...modArgs, recent)
                 .all<Record<string, unknown> & { id: string }>();
 
-            const recent_matches = recentRows.results ?? [];
+            // Coerced to real booleans, NULL preserved - see the identical block in
+            // /matches/history for why a raw SQLite 1 takes a whole page down on the client.
+            const recent_matches = (recentRows.results ?? []).map((m) => ({
+                ...m,
+                rated: m.rated == null ? null : Boolean(m.rated),
+                competitive: m.competitive == null ? null : Boolean(m.competitive),
+            }));
             // The same helper the history endpoint uses, so "who played" is assembled one way
             // in this codebase: one query for the whole page, never one per match.
             await attachParticipants(ctx, recent_matches);

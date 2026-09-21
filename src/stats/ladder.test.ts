@@ -67,17 +67,34 @@ test('the ORDER BY still discounts the deviation', () => {
     assert.match(LADDER_ORDER_BY, /DESC\s*$/);
 });
 
-test('the entry bar is a floor, not the mechanism', () => {
-    // Low ON PURPOSE. A bar high enough to exclude the three-match player on its own emptied the
-    // table: this community plays ~35 rated matches a month, and at 5 the live table held two
-    // names. It exists to keep a single lucky night off the board; the ordering does the rest.
-    assert.ok(MIN_DECIDED >= 2, 'one rated match should not be enough to appear');
-    assert.ok(MIN_DECIDED <= 5, 'a higher bar empties the table for this community');
+test('everyone who has played a rated match is on the ladder', () => {
+    // The bar USED to be 5 and this test asserted the opposite - `MIN_DECIDED >= 2`, "one rated
+    // match should not be enough to appear". That was changed deliberately, not worked around:
+    // the bar was excluding fourteen of eighteen active players to solve a problem the ORDER BY
+    // already solves, and a table nobody is on teaches nobody anything.
+    assert.ok(MIN_DECIDED <= 1, 'a bar hides players the ordering already places correctly');
 
-    // On the live numbers it removes exactly the 0-1 player, and nobody who has actually played.
+    // The one thing still refused, and it is not a judgement: `elo_ratings` gains a row when
+    // applyMatch first runs, so somebody with nothing decided has no rating to rank. The
+    // launcher prints this number, so a promise of entry at zero would be a lie.
+    assert.ok(MIN_DECIDED >= 1, 'a player with no rated match has no rating to rank');
+
+    // On the live numbers: everybody, including the one-match player the old bar removed.
     const eligible = LIVE.filter(r => r.games >= MIN_DECIDED).map(r => r.name);
-    assert.ok(!eligible.includes('Gorgorito12'));
-    assert.ok(eligible.includes('Aluclown'));
+    assert.deepEqual(eligible.sort(), [...LIVE.map(r => r.name)].sort());
+});
+
+test('the ordering, not a bar, is what keeps the one-match player down', () => {
+    // THE REPLACEMENT for the assertion above. With the floor gone this is the only thing
+    // standing between a newcomer and the top of the table, so it is pinned on its own rather
+    // than left implied by the ordering tests: Gorgorito12 has ONE rated match and the highest
+    // deviation on the board, and he comes last.
+    assert.equal(byConservative(LIVE).at(-1), 'Gorgorito12');
+
+    // And by raw rating he is third of four - so the discount is doing the work, not the rating.
+    const byRating = [...LIVE].sort((a, b) => b.rating - a.rating).map(r => r.name);
+    assert.equal(byRating.indexOf('Gorgorito12'), 3);
+    assert.ok(conservativeRating(LIVE[3]) < conservativeRating(LIVE[2]));
 });
 
 test('the ladder and its size ask the same question', () => {
