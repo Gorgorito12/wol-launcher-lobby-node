@@ -71,18 +71,19 @@ test('the ORDER BY still discounts the deviation', () => {
     assert.match(LADDER_ORDER_BY, /,\s*e\.user_id ASC\s*$/);
 });
 
-test('five rated matches to be on the ladder, and never fewer than one', () => {
-    // It went 5 -> 1 -> 5. The reason it is back is the rank badge: a place on the table is now
-    // a medal, and a medal is a claim that somebody has shown their level. See MIN_DECIDED.
-    assert.equal(MIN_DECIDED, 5);
+test('one rated match is enough to be on the ladder, and never fewer', () => {
+    // It went 5 -> 1 -> 5 -> 1. Five was there for the rank badges; the launcher now cuts the
+    // ages by a share of the table instead, and the ordering below keeps newcomers down.
+    // See MIN_DECIDED.
+    assert.equal(MIN_DECIDED, 1);
 
     // Still refused, and not a judgement: `elo_ratings` gains a row when applyMatch first runs,
     // so somebody with nothing decided has no rating to rank.
     assert.ok(MIN_DECIDED >= 1, 'a player with no rated match has no rating to rank');
 
-    // On the day's numbers: the three- and one-match players wait; the rest are on the table.
+    // On the day's numbers: everybody who has played is on the table.
     const eligible = LIVE.filter(r => r.games >= MIN_DECIDED).map(r => r.name);
-    assert.deepEqual(eligible.sort(), ['Aluclown', 'Geaf_Argento']);
+    assert.deepEqual(eligible.sort(), LIVE.map(r => r.name).sort());
 });
 
 test('the ordering, not a bar, is what keeps the one-match player down', () => {

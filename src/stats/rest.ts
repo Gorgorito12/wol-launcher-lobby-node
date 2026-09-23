@@ -37,26 +37,23 @@ import type { AppContext } from '../context';
  * maintains — so it counts RATED matches only, and no subquery decides who is eligible. The
  * win/loss tally below stays, but purely to fill the DECIDED column.</p>
  *
- * <p><b>FIVE, and it has now gone 5 → 1 → 5, so read why before moving it again.</b> It was
- * lowered to 1 because a bar is the wrong instrument for keeping a three-match newcomer off
- * the TOP of the table — the `ORDER BY` below does that, and still does: a one-match player
- * carries rd ≈ 290, so `rating - 2*rd` sinks him on his own. That reasoning is unchanged.
- * What changed is what a place on the table MEANS: the launcher now hangs a rank badge off the
- * position (Sovereign for #1, Imperial, Industrial…), and a medal is a claim that somebody has
- * shown their level. With the bar at 1, seven of fourteen names had one or two matches, and
- * the badge ladder read as a lottery. So the table is the players who have proved themselves,
- * and everybody below the bar is shown as the lowest age, "Discovery", in rooms and in the
- * room panel instead of being absent. Five is also the sample the launcher already requires
- * before it publishes a win percentage, so the two agree about what "enough games" is.</p>
+ * <p><b>ONE, and it has now gone 5 → 1 → 5 → 1, so read why before moving it again.</b> It
+ * went back to five because the launcher hangs a rank badge off the position, and with a bar
+ * of one the badges read as a lottery. That objection was answered in the LAUNCHER, not here:
+ * the ages are now cut by a SHARE of the table (top 10 % Sovereign, the next 15 % Imperial,
+ * and so on — `RankAges` there), and the ORDER BY below still sinks a one-match player on his
+ * own (rd ≈ 290, so `rating - 2*rd` puts him last). What five cost was the table itself: a
+ * handful of names out of everybody who plays, and the maintainer asked for everybody.</p>
  *
- * <p>The cost is real and accepted: the table is shorter. It is the maintainer's call, taken
- * with the rank badges; lowering it again means revisiting what the badges promise.</p>
+ * <p>So the bar is back to "has a rating at all". The launcher's win percentage keeps its OWN
+ * sample bar (five decided matches) — that is a different question and no longer borrows this
+ * number.</p>
  *
  * <p>It never goes below 1: `elo_ratings` gains a row when `applyMatch` first runs, so a
  * player with nothing decided has no rating to rank, and the launcher prints this number
  * (`min_decided`).</p>
  */
-export const MIN_DECIDED = 5;
+export const MIN_DECIDED = 1;
 
 /**
  * How good a player is AT LEAST — Glicko-2's conservative estimate, the number the ladder is
