@@ -4,6 +4,7 @@ import { verifyJwt } from '../lib/jwt';
 import { isBanned } from '../middleware/auth';
 import { DEFAULT_RATING, DEFAULT_RD } from '../elo/glicko2';
 import type { AppContext } from '../context';
+import { ladderRanks } from '../stats/rest';
 
 /**
  * Process-wide GLOBAL chat room — a single instance for the whole
@@ -584,7 +585,7 @@ export class GlobalChatRoom {
     private async onlineUsers():
         Promise<{
             userId: string; login: string; avatarUrl: string | null;
-            status: string; rating: number | null;
+            status: string; rating: number | null; rd: number | null; ladderRank?: number;
         }[]> {
         const statusByUser = new Map<string, string>();
         const ratingByUser = new Map<string, number>();
@@ -645,9 +646,18 @@ export class GlobalChatRoom {
             // See above.
         }
 
+        // Each player's place on the 1v1 ladder, for the rank badge in the launcher's players
+        // panel: ONE query for everybody connected, through the same helper the rooms list and
+        // the room use, so the three surfaces cannot disagree about who is 3rd. 0 = not on the
+        // ladder (the Discovery badge); a user missing from the map — the helper failed — is
+        // sent WITHOUT the field, which the launcher reads as "unknown" and draws no badge.
+        const ranks = this.ctx
+            ? await ladderRanks(this.ctx, [...this.attached.values()].map((a) => a.userId))
+            : new Map<string, number>();
+
         const out: {
             userId: string; login: string; avatarUrl: string | null;
-            status: string; rating: number | null; rd: number | null;
+            status: string; rating: number | null; rd: number | null; ladderRank?: number;
         }[] = [];
         for (const a of this.attached.values()) {
             out.push({
@@ -659,6 +669,7 @@ export class GlobalChatRoom {
                 // Same null rule as the rating: a query that threw says nothing about anyone,
                 // and no row means unrated, which is exactly what the default deviation means.
                 rd: ratingsKnown ? (rdByUser.get(a.userId) ?? DEFAULT_RD) : null,
+                ladderRank: ranks.get(a.userId),
             });
         }
         return out;

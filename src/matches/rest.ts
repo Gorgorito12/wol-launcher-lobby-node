@@ -17,7 +17,7 @@ import { sqliteTimestampToMs, normaliseSqliteTimestamp } from '../lib/time';
 import { finalizeRoom } from '../lobbies/discordAnnounce';
 import { advanceTournamentFromMatch } from '../tournaments/advance';
 import { getTournament, loadBracket } from '../tournaments/store';
-import { invalidateCivStatsCaches } from '../stats/rest';
+import { invalidateCivStatsCaches, ladderRanks } from '../stats/rest';
 import type { AppContext } from '../context';
 
 interface ReportMatchBody {
@@ -2246,14 +2246,20 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
         const wins = tally?.wins ?? 0;
         const losses = tally?.losses ?? 0;
 
+        // The player's place on the 1v1 ladder, for the rank badge on the launcher's account
+        // block. Same helper as the rooms list, the room and the players panel. 0 = not on the
+        // ladder; the helper failing leaves it undefined, and JSON then omits the field, which
+        // the launcher reads as "unknown" rather than as Discovery.
+        const ladder_rank = (await ladderRanks(ctx, [userId])).get(userId);
+
         // No row: unrated, which is the starting rating. This endpoint always answered
         // that way — it is where the chip's 1500 comes from — while the rooms list, the
         // presence frame and the room roster sent null for the same player. Same
         // constants everywhere now, so they cannot drift apart again.
         if (!row) return reply.send({
             rating: DEFAULT_RATING, rd: DEFAULT_RD, volatility: DEFAULT_VOLATILITY,
-            games_played: 0, wins, losses,
+            games_played: 0, wins, losses, ladder_rank,
         });
-        return reply.send({ ...row, wins, losses });
+        return reply.send({ ...row, wins, losses, ladder_rank });
     });
 }
