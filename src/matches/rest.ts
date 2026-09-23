@@ -17,7 +17,7 @@ import { sqliteTimestampToMs, normaliseSqliteTimestamp } from '../lib/time';
 import { finalizeRoom } from '../lobbies/discordAnnounce';
 import { advanceTournamentFromMatch } from '../tournaments/advance';
 import { getTournament, loadBracket } from '../tournaments/store';
-import { invalidateCivStatsCaches, ladderRanks } from '../stats/rest';
+import { invalidateCivStatsCaches, ladderRanks, ladderSize } from '../stats/rest';
 import type { AppContext } from '../context';
 
 interface ReportMatchBody {
@@ -2251,6 +2251,12 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
         // ladder; the helper failing leaves it undefined, and JSON then omits the field, which
         // the launcher reads as "unknown" rather than as Discovery.
         const ladder_rank = (await ladderRanks(ctx, [userId])).get(userId);
+        // And how many are on that ladder: the ages are cut by a SHARE of it, so the badge
+        // cannot be drawn from the position alone. Sent here rather than left to the
+        // community-stats payload, which can land after this and has no way to repaint the
+        // account block. Omitted on failure, like the position.
+        let ladder_size: number | undefined;
+        try { ladder_size = await ladderSize(ctx, 'default'); } catch { ladder_size = undefined; }
 
         // No row: unrated, which is the starting rating. This endpoint always answered
         // that way — it is where the chip's 1500 comes from — while the rooms list, the
@@ -2258,8 +2264,8 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
         // constants everywhere now, so they cannot drift apart again.
         if (!row) return reply.send({
             rating: DEFAULT_RATING, rd: DEFAULT_RD, volatility: DEFAULT_VOLATILITY,
-            games_played: 0, wins, losses, ladder_rank,
+            games_played: 0, wins, losses, ladder_rank, ladder_size,
         });
-        return reply.send({ ...row, wins, losses, ladder_rank });
+        return reply.send({ ...row, wins, losses, ladder_rank, ladder_size });
     });
 }

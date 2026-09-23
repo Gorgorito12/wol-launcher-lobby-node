@@ -665,7 +665,7 @@ async function ladder(ctx: AppContext, mode: 'default' | 'team', limit: number) 
  * <p>It shares {@link LADDER_WHERE} with the list itself, which is the only reason the two
  * can be trusted to describe the same set of people.</p>
  */
-async function ladderSize(ctx: AppContext, mode: 'default' | 'team'): Promise<number> {
+export async function ladderSize(ctx: AppContext, mode: 'default' | 'team'): Promise<number> {
     const row = await ctx.db.prepare(
         `SELECT COUNT(*) AS n
          FROM elo_ratings e
