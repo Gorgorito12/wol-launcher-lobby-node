@@ -17,8 +17,8 @@ import type { AppContext } from '../context';
  */
 
 /**
- * Fewest RATED games before a player is on the table. One: the table lists the best by
- * rating, and anybody whose rating has moved has a rating worth listing.
+ * Fewest RATED games before a player is on the table. Five: see the last paragraphs for why it
+ * went back up.
  *
  * <p>It used to be 3, alongside a `rd <= 110` filter, and TOGETHER they left the table empty
  * for a community that had been playing for weeks. The deviation was the one doing it: each
@@ -37,21 +37,26 @@ import type { AppContext } from '../context';
  * maintains — so it counts RATED matches only, and no subquery decides who is eligible. The
  * win/loss tally below stays, but purely to fill the DECIDED column.</p>
  *
- * <p><b>ONE, so the ladder lists everyone who has played a rated match.</b> It was raised to
- * 5 to stop a three-match newcomer sitting first, and that was the wrong instrument: measured
- * against the live table a threshold could not answer it either way — he had exactly 3, so a
- * bar of 3 still crowned him, and 5 left the table with TWO names out of eighteen active
- * players. The `ORDER BY` below is what answers it, and it always was: a one-match player
- * carries rd ≈ 290, so `rating - 2*rd` puts him near 920 and he sinks to the bottom on his own
- * and climbs as the deviation shrinks. A bar was only ever hiding people the ordering had
- * already placed correctly.</p>
+ * <p><b>FIVE, and it has now gone 5 → 1 → 5, so read why before moving it again.</b> It was
+ * lowered to 1 because a bar is the wrong instrument for keeping a three-match newcomer off
+ * the TOP of the table — the `ORDER BY` below does that, and still does: a one-match player
+ * carries rd ≈ 290, so `rating - 2*rd` sinks him on his own. That reasoning is unchanged.
+ * What changed is what a place on the table MEANS: the launcher now hangs a rank badge off the
+ * position (Sovereign for #1, Imperial, Industrial…), and a medal is a claim that somebody has
+ * shown their level. With the bar at 1, seven of fourteen names had one or two matches, and
+ * the badge ladder read as a lottery. So the table is the players who have proved themselves,
+ * and everybody below the bar is shown as the lowest age, "Discovery", in rooms and in the
+ * room panel instead of being absent. Five is also the sample the launcher already requires
+ * before it publishes a win percentage, so the two agree about what "enough games" is.</p>
  *
- * <p>What it still refuses is somebody with NO rated match, which is not a judgement at all:
- * `elo_ratings` gains a row when `applyMatch` first runs, so a player with nothing decided has
- * no rating to rank. Keep this at 1 rather than removing the condition — the launcher prints
- * it (`min_decided`) and a ladder that promised entry at zero would be lying.</p>
+ * <p>The cost is real and accepted: the table is shorter. It is the maintainer's call, taken
+ * with the rank badges; lowering it again means revisiting what the badges promise.</p>
+ *
+ * <p>It never goes below 1: `elo_ratings` gains a row when `applyMatch` first runs, so a
+ * player with nothing decided has no rating to rank, and the launcher prints this number
+ * (`min_decided`).</p>
  */
-export const MIN_DECIDED = 1;
+export const MIN_DECIDED = 5;
 
 /**
  * How good a player is AT LEAST — Glicko-2's conservative estimate, the number the ladder is
@@ -60,8 +65,13 @@ export const MIN_DECIDED = 1;
  *
  * <p>Two, not one: measured on the live table, a single deviation still put the three-match
  * player second instead of third. Two is also what Glicko-2's own write-up recommends.</p>
+ *
+ * <p>The `user_id` tiebreak is load-bearing since {@link ladderRanks} exists. Without it two
+ * players on the same conservative rating came back in whatever order SQLite chose, which was
+ * harmless while the position lived only in the list — and wrong the moment a second query
+ * computes the same position for a room, because the two could disagree about who is 3rd.</p>
  */
-export const LADDER_ORDER_BY = '(e.rating - 2 * e.rd) DESC';
+export const LADDER_ORDER_BY = '(e.rating - 2 * e.rd) DESC, e.user_id ASC';
 
 /**
  * Who is on a ladder at all. SHARED, not copied, by the list and by the count of it.
@@ -77,6 +87,70 @@ export const LADDER_ORDER_BY = '(e.rating - 2 * e.rd) DESC';
 export const LADDER_WHERE = `WHERE e.mode = ?
            AND u.is_banned = 0
            AND e.games_played >= ?`;
+
+/**
+ * A player's position on a ladder, for the surfaces that show a player without showing the
+ * ladder: the rooms list (the host) and the room itself (every member). The launcher turns it
+ * into the rank badge, so it MUST be the same number the table prints next to that player.
+ *
+ * <p>That is why it is a window function over the list's own two constants rather than a
+ * "count who is ahead of me" query: a COUNT would have to restate the WHERE and the ordering
+ * with a second alias, which is the two-copies shape {@link LADDER_WHERE} exists to prevent.
+ * Here the list and the position cannot filter or order differently.</p>
+ *
+ * <p>Binds: mode, MIN_DECIDED, then the user ids.</p>
+ */
+export function ladderRankSql(userCount: number): string {
+    const ids = Array.from({ length: userCount }, () => '?').join(', ');
+    return `WITH ranked AS (
+                SELECT e.user_id AS user_id,
+                       ROW_NUMBER() OVER (ORDER BY ${LADDER_ORDER_BY}) AS ladder_pos
+                FROM elo_ratings e
+                JOIN users u ON u.id = e.user_id
+                ${LADDER_WHERE}
+            )
+            SELECT user_id, ladder_pos FROM ranked WHERE user_id IN (${ids})`;
+}
+
+/**
+ * Positions for a handful of players, in ONE query. A player who is not on the ladder is
+ * mapped to 0, NOT left out: the launcher reads 0 as "below the entry bar" (the Discovery
+ * badge) and a MISSING field as "this server does not know", which draws no badge at all.
+ * Never throws — a room must not fail to open because a badge could not be worked out; on an
+ * error the map is empty and the field is simply omitted.
+ */
+export async function ladderRanks(
+    ctx: AppContext,
+    userIds: string[],
+    mode: 'default' | 'team' = 'default',
+): Promise<Map<string, number>> {
+    const unique = [...new Set(userIds.filter(Boolean))];
+    const out = new Map<string, number>();
+    if (unique.length === 0) return out;
+    try {
+        const rows = await ctx.db.prepare(ladderRankSql(unique.length))
+            .bind(mode, MIN_DECIDED, ...unique)
+            .all<{ user_id: string; ladder_pos: number }>();
+        for (const id of unique) out.set(id, 0);
+        for (const r of rows.results ?? []) out.set(r.user_id, r.ladder_pos);
+    } catch {
+        out.clear();
+    }
+    return out;
+}
+
+/**
+ * The JS mirror of {@link LADDER_ORDER_BY}, tiebreak included, for tests and for anything that
+ * has to explain the order.
+ */
+export function compareLadder(
+    a: { rating: number; rd: number; user_id: string },
+    b: { rating: number; rd: number; user_id: string },
+): number {
+    const diff = (b.rating - 2 * b.rd) - (a.rating - 2 * a.rd);
+    if (diff !== 0) return diff;
+    return a.user_id < b.user_id ? -1 : a.user_id > b.user_id ? 1 : 0;
+}
 
 /**
  * Civilization against civilization, in rated 1v1s. The table a modder balances from: a civ's

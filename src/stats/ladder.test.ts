@@ -15,7 +15,9 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { MIN_DECIDED, LADDER_ORDER_BY, LADDER_WHERE, conservativeRating } from './rest';
+import {
+    MIN_DECIDED, LADDER_ORDER_BY, LADDER_WHERE, conservativeRating, compareLadder, ladderRankSql,
+} from './rest';
 
 /** The live table, the day the rule changed. */
 const LIVE = [
@@ -63,25 +65,24 @@ test('the ORDER BY still discounts the deviation', () => {
     // The query is built from this constant, so reverting it to a plain `e.rating DESC` — the
     // tempting "optimisation", since the index is on (mode, rating DESC) — fails here instead
     // of silently restoring the bug.
-    assert.match(LADDER_ORDER_BY, /e\.rd/);
-    assert.match(LADDER_ORDER_BY, /DESC\s*$/);
+    assert.match(LADDER_ORDER_BY, /^\(e\.rating - 2 \* e\.rd\) DESC/);
+    // And it has a deterministic tiebreak, or the room's position and the table's could name
+    // different players for the same place.
+    assert.match(LADDER_ORDER_BY, /,\s*e\.user_id ASC\s*$/);
 });
 
-test('everyone who has played a rated match is on the ladder', () => {
-    // The bar USED to be 5 and this test asserted the opposite - `MIN_DECIDED >= 2`, "one rated
-    // match should not be enough to appear". That was changed deliberately, not worked around:
-    // the bar was excluding fourteen of eighteen active players to solve a problem the ORDER BY
-    // already solves, and a table nobody is on teaches nobody anything.
-    assert.ok(MIN_DECIDED <= 1, 'a bar hides players the ordering already places correctly');
+test('five rated matches to be on the ladder, and never fewer than one', () => {
+    // It went 5 -> 1 -> 5. The reason it is back is the rank badge: a place on the table is now
+    // a medal, and a medal is a claim that somebody has shown their level. See MIN_DECIDED.
+    assert.equal(MIN_DECIDED, 5);
 
-    // The one thing still refused, and it is not a judgement: `elo_ratings` gains a row when
-    // applyMatch first runs, so somebody with nothing decided has no rating to rank. The
-    // launcher prints this number, so a promise of entry at zero would be a lie.
+    // Still refused, and not a judgement: `elo_ratings` gains a row when applyMatch first runs,
+    // so somebody with nothing decided has no rating to rank.
     assert.ok(MIN_DECIDED >= 1, 'a player with no rated match has no rating to rank');
 
-    // On the live numbers: everybody, including the one-match player the old bar removed.
+    // On the day's numbers: the three- and one-match players wait; the rest are on the table.
     const eligible = LIVE.filter(r => r.games >= MIN_DECIDED).map(r => r.name);
-    assert.deepEqual(eligible.sort(), [...LIVE.map(r => r.name)].sort());
+    assert.deepEqual(eligible.sort(), ['Aluclown', 'Geaf_Argento']);
 });
 
 test('the ordering, not a bar, is what keeps the one-match player down', () => {
@@ -109,4 +110,26 @@ test('the ladder and its size ask the same question', () => {
     // And that it is a WHERE rather than something that would silently splice into the
     // COUNT query, which has no JOINs of its own to hang a condition on.
     assert.match(LADDER_WHERE.trim(), /^WHERE/);
+});
+
+test("the room's position and the table's are the same query", () => {
+    // The rooms row and the room panel show a badge worked out from a position the TABLE never
+    // sent them. If that position came from a second WHERE or a second ORDER BY, a player could
+    // be 3rd in the table and wear the 4th-place badge in a room.
+    const sql = ladderRankSql(3);
+    assert.ok(sql.includes(LADDER_WHERE), 'the position must filter exactly like the list');
+    assert.ok(sql.includes(`ORDER BY ${LADDER_ORDER_BY}`), 'and order exactly like it');
+    assert.match(sql, /ROW_NUMBER\(\)/);
+    assert.match(sql, /IN \(\?, \?, \?\)/);
+});
+
+test('ties are broken by user id, the same way in JS and in SQL', () => {
+    const a = { rating: 1600, rd: 100, user_id: 'b' };
+    const b = { rating: 1600, rd: 100, user_id: 'a' };
+    const c = { rating: 1700, rd: 150, user_id: 'z' }; // same conservative rating, 1400
+    const order = [a, b, c].sort(compareLadder).map(r => r.user_id);
+    assert.deepEqual(order, ['a', 'b', 'z']);
+    // And a better conservative rating still beats the id.
+    const d = { rating: 1601, rd: 100, user_id: 'zz' };
+    assert.equal([a, b, d].sort(compareLadder)[0].user_id, 'zz');
 });

@@ -8,6 +8,7 @@ import { runFoundingHook } from '../matches/foundingHook';
 import { createLobby } from './create';
 import { isEntrantMember } from '../tournaments/store';
 import { DEFAULT_RATING, DEFAULT_RD } from '../elo/glicko2';
+import { ladderRanks } from '../stats/rest';
 import type { AppContext } from '../context';
 
 /**
@@ -134,6 +135,11 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
             host_rd: number | null;
         }>();
 
+        // The hosts' ladder positions, for the rank badge the rooms row draws in place of the
+        // avatar. One query for the whole page, and absent (not 0) when it failed, so the
+        // launcher draws no badge rather than a wrong one.
+        const hostRanks = await ladderRanks(ctx, (rows.results ?? []).map((r) => r.host_user_id));
+
         reply.header('Cache-Control', 'public, max-age=5');
         return reply.send({
             lobbies: (rows.results ?? []).map((r) => ({
@@ -180,6 +186,8 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
                     // landed on, so both read the same. Same default as the rating, for the
                     // same reason — a player with no row is unrated, which is what 350 means.
                     rd: r.host_rd ?? DEFAULT_RD,
+                    // Position on the 1v1 ladder; 0 = below the entry bar (MIN_DECIDED).
+                    ladder_rank: hostRanks.get(r.host_user_id),
                 },
             })),
         });

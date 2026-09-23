@@ -6,6 +6,7 @@ import { notifyRoomChanged, finalizeRoom } from './discordAnnounce';
 import { runFoundingHook } from '../matches/foundingHook';
 import { verifyCrash, normaliseRecordingOutcome, isNtstatusFailure } from '../elo/crashEvidence';
 import { DEFAULT_RATING, DEFAULT_RD } from '../elo/glicko2';
+import { ladderRanks } from '../stats/rest';
 import type { AppContext } from '../context';
 
 /**
@@ -138,6 +139,12 @@ interface MemberEntry {
      */
     rating?: number;
     rd?: number;
+    /**
+     * Position on the 1v1 ladder, for the rank badge in the roster: 0 means below the entry
+     * bar (the Discovery badge), and ABSENT means the lookup failed, which draws no badge at
+     * all. A snapshot at join, like the rating beside it.
+     */
+    ladderRank?: number;
 }
 
 interface ChatLine {
@@ -406,6 +413,8 @@ class LobbyRoom {
         // this.members as-is and member_joined reuses these two.
         const rating = member.rating ?? DEFAULT_RATING;
         const rd = member.rd ?? DEFAULT_RD;
+        // Never throws; undefined when it could not be worked out, so both frames omit it.
+        const ladderRank = (await ladderRanks(ctx, [userId])).get(userId);
 
         const now = Date.now();
         this.attached.set(ws, {
@@ -425,6 +434,7 @@ class LobbyRoom {
             avatarUrl: avatarUrl ?? existing?.avatarUrl,
             rating,
             rd,
+            ladderRank,
         };
 
         this.send(ws, {
@@ -441,6 +451,7 @@ class LobbyRoom {
             avatar_url: avatarUrl,
             rating,
             rd,
+            ladder_rank: ladderRank,
         }, ws);
     }
 
