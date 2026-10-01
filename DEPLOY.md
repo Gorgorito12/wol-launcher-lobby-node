@@ -374,6 +374,9 @@ rooms:prune --older-than <6h>             the same, in bulk
 match:list [--unrated] [--since D] [--limit N]
 match:show <id>                           participants, verdict, confirmations, elo
 match:decide <id> --winner <player>       settle a stuck match, then replay the ladder
+match:decide-team <id> --losers <a,b[,c]>
+                                          rate a stored 2v2/3v3 from its recordings by
+                                          naming the losing side, then replay both ladders
 match:void <id>                           stop it counting, then replay the ladder
 elo:recompute                             replay the ladder; run it alone to self-check
 player:show <player>                      rating, ban state, stale memberships
@@ -401,9 +404,10 @@ is memory-only, so a restart is still the only way.
 ### The corrections, and why they are safe
 
 `applyMatch` has no inverse and nothing snapshots a player's prior rating, so "undo this
-match" cannot be subtracted. `match:decide` and `match:void` instead change the row and
-**replay the whole ladder** from match history, in report order. The result is the ladder as
-though the match had always read the way it now reads.
+match" cannot be subtracted. `match:decide`, `match:decide-team` and `match:void` instead
+change the row and **replay the whole ladder** (both of them, 1v1 and team) from match
+history, in report order. The result is the ladder as though the match had always read the
+way it now reads.
 
 That also repairs a corruption nothing else detects: if anything throws after `applyMatch`
 inside the late-reading path, the rollback there restores the match and participant rows but
@@ -415,12 +419,31 @@ already stored:
 
 ```bash
 sudo -u wol-lobby ./node_modules/.bin/tsx scripts/admin.ts elo:recompute
-# → "(no rating moved)". Anything else means the replay is not faithful;
-#   stop and work out why before using match:decide or match:void.
+# → "(no rating moved)" under both the 1v1 and the team ladder. Anything else means the
+#   replay is not faithful; stop and work out why before using match:decide,
+#   match:decide-team or match:void.
 ```
 
 The dry run of a rating command does the real work on a `VACUUM INTO` snapshot and prints the
-actual movement, so what you see is what `--apply` will do.
+actual movement on both ladders, so what you see is what `--apply` will do.
+
+### Rating a team match by hand
+
+`match:decide-team` is for a 2v2 or 3v3 that was stored but never rated because the launcher
+could not read the sides (every player on team 0 with a 0.5, `unrated_reason = 'not_1v1'`),
+and whose result you have **read out of the recordings yourself**. Name the losing side;
+everyone else in the match is the winning side. It refuses, and writes nothing, unless the
+match has 4 or 6 players and the losers are exactly half of them, all different and all in the
+match. Otherwise it writes the sides and results, marks the match rated on the team ladder
+(`rating_mode = 'team'`, `decided_by = 'operator'`) and replays both ladders. **Dry-run it
+first**: the dry run prints the real movement, and the 1v1 ladder should read
+`(no rating moved)`. Like `match:decide`, it moves ratings only; a tournament bracket waiting
+on that match does not advance.
+
+```bash
+sudo -u wol-lobby ./node_modules/.bin/tsx scripts/admin.ts match:decide-team <id> --losers "<p1>,<p2>"
+sudo -u wol-lobby ./node_modules/.bin/tsx scripts/admin.ts match:decide-team <id> --losers "<p1>,<p2>" --apply
+```
 
 There is also a harness, which needs the dev dependencies:
 

@@ -637,6 +637,12 @@ async function ladder(ctx: AppContext, mode: 'default' | 'team', limit: number) 
         topCivs = topCivsFor(civRows.results ?? []);
     }
 
+    // Each player's place on the OTHER ladder (design handoff 51a): a badge's tooltip always
+    // names the other badge — "#2 in the teams ladder · 1v1: Industrial #5" — so a 1v1 row
+    // carries its team position and a team row its 1v1 one. One batched query for the page;
+    // the field is omitted on failure, which the launcher reads as "unknown".
+    const other = await ladderRanks(ctx, players.map((p) => p.id), mode === 'team' ? 'default' : 'team');
+
     // The rank is decided HERE, by the same ordering that produced the list. A client
     // filtering its copy must not renumber: the third row is the third player, not the
     // third thing that survived the client's own filter.
@@ -652,6 +658,9 @@ async function ladder(ctx: AppContext, mode: 'default' | 'team', limit: number) 
         wins: r.wins,
         losses: r.losses,
         top_civs: topCivs.get(r.id) ?? [],
+        ...(mode === 'team'
+            ? { ladder_rank: other.get(r.id) }
+            : { ladder_rank_team: other.get(r.id) }),
     }));
 }
 

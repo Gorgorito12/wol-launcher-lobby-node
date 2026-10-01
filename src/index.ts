@@ -23,6 +23,7 @@ import { registerMatchesRest } from './matches/rest';
 import { registerStatsRest } from './stats/rest';
 import { registerTournamentsRest } from './tournaments/rest';
 import { registerTeamsRest } from './teams/rest';
+import { registerUsersRest } from './users/rest';
 import { sweepStaleTournaments } from './tournaments/sweep';
 import { registerReplaysRest } from './replays/rest';
 
@@ -183,11 +184,13 @@ async function main(): Promise<void> {
     registerStatsRest(app, ctx);
     registerTournamentsRest(app, ctx);
     registerTeamsRest(app, ctx);
+    registerUsersRest(app, ctx);
 
     // /me — current user + ELO snapshot. Requires auth.
     app.get('/me', { preHandler: [requireAuth()] }, async (req, _reply) => {
         const u = await db.prepare(
             `SELECT u.id, u.discord_username, u.display_name, u.avatar_url, u.created_at,
+                    u.badge_mode,
                     e.rating, e.rd, e.games_played
              FROM users u
              LEFT JOIN elo_ratings e ON e.user_id = u.id AND e.mode = 'default'

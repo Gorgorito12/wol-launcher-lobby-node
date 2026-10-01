@@ -5,6 +5,7 @@ import { isBanned } from '../middleware/auth';
 import { DEFAULT_RATING, DEFAULT_RD } from '../elo/glicko2';
 import type { AppContext } from '../context';
 import { ladderRanks } from '../stats/rest';
+import { badgeModes, type BadgeMode } from '../users/badgeMode';
 
 /**
  * Process-wide GLOBAL chat room — a single instance for the whole
@@ -586,6 +587,8 @@ export class GlobalChatRoom {
         Promise<{
             userId: string; login: string; avatarUrl: string | null;
             status: string; rating: number | null; rd: number | null; ladderRank?: number;
+            ratingTeam: number | null; rdTeam: number | null; ladderRankTeam?: number;
+            badgeMode?: string;
         }[]> {
         const statusByUser = new Map<string, string>();
         const ratingByUser = new Map<string, number>();
@@ -620,18 +623,28 @@ export class GlobalChatRoom {
         // a player we failed to look up.
         let ratingsKnown = false;
         const rdByUser = new Map<string, number>();
+        // The TEAM ladder's pair (design handoff 51): the panel's number follows the badge it
+        // draws, so a player showing the team badge shows the team rating. Same query, both
+        // modes, keyed apart.
+        const ratingTeamByUser = new Map<string, number>();
+        const rdTeamByUser = new Map<string, number>();
         try {
             const ids = [...new Set([...this.attached.values()].map((a) => a.userId))];
             if (this.ctx && ids.length > 0) {
                 const placeholders = ids.map(() => '?').join(',');
                 const rows = await this.ctx.db
                     .prepare(
-                        `SELECT user_id, rating, rd FROM elo_ratings
-                         WHERE mode = 'default' AND user_id IN (${placeholders})`,
+                        `SELECT user_id, mode, rating, rd FROM elo_ratings
+                         WHERE mode IN ('default', 'team') AND user_id IN (${placeholders})`,
                     )
                     .bind(...ids)
-                    .all<{ user_id: string; rating: number; rd: number }>();
+                    .all<{ user_id: string; mode: string; rating: number; rd: number }>();
                 for (const r of rows.results) {
+                    if (r.mode === 'team') {
+                        ratingTeamByUser.set(r.user_id, r.rating);
+                        rdTeamByUser.set(r.user_id, r.rd);
+                        continue;
+                    }
                     ratingByUser.set(r.user_id, r.rating);
                     // The deviation goes with the rating, and without it the number is
                     // ambiguous: the client could not tell a 1500 nobody has played for from
@@ -651,13 +664,26 @@ export class GlobalChatRoom {
         // the room use, so the three surfaces cannot disagree about who is 3rd. 0 = not on the
         // ladder (the Discovery badge); a user missing from the map — the helper failed — is
         // sent WITHOUT the field, which the launcher reads as "unknown" and draws no badge.
+        const connectedIds = [...this.attached.values()].map((a) => a.userId);
         const ranks = this.ctx
-            ? await ladderRanks(this.ctx, [...this.attached.values()].map((a) => a.userId))
+            ? await ladderRanks(this.ctx, connectedIds)
             : new Map<string, number>();
+        // The team ladder and the badge preference, for the badge each player CHOSE (design
+        // handoff 51b-51c). Read here rather than cached on the socket for the reason the
+        // ratings are: a preference changed mid-session must show on the next broadcast, and
+        // POST /me/badge-mode calls refreshPlayers() to cause one.
+        const teamRanks = this.ctx
+            ? await ladderRanks(this.ctx, connectedIds, 'team')
+            : new Map<string, number>();
+        const modes = this.ctx
+            ? await badgeModes(this.ctx, connectedIds)
+            : new Map<string, BadgeMode>();
 
         const out: {
             userId: string; login: string; avatarUrl: string | null;
             status: string; rating: number | null; rd: number | null; ladderRank?: number;
+            ratingTeam: number | null; rdTeam: number | null; ladderRankTeam?: number;
+            badgeMode?: string;
         }[] = [];
         for (const a of this.attached.values()) {
             out.push({
@@ -670,6 +696,10 @@ export class GlobalChatRoom {
                 // and no row means unrated, which is exactly what the default deviation means.
                 rd: ratingsKnown ? (rdByUser.get(a.userId) ?? DEFAULT_RD) : null,
                 ladderRank: ranks.get(a.userId),
+                ratingTeam: ratingsKnown ? (ratingTeamByUser.get(a.userId) ?? DEFAULT_RATING) : null,
+                rdTeam: ratingsKnown ? (rdTeamByUser.get(a.userId) ?? DEFAULT_RD) : null,
+                ladderRankTeam: teamRanks.get(a.userId),
+                badgeMode: modes.get(a.userId),
             });
         }
         return out;

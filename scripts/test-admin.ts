@@ -16,8 +16,8 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { Db } from '../src/db';
-import { applyMatch } from '../src/elo/glicko2';
-import { recomputeLadder, readRatings } from './admin';
+import { applyMatch, DEFAULT_RATING } from '../src/elo/glicko2';
+import { decideTeamMatch, recomputeLadder, readRatings, type TeamRefusal } from './admin';
 
 let failures = 0;
 
@@ -119,6 +119,59 @@ async function seed(): Promise<Seeded> {
     }
 
     return { db, dir };
+}
+
+/** A signed-up player: the user row and the 1v1 rating row signup creates. */
+async function addUser(db: Db, id: string, name: string): Promise<void> {
+    await db.prepare(
+        `INSERT INTO users (id, discord_id, discord_username, display_name) VALUES (?, ?, ?, ?)`,
+    ).bind(id, `d-${id}`, name, name).run();
+    await db.prepare(
+        `INSERT INTO elo_ratings (user_id, mode) VALUES (?, 'default')`,
+    ).bind(id).run();
+}
+
+/**
+ * A 2v2 or 3v3 stored the way POST /matches stores one whose sides the launcher could not
+ * read: everybody on team 0 with a 0.5, refused `not_1v1`, and `rating_mode = 'default'`,
+ * because a shape the server refuses is filed under the 1v1 ladder.
+ */
+async function addUnreadTeamMatch(db: Db, id: string, players: string[], at: string): Promise<void> {
+    await db.prepare(
+        `INSERT INTO matches (id, lobby_id, host_user_id, mod_id, mod_combined_hash,
+                              map_name, duration_seconds, started_at, ended_at, created_at,
+                              rated, unrated_reason, rating_mode)
+         VALUES (?, NULL, ?, 'wol', 'h', 'test_map', 1200, ?, ?, ?, 0, 'not_1v1', 'default')`,
+    ).bind(id, players[0], at, at, at).run();
+    for (const u of players) {
+        await db.prepare(
+            `INSERT INTO match_participants (match_id, user_id, team, result) VALUES (?, ?, 0, 0.5)`,
+        ).bind(id, u).run();
+    }
+}
+
+/** Every row a decision could write, in a fixed order. Equal before and after = nothing written. */
+async function stateOf(db: Db): Promise<string> {
+    const read = async (sql: string): Promise<unknown[]> => (await db.prepare(sql).bind().all()).results;
+    return JSON.stringify([
+        await read(`SELECT * FROM matches ORDER BY id`),
+        await read(`SELECT * FROM match_participants ORDER BY match_id, user_id`),
+        await read(`SELECT * FROM elo_ratings ORDER BY user_id, mode`),
+    ]);
+}
+
+/** The same ladder to the last bit (rating, deviation and games), for "exactly unchanged". */
+function identicalLadder(a: Map<string, { rating: number; rd: number; games_played: number }>,
+                         b: Map<string, { rating: number; rd: number; games_played: number }>): string | null {
+    if (a.size !== b.size) return `size ${a.size} vs ${b.size}`;
+    for (const [id, ra] of a) {
+        const rb = b.get(id);
+        if (!rb) return `${id} missing`;
+        if (ra.rating !== rb.rating || ra.rd !== rb.rd || ra.games_played !== rb.games_played) {
+            return `${id} ${ra.rating}/${ra.rd}/${ra.games_played} vs ${rb.rating}/${rb.rd}/${rb.games_played}`;
+        }
+    }
+    return null;
 }
 
 async function main(): Promise<void> {
@@ -242,6 +295,147 @@ async function main(): Promise<void> {
             'a player who never played keeps a row at the default rating',
             after.has('u-z') && Math.abs(after.get('u-z')!.rating - 1500) < 0.05
             && after.get('u-z')!.games_played === 0,
+        );
+        db.close();
+        rmSync(dir, { recursive: true, force: true });
+    }
+
+    // ---- 6. a 2v2 the launcher could not read is rated by hand ----------------------
+    {
+        const { db, dir } = await seed();
+        await addUser(db, 'u-d', 'dani');
+        // Between m1 and m2 in report order, so the replay interleaves it with the 1v1s —
+        // which is exactly what "the 1v1 ladder is unchanged" below has to survive.
+        const four = ['u-a', 'u-b', 'u-c', 'u-d'];
+        await addUnreadTeamMatch(db, 't1', four, '2026-08-01 10:02:30');
+
+        const soloBefore = await readRatings(db);
+        const teamBefore = await readRatings(db, 'team');
+
+        const d = await decideTeamMatch(db, 't1', ['u-c', 'u-d']);
+        check('a 2v2 with its losing side named is decided', d.ok, d.ok ? '' : d.error);
+        check(
+            'the winners are everyone in the match who was not named',
+            d.ok && d.winners.map((p) => p.userId).join() === 'u-a,u-b'
+            && d.losers.map((p) => p.userId).join() === 'u-c,u-d',
+        );
+
+        const row = await db.prepare(
+            `SELECT rated, unrated_reason, rating_mode, decided_by FROM matches WHERE id = 't1'`,
+        ).bind().first<{ rated: number; unrated_reason: string | null; rating_mode: string; decided_by: string }>();
+        check(
+            'the match is stored rated, on the team ladder, decided by the operator',
+            row?.rated === 1 && row.unrated_reason === null
+            && row.rating_mode === 'team' && row.decided_by === 'operator',
+            JSON.stringify(row),
+        );
+
+        const sides = await db.prepare(
+            `SELECT user_id, team, result FROM match_participants WHERE match_id = 't1' ORDER BY user_id`,
+        ).bind().all<{ user_id: string; team: number; result: number }>();
+        check(
+            'winners are team 0 with 1.0 and losers team 1 with 0.0',
+            (sides.results ?? []).map((p) => `${p.user_id}:${p.team}:${p.result}`).join()
+            === 'u-a:0:1,u-b:0:1,u-c:1:0,u-d:1:0',
+            JSON.stringify(sides.results),
+        );
+
+        const { matches } = await recomputeLadder(db);
+        const solo = await readRatings(db);
+        const team = await readRatings(db, 'team');
+
+        check('the replay counts it as a rated match', matches === 4, `got ${matches}`);
+        check(
+            'all four have a team rating with one game, and nobody else does',
+            team.size === 4 && four.every((id) => team.get(id)?.games_played === 1),
+            [...team.keys()].join(),
+        );
+        // NaN for a missing row, so a player who never reached the team ladder FAILs the
+        // comparison instead of crashing the harness before the checks after it can run.
+        const start = (id: string): number => teamBefore.get(id)?.rating ?? DEFAULT_RATING;
+        const now = (id: string): number => team.get(id)?.rating ?? NaN;
+        const moves = (ids: string[]): string =>
+            ids.map((id) => `${id} ${start(id)} -> ${now(id).toFixed(1)}`).join('; ');
+        check(
+            'the winners end above where they started on the team ladder',
+            ['u-a', 'u-b'].every((id) => now(id) > start(id)),
+            moves(['u-a', 'u-b']),
+        );
+        check(
+            'the losers end below where they started on the team ladder',
+            ['u-c', 'u-d'].every((id) => now(id) < start(id)),
+            moves(['u-c', 'u-d']),
+        );
+        const drift = identicalLadder(soloBefore, solo);
+        check('the 1v1 ladder is exactly unchanged', drift === null, drift ?? '');
+
+        const stamps = await db.prepare(
+            `SELECT rating_before, rating_after FROM match_participants WHERE match_id = 't1'`,
+        ).bind().all<{ rating_before: number | null; rating_after: number | null }>();
+        check(
+            'the match carries the team ratings the replay gave it',
+            (stamps.results ?? []).length === 4
+            && (stamps.results ?? []).every((s) => s.rating_before !== null && s.rating_after !== null),
+        );
+        db.close();
+        rmSync(dir, { recursive: true, force: true });
+    }
+
+    // ---- 7. every refusal writes nothing ---------------------------------------------
+    {
+        const { db, dir } = await seed();
+        await addUser(db, 'u-d', 'dani');
+        await addUser(db, 'u-z', 'zoe');   // signed up, never in the match below
+        await addUnreadTeamMatch(db, 't1', ['u-a', 'u-b', 'u-c', 'u-d'], '2026-08-01 10:02:30');
+
+        const cases: Array<[string, string, string[], TeamRefusal]> = [
+            ['one loser named for a 2v2', 't1', ['u-c'], 'wrong_loser_count'],
+            ['three losers named for a 2v2', 't1', ['u-b', 'u-c', 'u-d'], 'wrong_loser_count'],
+            // Two names, so only the "did they play" rule can refuse it.
+            ['a loser who did not play', 't1', ['u-c', 'u-z'], 'did_not_play'],
+            ['the same loser named twice', 't1', ['u-c', 'u-c'], 'named_twice'],
+            ['a 2-player match', 'm1', ['u-b'], 'not_a_team_match'],
+            ['a match that does not exist', 'nope', ['u-c', 'u-d'], 'no_match'],
+        ];
+        for (const [label, matchId, losers, reason] of cases) {
+            const before = await stateOf(db);
+            const d = await decideTeamMatch(db, matchId, losers);
+            const untouched = before === await stateOf(db);
+            const refusedRight = !d.ok && d.reason === reason;
+            check(
+                `refused, and nothing written: ${label}`,
+                refusedRight && untouched,
+                !refusedRight
+                    ? (d.ok ? 'it was decided' : `refused as ${d.reason}: ${d.error}`)
+                    : untouched ? '' : 'the database changed',
+            );
+        }
+        db.close();
+        rmSync(dir, { recursive: true, force: true });
+    }
+
+    // ---- 8. a 3v3 is decided the same way -----------------------------------------------
+    {
+        const { db, dir } = await seed();
+        for (const [id, name] of [['u-d', 'dani'], ['u-e', 'eli'], ['u-f', 'fede']] as Array<[string, string]>) {
+            await addUser(db, id, name);
+        }
+        const six = ['u-a', 'u-b', 'u-c', 'u-d', 'u-e', 'u-f'];
+        await addUnreadTeamMatch(db, 't3', six, '2026-08-01 10:04:00');
+
+        const short = await decideTeamMatch(db, 't3', ['u-e', 'u-f']);
+        check('a 3v3 refuses two losers', !short.ok && short.reason === 'wrong_loser_count');
+
+        const d = await decideTeamMatch(db, 't3', ['u-d', 'u-e', 'u-f']);
+        check('a 3v3 with its losing side named is decided', d.ok, d.ok ? '' : d.error);
+        await recomputeLadder(db);
+        const team = await readRatings(db, 'team');
+        check(
+            'all six land on the team ladder, the winners above the start and the losers below',
+            team.size === 6
+            && ['u-a', 'u-b', 'u-c'].every((id) => (team.get(id)?.rating ?? NaN) > DEFAULT_RATING)
+            && ['u-d', 'u-e', 'u-f'].every((id) => (team.get(id)?.rating ?? NaN) < DEFAULT_RATING),
+            six.map((id) => `${id} ${team.get(id)?.rating.toFixed(1) ?? '-'}`).join('; '),
         );
         db.close();
         rmSync(dir, { recursive: true, force: true });

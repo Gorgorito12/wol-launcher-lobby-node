@@ -147,6 +147,14 @@ export const Errors = {
         'not_team_captain',
         'Only the captain of this team can do that.',
     ),
+    // Choosing the Teams badge without a place on the team ladder: there is no team rank to
+    // wear yet. The launcher disables the option and says why; this is the server's refusal for
+    // a client that did not.
+    TeamBadgeLocked:  () => new HttpError(
+        409,
+        'team_badge_locked',
+        'Play a rated team match to unlock the Teams badge.',
+    ),
     Conflict:        (msg: string) => new HttpError(409, 'conflict', msg),
     Internal:        (msg = 'Unexpected server error.') =>
         new HttpError(500, 'internal', msg),

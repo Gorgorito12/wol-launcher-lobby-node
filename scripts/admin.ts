@@ -42,6 +42,7 @@ import {
     DEFAULT_RD,
     DEFAULT_VOLATILITY,
     type ParticipantOutcome,
+    type RatingMode,
 } from '../src/elo/glicko2';
 import * as tourn from './adminTournaments';
 
@@ -238,12 +239,20 @@ interface RatingRow {
     display_name: string | null;
 }
 
-export async function readRatings(db: Db): Promise<Map<string, RatingRow>> {
+/**
+ * One ladder, keyed by user id. `default` is the 1v1 ladder and `team` the one 2v2 and 3v3
+ * share (migration 0010). It defaults to 1v1 because that was the only ladder when every
+ * existing caller was written, and `scripts/test-admin.ts` relies on that.
+ */
+export async function readRatings(
+    db: Db,
+    mode: RatingMode = 'default',
+): Promise<Map<string, RatingRow>> {
     const rows = await db.prepare(
         `SELECT e.user_id, e.rating, e.rd, e.games_played, u.display_name
            FROM elo_ratings e LEFT JOIN users u ON u.id = e.user_id
-          WHERE e.mode = 'default'`,
-    ).bind().all<RatingRow>();
+          WHERE e.mode = ?`,
+    ).bind(mode).all<RatingRow>();
     const map = new Map<string, RatingRow>();
     for (const r of rows.results ?? []) map.set(r.user_id, r);
     return map;
@@ -270,9 +279,20 @@ function printRatingDiff(before: Map<string, RatingRow>, after: Map<string, Rati
     return moved;
 }
 
+/** Both ladders, in the order they are printed, under the names an operator uses for them. */
+const LADDERS: ReadonlyArray<{ mode: RatingMode; label: string }> = [
+    { mode: 'default', label: '1v1 ladder' },
+    { mode: 'team', label: 'team ladder' },
+];
+
 /**
  * Perform a rating-moving change: on a snapshot when this is a dry run, on the real database
  * when it is not. Either way the operator sees the actual movement before or as it happens.
+ *
+ * <p>Diffs BOTH ladders, because `recomputeLadder` rebuilds both. A diff of the 1v1 ladder
+ * alone printed "(no rating moved)" for a team decision, whose entire effect is on the other
+ * ladder. Each one is printed even when nothing moved on it: "1v1 ladder: (no rating moved)"
+ * after a team decision is the confirmation that it touched nothing else.</p>
  */
 async function withRatingChange(
     dbPath: string,
@@ -280,15 +300,18 @@ async function withRatingChange(
     mutate: (db: Db) => Promise<boolean>,
 ): Promise<void> {
     const run = async (db: Db, real: boolean): Promise<void> => {
-        const before = await readRatings(db);
+        const before: Map<string, RatingRow>[] = [];
+        for (const l of LADDERS) before.push(await readRatings(db, l.mode));
         const ok = await mutate(db);
         if (!ok) return;
         const { matches } = await recomputeLadder(db);
-        const after = await readRatings(db);
 
         console.log(`Ladder replayed from ${matches} rated match(es).`);
-        const moved = printRatingDiff(before, after);
-        if (moved === 0) console.log('  (no rating moved)');
+        for (const [i, l] of LADDERS.entries()) {
+            console.log(`${l.label}:`);
+            const moved = printRatingDiff(before[i]!, await readRatings(db, l.mode));
+            if (moved === 0) console.log('  (no rating moved)');
+        }
         console.log(
             real
                 ? `Done — ${label}.`
@@ -712,7 +735,10 @@ async function cmdMatchDecide(dbPath: string): Promise<void> {
         const rows = parts.results ?? [];
 
         if (rows.length !== 2) {
-            console.log(`Match has ${rows.length} participants — only a 1v1 can be decided here.`);
+            console.log(
+                `Match has ${rows.length} participants — only a 1v1 can be decided here.`
+                + (rows.length === 4 || rows.length === 6
+                    ? ' For a 2v2 or 3v3 use match:decide-team.' : ''));
             return false;
         }
         if (!rows.some((p) => p.user_id === user.id)) {
@@ -730,6 +756,189 @@ async function cmdMatchDecide(dbPath: string): Promise<void> {
                 `UPDATE match_participants SET result = ? WHERE match_id = ? AND user_id = ?`,
             ).bind(p.user_id === user.id ? 1.0 : 0.0, id, p.user_id)),
         ]);
+        return true;
+    });
+}
+
+/** A player as {@link decideTeamMatch} reports them: the id it wrote, the name an operator reads. */
+export interface TeamDecisionPlayer {
+    userId: string;
+    displayName: string;
+}
+
+/** Which rule refused, so a test can tell that the INTENDED rule fired and not an earlier one. */
+export type TeamRefusal =
+    | 'no_match'
+    | 'not_a_team_match'
+    | 'named_twice'
+    | 'did_not_play'
+    | 'wrong_loser_count';
+
+/** What {@link decideTeamMatch} wrote, or why it refused. A refusal has written nothing. */
+export type TeamDecision =
+    | { ok: false; reason: TeamRefusal; error: string }
+    | {
+        ok: true;
+        matchId: string;
+        winners: TeamDecisionPlayer[];
+        losers: TeamDecisionPlayer[];
+        /** The row as it stood before, so the command can say what it overrode. */
+        was: {
+            rated: number | null;
+            unratedReason: string | null;
+            ratingMode: string | null;
+            decidedBy: string | null;
+        };
+    };
+
+/**
+ * Turn a stored 2v2 or 3v3 into a rated team match, from a result an operator read off the
+ * recordings. Writes the sides, the results and the rating state; the caller replays the
+ * ladder.
+ *
+ * <p><b>Why it exists.</b> A team match whose sides the launcher failed to read arrives with
+ * every participant on team 0 and a 0.5, and is stored `not_1v1`: one side, so no shape the
+ * server rates. Nothing rates it afterwards. `match:decide` takes 1v1s only, and
+ * `maybeRateAwaitingTeamMatch` only releases matches stored `awaiting_confirmation`, whose
+ * sides are already known.</p>
+ *
+ * <p><b>Why the LOSERS are named.</b> A recording names the losing side, and with exactly two
+ * sides that decides the other one. So the input is the thing the operator actually read. The
+ * winners are everyone else in the match.</p>
+ *
+ * <p>Team 0 is the winners and team 1 the losers. The numbers mean nothing beyond being
+ * different: `applyMatch` only compares them, and `matchShape` counts two equal sides.
+ * `rating_mode = 'team'` is what sends the match to the team ladder in the replay; left at
+ * 'default', a four-player match would be fed to the 1v1 ladder.</p>
+ *
+ * <p>Every write happens in one batch, which `Db.batch` runs as one transaction, so it either
+ * all lands or none of it does. A refusal reads and nothing else.</p>
+ */
+export async function decideTeamMatch(
+    db: Db,
+    matchId: string,
+    loserUserIds: readonly string[],
+): Promise<TeamDecision> {
+    const refuse = (reason: TeamRefusal, error: string): TeamDecision =>
+        ({ ok: false, reason, error });
+
+    const m = await db.prepare(
+        `SELECT rated, unrated_reason, rating_mode, decided_by FROM matches WHERE id = ?`,
+    ).bind(matchId).first<{
+        rated: number | null;
+        unrated_reason: string | null;
+        rating_mode: string | null;
+        decided_by: string | null;
+    }>();
+    if (!m) return refuse('no_match', `No match '${matchId}'.`);
+
+    const parts = await db.prepare(
+        `SELECT p.user_id, COALESCE(u.display_name, p.user_id) AS display_name
+           FROM match_participants p LEFT JOIN users u ON u.id = p.user_id
+          WHERE p.match_id = ?
+          ORDER BY p.user_id`,
+    ).bind(matchId).all<{ user_id: string; display_name: string }>();
+    const players = parts.results ?? [];
+
+    if (players.length !== 4 && players.length !== 6) {
+        return refuse('not_a_team_match', players.length === 2
+            ? `Match has 2 participants — that is a 1v1; use match:decide.`
+            : `Match has ${players.length} participant(s) — only a 2v2 (4) or a 3v3 (6) can be decided here.`);
+    }
+
+    const inMatch = new Map(players.map((p) => [p.user_id, p.display_name] as [string, string]));
+    const nameOf = async (userId: string): Promise<string> => {
+        const known = inMatch.get(userId);
+        if (known !== undefined) return known;
+        const u = await db.prepare(`SELECT display_name FROM users WHERE id = ?`)
+            .bind(userId).first<{ display_name: string }>();
+        return u?.display_name ?? userId;
+    };
+
+    // Distinct first. Two names for one person (an id and a display name, say) would
+    // otherwise count as two losers and pass the count check below.
+    const losers = new Set<string>();
+    for (const id of loserUserIds) {
+        if (losers.has(id)) {
+            return refuse('named_twice', `${await nameOf(id)} is named twice among the losers.`);
+        }
+        losers.add(id);
+    }
+
+    const outsiders = [...losers].filter((id) => !inMatch.has(id));
+    if (outsiders.length > 0) {
+        const names: string[] = [];
+        for (const id of outsiders) names.push(await nameOf(id));
+        return refuse('did_not_play', `${names.join(', ')} did not play in this match.`);
+    }
+
+    const perSide = players.length / 2;
+    if (losers.size !== perSide) {
+        return refuse('wrong_loser_count',
+            `${losers.size} loser(s) named — a ${perSide}v${perSide} needs exactly ${perSide}.`);
+    }
+
+    await db.batch([
+        db.prepare(
+            `UPDATE matches SET rated = 1, unrated_reason = NULL, rating_mode = 'team',
+                                decided_by = 'operator'
+              WHERE id = ?`,
+        ).bind(matchId),
+        ...players.map((p) => {
+            const lost = losers.has(p.user_id);
+            return db.prepare(
+                `UPDATE match_participants SET team = ?, result = ? WHERE match_id = ? AND user_id = ?`,
+            ).bind(lost ? 1 : 0, lost ? 0.0 : 1.0, matchId, p.user_id);
+        }),
+    ]);
+
+    const pick = (lost: boolean): TeamDecisionPlayer[] => players
+        .filter((p) => losers.has(p.user_id) === lost)
+        .map((p) => ({ userId: p.user_id, displayName: p.display_name }));
+
+    return {
+        ok: true,
+        matchId,
+        winners: pick(false),
+        losers: pick(true),
+        was: {
+            rated: m.rated,
+            unratedReason: m.unrated_reason,
+            ratingMode: m.rating_mode,
+            decidedBy: m.decided_by,
+        },
+    };
+}
+
+/**
+ * Rate a stored 2v2 or 3v3 by naming its losing side, then replay both ladders. See
+ * {@link decideTeamMatch} for the rules. Players are given comma-separated; use the id for
+ * anyone whose display name contains a comma.
+ */
+async function cmdMatchDecideTeam(dbPath: string): Promise<void> {
+    const id = positionals()[0];
+    const raw = flag('losers');
+    if (!id || !raw) {
+        console.log('Usage: match:decide-team <matchId> --losers <p1,p2[,p3]> [--apply]');
+        return;
+    }
+    const needles = raw.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
+
+    await withRatingChange(dbPath, `match ${id} decided as a team match`, async (db) => {
+        const loserIds: string[] = [];
+        for (const needle of needles) {
+            const user = await findUser(db, needle);
+            if (!user) return false;   // findUser has already said why.
+            loserIds.push(user.id);
+        }
+
+        const d = await decideTeamMatch(db, id, loserIds);
+        if (!d.ok) { console.log(d.error); return false; }
+
+        const names = (ps: TeamDecisionPlayer[]): string => ps.map((p) => p.displayName).join(', ');
+        const was = d.was.unratedReason
+            ?? (d.was.rated === 1 ? 'rated' : d.was.rated === 0 ? 'unrated' : 'unknown');
+        console.log(`Match ${id}: winners ${names(d.winners)}; losers ${names(d.losers)}; was '${was}'.`);
         return true;
     });
 }
@@ -917,6 +1126,9 @@ function usage(): void {
   match:list [--unrated] [--since D] [--limit N]
   match:show <id>                           participants, verdict, confirmations, elo
   match:decide <id> --winner <player>       settle a stuck match, then replay the ladder
+  match:decide-team <id> --losers <a,b[,c]>
+                                            rate a stored 2v2/3v3 from its recordings by
+                                            naming the losing side, then replay both ladders
   match:void <id>                           stop it counting, then replay the ladder
   elo:recompute                             replay the ladder; run it alone to self-check
   player:show <player>                      rating, ban state, stale memberships
@@ -942,7 +1154,7 @@ function cli(): tourn.CliCtx {
 const KNOWN = new Set([
     'status',
     'rooms:list', 'rooms:close', 'rooms:prune',
-    'match:list', 'match:show', 'match:decide', 'match:void',
+    'match:list', 'match:show', 'match:decide', 'match:decide-team', 'match:void',
     'elo:recompute',
     'player:show', 'player:history', 'player:reset',
     'versions',
@@ -965,6 +1177,7 @@ async function main(): Promise<void> {
     // The rating commands manage their own connection: a dry run has to open a snapshot
     // instead of the real database, and that decision belongs to them.
     if (COMMAND === 'match:decide') return cmdMatchDecide(dbPath);
+    if (COMMAND === 'match:decide-team') return cmdMatchDecideTeam(dbPath);
     if (COMMAND === 'match:void') return cmdMatchVoid(dbPath);
     if (COMMAND === 'elo:recompute') return cmdEloRecompute(dbPath);
     if (COMMAND === 'player:reset') return cmdPlayerReset(dbPath);

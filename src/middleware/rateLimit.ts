@@ -195,4 +195,8 @@ export const Limits = {
     LobbyCreateUser:  { scope: 'lcreate-u', keyKind: 'user', perMinute: 10,  perDay: 100  } as const,
     LobbyJoinUser:    { scope: 'ljoin-u',   keyKind: 'user', perMinute: 50,  perDay: 200  } as const,
     ReportUser:       { scope: 'report-u',  keyKind: 'user', perMinute: 5,   perDay: 20   } as const,
+    // The badge-mode switch in the profile. A user setting clicked by hand, by USER like the
+    // writes above; generous per minute because somebody trying the three options clicks
+    // three times in a row, small per day because nothing legitimate changes it often.
+    BadgeModeUser:    { scope: 'badge-u',   keyKind: 'user', perMinute: 20,  perDay: 200  } as const,
 } satisfies Record<string, RateLimitRule>;

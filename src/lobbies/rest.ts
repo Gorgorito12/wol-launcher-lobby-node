@@ -9,6 +9,7 @@ import { createLobby } from './create';
 import { isEntrantMember } from '../tournaments/store';
 import { DEFAULT_RATING, DEFAULT_RD } from '../elo/glicko2';
 import { ladderRanks } from '../stats/rest';
+import { normalizeBadgeMode } from '../users/badgeMode';
 import type { AppContext } from '../context';
 
 /**
@@ -102,7 +103,9 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
                     (SELECT COUNT(*) FROM lobby_members m
                       WHERE m.lobby_id = l.id AND m.role = 'spectator') AS spectators_present,
                     l.created_at, u.discord_username AS host_login, u.display_name AS host_name,
-                    u.avatar_url AS host_avatar, e.rating AS host_rating, e.rd AS host_rd
+                    u.avatar_url AS host_avatar, e.rating AS host_rating, e.rd AS host_rd,
+                    t.rating AS host_rating_team, t.rd AS host_rd_team,
+                    u.badge_mode AS host_badge_mode
              FROM lobbies l
              JOIN users u ON u.id = l.host_user_id
              -- LEFT, and it has to stay LEFT. This is the rooms list: with an inner
@@ -110,6 +113,9 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
              -- is a far worse bug than a missing number and a silent one. Same trap as
              -- the membership query in LobbyRoom's hello.
              LEFT JOIN elo_ratings e ON e.user_id = l.host_user_id AND e.mode = 'default'
+             -- The team ladder, LEFT for the same reason and more so: nobody has a team row
+             -- until their first rated team match.
+             LEFT JOIN elo_ratings t ON t.user_id = l.host_user_id AND t.mode = 'team'
              WHERE l.status IN ('open', 'locked', 'in_game')
              ORDER BY l.created_at DESC
              LIMIT 100`,
@@ -133,12 +139,19 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
             host_avatar: string | null;
             host_rating: number | null;
             host_rd: number | null;
+            host_rating_team: number | null;
+            host_rd_team: number | null;
+            host_badge_mode: string | null;
         }>();
 
         // The hosts' ladder positions, for the rank badge the rooms row draws in place of the
         // avatar. One query for the whole page, and absent (not 0) when it failed, so the
         // launcher draws no badge rather than a wrong one.
-        const hostRanks = await ladderRanks(ctx, (rows.results ?? []).map((r) => r.host_user_id));
+        const hostIds = (rows.results ?? []).map((r) => r.host_user_id);
+        const hostRanks = await ladderRanks(ctx, hostIds);
+        // The team ladder too (design handoff 51b): a 2v2/3v3 room's row wears the host's TEAM
+        // badge, and a casual room's row the badge the host chose.
+        const hostTeamRanks = await ladderRanks(ctx, hostIds, 'team');
 
         reply.header('Cache-Control', 'public, max-age=5');
         return reply.send({
@@ -188,6 +201,13 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
                     rd: r.host_rd ?? DEFAULT_RD,
                     // Position on the 1v1 ladder; 0 = below the entry bar (MIN_DECIDED).
                     ladder_rank: hostRanks.get(r.host_user_id),
+                    // The same three for the TEAM ladder, defaulted the same way: no row means
+                    // unrated, which is what the defaults mean.
+                    ladder_rank_team: hostTeamRanks.get(r.host_user_id),
+                    rating_team: r.host_rating_team ?? DEFAULT_RATING,
+                    rd_team: r.host_rd_team ?? DEFAULT_RD,
+                    // Which badge the host shows where the room does not decide it.
+                    badge_mode: normalizeBadgeMode(r.host_badge_mode),
                 },
             })),
         });

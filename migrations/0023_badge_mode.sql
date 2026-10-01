@@ -1,0 +1,16 @@
+-- Which rank badge a player shows beside their name where no match decides it (design handoff
+-- 51c, launcher "insignia de equipos"): the account chip, the Players panel, the global chat and
+-- the profile header. Inside a room the room's mode decides instead, for everybody.
+--
+--   'highest' — the badge of the higher AGE; a tie goes to 1v1. The default, so nobody has to
+--               touch anything to wear their best rank.
+--   '1v1'     — always the 1v1 badge.
+--   'team'    — always the team badge. Refused by POST /me/badge-mode while the player has no
+--               place on the team ladder (src/users/badgeMode.ts).
+--
+-- NOT NULL with a default: every existing row reads as 'highest', never NULL, so no reader has
+-- to invent a meaning for an absent value. Stored on the server because OTHER players see it —
+-- a launcher-side setting could only ever change what the player sees of themselves.
+--
+-- Additive; an older launcher ignores the column and the fields that carry it.
+ALTER TABLE users ADD COLUMN badge_mode TEXT NOT NULL DEFAULT 'highest';

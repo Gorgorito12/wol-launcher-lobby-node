@@ -7,6 +7,7 @@ import { runFoundingHook } from '../matches/foundingHook';
 import { verifyCrash, normaliseRecordingOutcome, isNtstatusFailure } from '../elo/crashEvidence';
 import { DEFAULT_RATING, DEFAULT_RD } from '../elo/glicko2';
 import { ladderRanks } from '../stats/rest';
+import { normalizeBadgeMode } from '../users/badgeMode';
 import type { AppContext } from '../context';
 
 /**
@@ -41,6 +42,28 @@ export function attachGlobalChat(gc: { refreshPlayers(): void }): void {
  * <p><b>`exited_at` is never bound</b>: it defaults to the server's own clock at INSERT. The
  * number the client sent goes into `client_seconds`, which no verdict reads.</p>
  */
+/**
+ * The hello's membership check, which also reads what the roster paints: the avatar, both
+ * ladders' rating and deviation, and the badge preference (design handoff 51).
+ *
+ * <p><b>BOTH elo_ratings joins MUST stay LEFT.</b> A row here means "you are in this lobby", so
+ * an inner join would throw everybody without a rating row out of the room with 4004
+ * not_in_lobby — every player right after a ratings reset, and on the TEAM join every player
+ * who has never played a rated team match, which today is nearly everyone. Exported so a test
+ * can pin that.</p>
+ *
+ * <p>Binds: lobby id, user id.</p>
+ */
+export const MEMBER_HELLO_SQL =
+    `SELECT u.avatar_url AS avatar_url, u.badge_mode AS badge_mode,
+            e.rating AS rating, e.rd AS rd,
+            t.rating AS rating_team, t.rd AS rd_team
+     FROM lobby_members lm
+     JOIN users u ON u.id = lm.user_id
+     LEFT JOIN elo_ratings e ON e.user_id = lm.user_id AND e.mode = 'default'
+     LEFT JOIN elo_ratings t ON t.user_id = lm.user_id AND t.mode = 'team'
+     WHERE lm.lobby_id = ? AND lm.user_id = ? LIMIT 1`;
+
 export const GAME_EXIT_INSERT_SQL =
     `INSERT OR IGNORE INTO lobby_game_exits (lobby_id, user_id, client_seconds)
      SELECT ?, ?, ? FROM lobbies
@@ -145,6 +168,19 @@ interface MemberEntry {
      * all. A snapshot at join, like the rating beside it.
      */
     ladderRank?: number;
+    /**
+     * The same three for the TEAM ladder (design handoff 51b): in a 2v2/3v3 room every member
+     * wears their team badge, and the roster line names the team rating. Defaulted like the 1v1
+     * pair — no row means unrated. A snapshot at join.
+     */
+    ratingTeam?: number;
+    rdTeam?: number;
+    ladderRankTeam?: number;
+    /**
+     * Which badge this member shows where the room does not decide it (a casual room):
+     * 'highest' | '1v1' | 'team'. A snapshot at join, like everything else here.
+     */
+    badgeMode?: string;
 }
 
 interface ChatLine {
@@ -383,16 +419,13 @@ class LobbyRoom {
         // membership check — a row means "you are in this lobby" — so an inner join
         // would throw out of the room, with 4004 not_in_lobby, everyone who has no
         // rating row yet. Right after a ratings reset that is every single player.
-        const member = await ctx.db.prepare(
-            `SELECT u.avatar_url AS avatar_url, e.rating AS rating, e.rd AS rd
-             FROM lobby_members lm
-             JOIN users u ON u.id = lm.user_id
-             LEFT JOIN elo_ratings e ON e.user_id = lm.user_id AND e.mode = 'default'
-             WHERE lm.lobby_id = ? AND lm.user_id = ? LIMIT 1`,
-        ).bind(this.lobbyId, userId).first<{
+        const member = await ctx.db.prepare(MEMBER_HELLO_SQL).bind(this.lobbyId, userId).first<{
             avatar_url: string | null;
+            badge_mode: string | null;
             rating: number | null;
             rd: number | null;
+            rating_team: number | null;
+            rd_team: number | null;
         }>();
         if (!member) {
             this.sendError(ws, 'not_in_lobby', 'You are not a member of this lobby');
@@ -415,6 +448,11 @@ class LobbyRoom {
         const rd = member.rd ?? DEFAULT_RD;
         // Never throws; undefined when it could not be worked out, so both frames omit it.
         const ladderRank = (await ladderRanks(ctx, [userId])).get(userId);
+        // The team ladder (design handoff 51), defaulted and omitted the same way.
+        const ratingTeam = member.rating_team ?? DEFAULT_RATING;
+        const rdTeam = member.rd_team ?? DEFAULT_RD;
+        const ladderRankTeam = (await ladderRanks(ctx, [userId], 'team')).get(userId);
+        const badgeMode = normalizeBadgeMode(member.badge_mode);
 
         const now = Date.now();
         this.attached.set(ws, {
@@ -435,6 +473,10 @@ class LobbyRoom {
             rating,
             rd,
             ladderRank,
+            ratingTeam,
+            rdTeam,
+            ladderRankTeam,
+            badgeMode,
         };
 
         this.send(ws, {
@@ -452,6 +494,10 @@ class LobbyRoom {
             rating,
             rd,
             ladder_rank: ladderRank,
+            rating_team: ratingTeam,
+            rd_team: rdTeam,
+            ladder_rank_team: ladderRankTeam,
+            badge_mode: badgeMode,
         }, ws);
     }
 

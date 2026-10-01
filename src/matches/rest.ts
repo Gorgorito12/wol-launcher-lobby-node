@@ -18,6 +18,7 @@ import { finalizeRoom } from '../lobbies/discordAnnounce';
 import { advanceTournamentFromMatch } from '../tournaments/advance';
 import { getTournament, loadBracket } from '../tournaments/store';
 import { invalidateCivStatsCaches, ladderRanks, ladderSize } from '../stats/rest';
+import { normalizeBadgeMode } from '../users/badgeMode';
 import type { AppContext } from '../context';
 
 interface ReportMatchBody {
@@ -2258,14 +2259,36 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
         let ladder_size: number | undefined;
         try { ladder_size = await ladderSize(ctx, 'default'); } catch { ladder_size = undefined; }
 
+        // The TEAM ladder's standing and the badge preference (design handoff 51): the account
+        // block wears the badge the player CHOSE, and the profile's selector needs both ladders
+        // to offer the choice. Defaulted like the 1v1 row — no team row means unrated — and the
+        // position and size omitted on failure, so the launcher reads "unknown", never Discovery.
+        const teamRow = await ctx.db.prepare(
+            `SELECT rating, rd, games_played FROM elo_ratings WHERE user_id = ? AND mode = 'team'`,
+        ).bind(userId).first<{ rating: number; rd: number; games_played: number }>();
+        const ladder_rank_team = (await ladderRanks(ctx, [userId], 'team')).get(userId);
+        let ladder_size_team: number | undefined;
+        try { ladder_size_team = await ladderSize(ctx, 'team'); } catch { ladder_size_team = undefined; }
+        const modeRow = await ctx.db.prepare('SELECT badge_mode FROM users WHERE id = ?')
+            .bind(userId).first<{ badge_mode: string | null }>();
+        const team = {
+            rating_team: teamRow?.rating ?? DEFAULT_RATING,
+            rd_team: teamRow?.rd ?? DEFAULT_RD,
+            games_played_team: teamRow?.games_played ?? 0,
+            ladder_rank_team,
+            ladder_size_team,
+            // Omitted for a user id the server does not know, rather than invented.
+            badge_mode: modeRow ? normalizeBadgeMode(modeRow.badge_mode) : undefined,
+        };
+
         // No row: unrated, which is the starting rating. This endpoint always answered
         // that way — it is where the chip's 1500 comes from — while the rooms list, the
         // presence frame and the room roster sent null for the same player. Same
         // constants everywhere now, so they cannot drift apart again.
         if (!row) return reply.send({
             rating: DEFAULT_RATING, rd: DEFAULT_RD, volatility: DEFAULT_VOLATILITY,
-            games_played: 0, wins, losses, ladder_rank, ladder_size,
+            games_played: 0, wins, losses, ladder_rank, ladder_size, ...team,
         });
-        return reply.send({ ...row, wins, losses, ladder_rank, ladder_size });
+        return reply.send({ ...row, wins, losses, ladder_rank, ladder_size, ...team });
     });
 }
