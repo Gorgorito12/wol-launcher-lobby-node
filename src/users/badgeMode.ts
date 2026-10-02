@@ -40,7 +40,7 @@ export function normalizeBadgeMode(raw: unknown): BadgeMode {
  * <p>Built on {@link LADDER_WHERE}, never restating it: "may wear the team badge" and "is on the
  * team ladder" must be the SAME question, or the selector would unlock a badge the ladder then
  * draws as Discovery (or lock one it draws in colour). A team match only rates once both sides'
- * readings agree, so this is exactly "has a decided team match" while MIN_DECIDED is 1.</p>
+ * readings agree, so this is "has finished team placement" (MIN_DECIDED rated team matches).</p>
  *
  * <p>Binds: `'team'`, MIN_DECIDED, the user id.</p>
  *

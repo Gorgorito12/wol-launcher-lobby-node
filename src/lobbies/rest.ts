@@ -199,7 +199,7 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
                     // landed on, so both read the same. Same default as the rating, for the
                     // same reason — a player with no row is unrated, which is what 350 means.
                     rd: r.host_rd ?? DEFAULT_RD,
-                    // Position on the 1v1 ladder; 0 = below the entry bar (MIN_DECIDED).
+                    // Position on the 1v1 ladder; 0 = still in placement (fewer than MIN_DECIDED rated matches).
                     ladder_rank: hostRanks.get(r.host_user_id),
                     // The same three for the TEAM ladder, defaulted the same way: no row means
                     // unrated, which is what the defaults mean.

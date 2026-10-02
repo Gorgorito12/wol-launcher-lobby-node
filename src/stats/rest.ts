@@ -17,58 +17,52 @@ import type { AppContext } from '../context';
  */
 
 /**
- * Fewest RATED games before a player is on the table. Five: see the last paragraphs for why it
- * went back up.
+ * PLACEMENT: how many RATED matches a player plays before he is on the table. Until then he is
+ * "in placement" — he has a rating, it moves and it is shown to him, but he is not ranked and
+ * the payload lists him under `placement` with his progress instead.
  *
- * <p>It used to be 3, alongside a `rd <= 110` filter, and TOGETHER they left the table empty
- * for a community that had been playing for weeks. The deviation was the one doing it: each
- * match is its own Glicko rating period, so RD falls slowly — measured against the library
- * this repo installs, 290 / 256 / 230 after one, two and three matches, first crossing 110
- * around the FOURTEENTH, and never at all for a player who keeps winning, because a growing
- * rating re-inflates RD as fast as the update shrinks it. The best player in the community
- * was the one who could never appear.</p>
+ * <p><b>Why placement exists at all: the ladder is ordered by the rating it PRINTS.</b> It used
+ * to be ordered by `rating - 2*rd` (Glicko-2's conservative estimate) while printing `rating`, so
+ * the column did not descend — 1571 above 1720 on the live table — and players read it as a
+ * broken ranking. The conservative order existed for one reason: with a bar of 1, a newcomer
+ * who won his first three games (rd ≈ 230, rating ≈ 1626) landed above regulars with a dozen.
+ * Placement answers that the way Age of Empires III: DE does (10 placement games, then ranked by
+ * Elo): a player does not compete for a place until his first matches have settled his rating,
+ * and from then on the table is simply the rating, top to bottom.</p>
  *
- * <p>The comment here used to say the games bar was "nearly implied by the deviation filter".
- * It was the other way round: the deviation was about five times stricter, and the payload
- * advertised only this weaker number, which is why the launcher's empty-state promised entry
- * at three matches while something else was refusing everybody.</p>
+ * <p><b>Five, not ten, and the reason is activity.</b> AoE3 DE uses ten. This community plays
+ * about 35 rated matches a month across ~18 players — roughly four rated matches per player per
+ * month — so ten would keep an ordinary player off the table for two to three months. Five is a
+ * bit over one month. What made an earlier bar of five unacceptable (the table showed 3 of 18
+ * active players and everybody else simply did not exist) is answered by the `placement` list:
+ * nobody who has played disappears, they are shown with their progress (3/5).</p>
  *
- * <p>What replaced it is `e.games_played >= MIN_DECIDED`, a column `applyMatch` already
- * maintains — so it counts RATED matches only, and no subquery decides who is eligible. The
- * win/loss tally below stays, but purely to fill the DECIDED column.</p>
- *
- * <p><b>ONE, and it has now gone 5 → 1 → 5 → 1, so read why before moving it again.</b> It
- * went back to five because the launcher hangs a rank badge off the position, and with a bar
- * of one the badges read as a lottery. That objection was answered in the LAUNCHER, not here:
- * the ages are now cut by a SHARE of the table (top 10 % Sovereign, the next 15 % Imperial,
- * and so on — `RankAges` there), and the ORDER BY below still sinks a one-match player on his
- * own (rd ≈ 290, so `rating - 2*rd` puts him last). What five cost was the table itself: a
- * handful of names out of everybody who plays, and the maintainer asked for everybody.</p>
- *
- * <p>So the bar is back to "has a rating at all". The launcher's win percentage keeps its OWN
- * sample bar (five decided matches) — that is a different question and no longer borrows this
- * number.</p>
- *
- * <p>It never goes below 1: `elo_ratings` gains a row when `applyMatch` first runs, so a
- * player with nothing decided has no rating to rank, and the launcher prints this number
- * (`min_decided`).</p>
+ * <p>The history, so it is not re-litigated blind: 3 (+ an rd filter that showed nobody) → 1 → 5
+ * → 1 (with the conservative ORDER BY doing the bar's job) → 5 as placement, with the plain
+ * rating ORDER BY. The launcher prints this number (`min_decided`) and reads it as the placement
+ * length; it never hardcodes it. The launcher's win percentage keeps its OWN five-match sample
+ * bar — a different question that merely happens to share the number today.</p>
  */
-export const MIN_DECIDED = 1;
+export const MIN_DECIDED = 5;
 
 /**
- * How good a player is AT LEAST — Glicko-2's conservative estimate, the number the ladder is
- * ordered by. Exported as BOTH the SQL fragment and the same arithmetic in JS so the query and
- * the test that pins it cannot drift apart; the string is a module constant, never user input.
+ * What the ladder is ordered by: the RATING, the same number every surface prints beside the
+ * name — so the table descends, which is the one property a ranking has to have to be read as
+ * one. The newcomer-with-a-hot-start problem the conservative order (`rating - 2*rd`) used to
+ * solve is solved by {@link MIN_DECIDED} (placement) instead; see there.
  *
- * <p>Two, not one: measured on the live table, a single deviation still put the three-match
- * player second instead of third. Two is also what Glicko-2's own write-up recommends.</p>
+ * <p>Do NOT bring the deviation back into this expression. It was there for a year and its
+ * cost was a column that does not descend, reported as "someone with a higher ELO is placed
+ * lower". `src/stats/ladder.test.ts` pins this.</p>
  *
  * <p>The `user_id` tiebreak is load-bearing since {@link ladderRanks} exists. Without it two
- * players on the same conservative rating came back in whatever order SQLite chose, which was
- * harmless while the position lived only in the list — and wrong the moment a second query
- * computes the same position for a room, because the two could disagree about who is 3rd.</p>
+ * players on the same rating came back in whatever order SQLite chose, which was harmless
+ * while the position lived only in the list — and wrong the moment a second query computes the
+ * same position for a room, because the two could disagree about who is 3rd.</p>
+ *
+ * <p>`idx_elo_rating (mode, rating DESC)` serves this ORDER BY again.</p>
  */
-export const LADDER_ORDER_BY = '(e.rating - 2 * e.rd) DESC, e.user_id ASC';
+export const LADDER_ORDER_BY = 'e.rating DESC, e.user_id ASC';
 
 /**
  * Who is on a ladder at all. SHARED, not copied, by the list and by the count of it.
@@ -141,10 +135,10 @@ export async function ladderRanks(
  * has to explain the order.
  */
 export function compareLadder(
-    a: { rating: number; rd: number; user_id: string },
-    b: { rating: number; rd: number; user_id: string },
+    a: { rating: number; user_id: string },
+    b: { rating: number; user_id: string },
 ): number {
-    const diff = (b.rating - 2 * b.rd) - (a.rating - 2 * a.rd);
+    const diff = b.rating - a.rating;
     if (diff !== 0) return diff;
     return a.user_id < b.user_id ? -1 : a.user_id > b.user_id ? 1 : 0;
 }
@@ -343,11 +337,6 @@ export function topMapsSql(mod: string | null, mode: 'default' | 'team' | null =
 /** Kept for the tests that pin the unfiltered shape, and for anything reading it by name. */
 export const TOP_MAPS_SQL = topMapsSql(null);
 
-
-/** The same rule as {@link LADDER_ORDER_BY}, for tests and for anything that has to explain it. */
-export function conservativeRating(row: { rating: number; rd: number }): number {
-    return row.rating - 2 * row.rd;
-}
 
 const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 50;
@@ -584,24 +573,10 @@ interface TopMapRow { map_name: string; n: number }
  * query does not state. SUM() over no rows is NULL, not 0 — hence the COALESCEs — and
  * aliases cannot be used in WHERE, so the predicate repeats the expression.</p>
  *
- * <p><b>The order is `rating - 2 * rd`, not `rating` — the CONSERVATIVE rating, and it is the
- * whole answer to "somebody wins three games on his first night and lands above the regulars".
- * </b> It is Glicko-2's own recommendation: how good the player is AT LEAST, at roughly 95%
- * confidence. A newcomer carries an enormous deviation, so the number he is ranked by is
- * heavily discounted no matter how well he starts, and he climbs on his own as it shrinks —
- * which is exactly what "he has not proved it yet" means, expressed in the units the rating
- * system already keeps. Measured on the live table the day this changed: rating alone gave
- * Gommiustan (1626, rd 248, 3 matches) > Aluclown (1604, rd 125, 13); this gives Aluclown
- * (1353) > Geaf (1244) > Gommiustan (1130).</p>
- *
- * <p>The trade-off, and the client has to carry it: the rating SHOWN is still `rating`, so the
- * displayed numbers no longer descend down the table. That is why the launcher's rows print
- * the match count beside the name — it is what makes the order legible — and mark a high
- * deviation as provisional. Emitting the adjusted number instead was rejected: it would
- * contradict the rating the same player is shown in his profile and in every room.</p>
- *
- * <p>Note `idx_elo_rating (mode, rating DESC)` no longer serves this ORDER BY. Irrelevant at
- * this size; if the table ever grows, the index to add is on the expression.</p>
+ * <p><b>The order is the plain `rating`</b> — see {@link LADDER_ORDER_BY}. It was `rating - 2*rd`
+ * for a year, which kept a newcomer with a hot start below the regulars but left the printed
+ * column out of order. Placement ({@link MIN_DECIDED}) keeps the newcomer off the table until
+ * his rating has settled, so the table can be ordered by the number it shows.</p>
  */
 async function ladder(ctx: AppContext, mode: 'default' | 'team', limit: number) {
     const rows = await ctx.db.prepare(
@@ -684,6 +659,43 @@ export async function ladderSize(ctx: AppContext, mode: 'default' | 'team'): Pro
     return row?.n ?? 0;
 }
 
+/**
+ * The players IN PLACEMENT on a ladder: they have played at least one rated match of this mode
+ * but fewer than {@link MIN_DECIDED}, so they have a rating and no place yet.
+ *
+ * <p>It exists so that a placement bar does not make people disappear — the reason an earlier
+ * bar of five was reverted (the table showed 3 of 18 active players). The launcher lists them
+ * under the table with their progress ("3/5").</p>
+ *
+ * <p>Ordered by how close they are to finishing, then by rating, then by id so two equal rows
+ * never swap between polls. Never ranked: a position here would be a place on a table they are
+ * not on yet.</p>
+ */
+async function placement(ctx: AppContext, mode: 'default' | 'team', limit: number) {
+    const rows = await ctx.db.prepare(
+        `SELECT u.id, u.discord_username, u.display_name, u.avatar_url,
+                e.rating, e.rd, e.games_played
+         FROM elo_ratings e
+         JOIN users u ON u.id = e.user_id
+         WHERE e.mode = ?
+           AND u.is_banned = 0
+           AND e.games_played >= 1
+           AND e.games_played < ?
+         ORDER BY e.games_played DESC, e.rating DESC, e.user_id ASC
+         LIMIT ?`,
+    ).bind(mode, MIN_DECIDED, limit).all<Omit<LeaderRow, 'wins' | 'losses'>>();
+
+    return (rows.results ?? []).map((r) => ({
+        user_id: r.id,
+        discord_username: r.discord_username,
+        display_name: r.display_name,
+        avatar_url: r.avatar_url,
+        rating: r.rating,
+        rd: r.rd,
+        games_played: r.games_played,
+    }));
+}
+
 export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
     // NO ipRateLimit preHandler here, on purpose - see the cache check below. The quota is
     // charged inside the handler, and only when the request is actually going to do work.
@@ -745,12 +757,15 @@ export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
             // of the multiplayer notes: the community strip is one endpoint, because the
             // request budget is per IP and shared behind a Radmin NAT — a second route would
             // cost double for a page nobody asked twice for.
-            const [leaderboard, leaderboard_team, ranked_players, ranked_players_team] =
+            const [leaderboard, leaderboard_team, ranked_players, ranked_players_team,
+                   placement_players, placement_players_team] =
                 await Promise.all([
                     ladder(ctx, 'default', limit),
                     ladder(ctx, 'team', limit),
                     ladderSize(ctx, 'default'),
                     ladderSize(ctx, 'team'),
+                    placement(ctx, 'default', MAX_LIMIT),
+                    placement(ctx, 'team', MAX_LIMIT),
                 ]);
 
             // Source is lobbies.created_at, and the wording on the card has to match:
@@ -907,6 +922,11 @@ export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
                 // reads these; a launcher older than them shows the rank alone.
                 ranked_players,
                 ranked_players_team,
+                // Who is still in placement (fewer than min_decided rated matches), with their
+                // progress. A launcher older than placement ignores it; the table above it is
+                // ordered by the printed rating, so nobody here could have been on it anyway.
+                placement: placement_players,
+                placement_team: placement_players_team,
                 // Which mod this whole payload is about, echoed back. The launcher draws it beside
                 // the figures; without it a cached page and a fresh one are indistinguishable.
                 mod: mod,
