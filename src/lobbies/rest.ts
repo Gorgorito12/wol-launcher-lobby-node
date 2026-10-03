@@ -7,7 +7,8 @@ import { finalizeRoom } from './discordAnnounce';
 import { runFoundingHook } from '../matches/foundingHook';
 import { createLobby } from './create';
 import { isEntrantMember } from '../tournaments/store';
-import { DEFAULT_RATING, DEFAULT_RD } from '../elo/glicko2';
+import { DEFAULT_RATING, DEFAULT_RD, effectiveRatings, type EffectiveRating } from '../elo/glicko2';
+import { currentSeason } from '../elo/seasons';
 import { ladderRanks } from '../stats/rest';
 import { normalizeBadgeMode } from '../users/badgeMode';
 import type { AppContext } from '../context';
@@ -81,6 +82,35 @@ interface JoinLobbyBody {
 }
 
 /**
+ * The public rooms list. Exported so a test can pin that it carries NO rating join: the hosts'
+ * ratings are read separately through effectiveRatings, because the ratings table holds a row
+ * per season and any join on it would list a room once per season its host has played.
+ */
+export const LOBBY_LIST_SQL =
+    `SELECT l.id, l.host_user_id, l.title, l.mod_id, l.mod_combined_hash,
+            l.max_players, l.spectator_slots, l.current_players, l.is_private,
+            l.status, l.competitive, l.tournament_match_id,
+            -- Counted rather than denormalised, unlike current_players. This is read
+            -- once per row on a list capped at 100 and covered by lobby_members' own
+            -- primary key; a second denormalised counter would be a second thing that
+            -- can drift out of step with the roster, and the first one already has a
+            -- comment in LobbyRoom about never decrementing.
+            (SELECT COUNT(*) FROM lobby_members m
+              WHERE m.lobby_id = l.id AND m.role = 'spectator') AS spectators_present,
+            l.created_at, u.discord_username AS host_login, u.display_name AS host_name,
+            u.avatar_url AS host_avatar,
+            u.badge_mode AS host_badge_mode
+     FROM lobbies l
+     JOIN users u ON u.id = l.host_user_id
+     -- No rating join here any more: the hosts' ratings are the running season's, read
+     -- below through effectiveRatings. A join on the ratings table would have to pick a
+     -- season row per host — and a host with rows in two seasons would list his room
+     -- twice, while a host with none would need it LEFT or his room would vanish.
+     WHERE l.status IN ('open', 'locked', 'in_game')
+     ORDER BY l.created_at DESC
+     LIMIT 100`;
+
+/**
  * Mount /lobbies/* on the Fastify instance. Direct port of the original
  * Hono router with the same routes, same SQL, same response shapes —
  * the launcher's <c>LobbyApiClient</c> can't tell which backend it's
@@ -92,33 +122,7 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
         preHandler: [ipRateLimit(ctx, Limits.LobbyListIp)],
     }, async (_req, reply) => {
         const rows = await ctx.db.prepare(
-            `SELECT l.id, l.host_user_id, l.title, l.mod_id, l.mod_combined_hash,
-                    l.max_players, l.spectator_slots, l.current_players, l.is_private,
-                    l.status, l.competitive, l.tournament_match_id,
-                    -- Counted rather than denormalised, unlike current_players. This is read
-                    -- once per row on a list capped at 100 and covered by lobby_members' own
-                    -- primary key; a second denormalised counter would be a second thing that
-                    -- can drift out of step with the roster, and the first one already has a
-                    -- comment in LobbyRoom about never decrementing.
-                    (SELECT COUNT(*) FROM lobby_members m
-                      WHERE m.lobby_id = l.id AND m.role = 'spectator') AS spectators_present,
-                    l.created_at, u.discord_username AS host_login, u.display_name AS host_name,
-                    u.avatar_url AS host_avatar, e.rating AS host_rating, e.rd AS host_rd,
-                    t.rating AS host_rating_team, t.rd AS host_rd_team,
-                    u.badge_mode AS host_badge_mode
-             FROM lobbies l
-             JOIN users u ON u.id = l.host_user_id
-             -- LEFT, and it has to stay LEFT. This is the rooms list: with an inner
-             -- join every room whose host has no rating row would VANISH from it, which
-             -- is a far worse bug than a missing number and a silent one. Same trap as
-             -- the membership query in LobbyRoom's hello.
-             LEFT JOIN elo_ratings e ON e.user_id = l.host_user_id AND e.mode = 'default'
-             -- The team ladder, LEFT for the same reason and more so: nobody has a team row
-             -- until their first rated team match.
-             LEFT JOIN elo_ratings t ON t.user_id = l.host_user_id AND t.mode = 'team'
-             WHERE l.status IN ('open', 'locked', 'in_game')
-             ORDER BY l.created_at DESC
-             LIMIT 100`,
+            LOBBY_LIST_SQL,
         ).bind().all<{
             id: string;
             host_user_id: string;
@@ -137,10 +141,6 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
             host_login: string;
             host_name: string;
             host_avatar: string | null;
-            host_rating: number | null;
-            host_rd: number | null;
-            host_rating_team: number | null;
-            host_rd_team: number | null;
             host_badge_mode: string | null;
         }>();
 
@@ -148,10 +148,27 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
         // avatar. One query for the whole page, and absent (not 0) when it failed, so the
         // launcher draws no badge rather than a wrong one.
         const hostIds = (rows.results ?? []).map((r) => r.host_user_id);
-        const hostRanks = await ladderRanks(ctx, hostIds);
+        const season = currentSeason(Date.now());
+        const hostRanks = await ladderRanks(ctx, hostIds, 'default', season);
         // The team ladder too (design handoff 51b): a 2v2/3v3 room's row wears the host's TEAM
         // badge, and a casual room's row the badge the host chose.
-        const hostTeamRanks = await ladderRanks(ctx, hostIds, 'team');
+        const hostTeamRanks = await ladderRanks(ctx, hostIds, 'team', season);
+
+        // The hosts' ratings in the running season — the same helper applyMatch reads, so a
+        // host carried over from last season shows the soft-reset number his next match starts
+        // from. A failure sends no rating at all (null), never somebody's 1500: the launcher
+        // reads null as "unknown".
+        let hostSolo: Map<string, EffectiveRating> | null = null;
+        let hostTeam: Map<string, EffectiveRating> | null = null;
+        try {
+            [hostSolo, hostTeam] = await Promise.all([
+                effectiveRatings(ctx.db, hostIds, 'default', season),
+                effectiveRatings(ctx.db, hostIds, 'team', season),
+            ]);
+        } catch {
+            hostSolo = null;
+            hostTeam = null;
+        }
 
         reply.header('Cache-Control', 'public, max-age=5');
         return reply.send({
@@ -193,19 +210,19 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
                     // itself. It does not: RatingDisplay.ShouldShow is `rating.HasValue`.
                     // Filling it in on the client would be wrong anyway — it cannot tell
                     // an unrated player from a server that did not send the field.
-                    rating: r.host_rating ?? DEFAULT_RATING,
+                    rating: hostSolo ? (hostSolo.get(r.host_user_id)?.rating ?? DEFAULT_RATING) : null,
                     // The deviation goes WITH it, and without it the rating is ambiguous: the
                     // client had no way to tell a 1500 nobody has played for from one somebody
                     // landed on, so both read the same. Same default as the rating, for the
                     // same reason — a player with no row is unrated, which is what 350 means.
-                    rd: r.host_rd ?? DEFAULT_RD,
+                    rd: hostSolo ? (hostSolo.get(r.host_user_id)?.rd ?? DEFAULT_RD) : null,
                     // Position on the 1v1 ladder; 0 = below the entry bar (MIN_DECIDED).
                     ladder_rank: hostRanks.get(r.host_user_id),
                     // The same three for the TEAM ladder, defaulted the same way: no row means
                     // unrated, which is what the defaults mean.
                     ladder_rank_team: hostTeamRanks.get(r.host_user_id),
-                    rating_team: r.host_rating_team ?? DEFAULT_RATING,
-                    rd_team: r.host_rd_team ?? DEFAULT_RD,
+                    rating_team: hostTeam ? (hostTeam.get(r.host_user_id)?.rating ?? DEFAULT_RATING) : null,
+                    rd_team: hostTeam ? (hostTeam.get(r.host_user_id)?.rd ?? DEFAULT_RD) : null,
                     // Which badge the host shows where the room does not decide it.
                     badge_mode: normalizeBadgeMode(r.host_badge_mode),
                 },

@@ -217,49 +217,93 @@ The one thing a rollback leaves behind is rows the older code has no name for �
 correction path refuses anything but `unrated_reason = 'no_decided_result'`, so an unknown value
 is inert rather than dangerous.
 
-## Resetting the ratings
+## Rating seasons
 
-Only ever needed on purpose — this throws every player's ELO away. It exists
-because the ratings built before the ratability rule landed were mostly made of
-matches nobody won: `POST /matches` used to feed EVERY report to Glicko, and
-since AoE3 does not record by default almost every stored match has no winner.
+The ladder restarts every three months and every season's final table is kept for good. The
+calendar is `src/elo/seasons.ts` and nothing else: **Season 1** is everything stored before
+**1 December 2026, 06:00 UTC** (midnight in Central America and Mexico City, 03:00 in Argentina,
+07:00 in Spain), **Season 2** starts at that instant, and every later season starts on the 1st of
+March, June, September and December at the same hour.
 
-The match history is NOT touched: `matches` and `match_participants.result` stay
-whole. Only `elo_ratings` and the per-participant `rating_before`/`rating_after`
-go.
+**Nothing runs at the boundary, and nothing has to.** Ratings live in `season_ratings`, one row
+per (player, ladder, season). A season that has just begun has no rows, so at 06:00:00 every
+reader — the ladder, the rank badges, the rooms list, the profile — is already showing the new
+season. A player's first rated match of it starts from the **soft reset** of the last season he
+played: halfway between his final rating and 1500, with a deviation of at least 250 (so his
+first matches move about ±90 points). There is no timer, by the same house rule as everything
+else here.
+
+What players see that night: the ladder empties, every badge reads Discovery, ratings show the
+soft-reset starting point, and the first players of the season climb a tiny table. The old
+season's table is browsable in the launcher's season selector, each player's profile lists his
+final place, a top-3 finish earns a medal beside the name, and the bell tells everybody where
+they finished.
+
+### Deploying seasons (once)
+
+Season 1 is a COPY of the ladder as it stands when migration `0024_seasons.sql` runs, so it must
+equal what a replay of the history produces. Check that first, on production, with the old code
+still running:
 
 ```bash
-sudo systemctl stop wol-lobby
-
-# Back up all THREE files, not just the .db. The database runs in WAL mode, so the
-# -wal sidecar can hold committed transactions the .db does not yet contain, and
-# copying the .db alone can capture a state that never existed. With the service
-# stopped nothing is writing, so copying the set together is consistent — and
-# unlike `sqlite3 .backup` it needs no extra package installed. (sqlite3 is NOT
-# part of this install: the service reaches SQLite through better-sqlite3 and
-# never shells out to it.)
-BK=/var/lib/wol-lobby/backup-$(date +%F)
-sudo mkdir -p "$BK"
-sudo cp -a /var/lib/wol-lobby/lobby.db* "$BK"/
-sudo ls -l "$BK"          # confirm there is something there before continuing
-
-# As the SERVICE's user, and with the tsx that is already installed — not npx.
-# Running it as your own login user fails twice over: it cannot read the service's
-# .env, and it cannot write the database.
-cd /opt/wol-lobby
-sudo -u wol-lobby ./node_modules/.bin/tsx scripts/reset-elo.ts
-
-sudo systemctl start wol-lobby
+sudo -u wol-lobby ./node_modules/.bin/tsx scripts/admin.ts elo:recompute
+# → "(no rating moved)". If somebody moved, apply it (--apply) BEFORE deploying seasons.
 ```
 
-The script needs no secrets — only the database path, which it takes from `DB_PATH`
-(the environment, or the service's `.env`), or from an explicit first argument:
-`sudo -u wol-lobby ./node_modules/.bin/tsx scripts/reset-elo.ts /var/lib/wol-lobby/lobby.db`
+Then deploy as usual (`git pull`, restart — the migration applies itself). Run the same command
+again afterwards: it must print "(no rating moved)" for season 1 on both ladders. Nothing visible
+changes for players until the boundary.
 
-To roll back, copy the files out of that backup directory and start the service. This is
-deliberately a script and not a migration: a migration is remembered in the
-`_migrations` table of the database it ran against, so restoring the backup and
-starting up would re-run it and delete the ratings you had just restored.
+**Rehearse the boundary on a copy, not on production.** `VACUUM INTO` a snapshot, point a second
+instance at it on another port, and start it with the clock moved past the boundary — on the VM,
+`faketime '2026-12-01 06:00:01' node ...` (package `faketime`) does that without any code change.
+The ladder must be empty, the rooms list must show soft-reset ratings, and Season 1's table must
+be identical to the live one.
+
+### Announcing a season's winners
+
+```bash
+sudo -u wol-lobby ./node_modules/.bin/tsx scripts/admin.ts season:show       # the last ended one
+sudo -u wol-lobby ./node_modules/.bin/tsx scripts/admin.ts season:show 1 --limit 20
+```
+
+The places are the ones players are shown: the same ordering as the live ladder
+(`rating - 2*rd`), the same entry bar, and **no ban filter** — a past table never renumbers,
+even for a player banned later.
+
+### A result that arrives after the boundary
+
+A match belongs to the season of `matches.created_at` (the server's own stamp, never a client
+clock). A team match reported at 05:58 and corroborated by the other side at 06:02 is a Season-N
+match whose rating arrived after Season N ended: the server keeps the result, still advances a
+tournament with it, stores it `unrated_reason = 'season_closed'` and moves nobody's rating. The
+same goes for a 1v1 decided late by a reading or by abandonment. A crash void or a founding
+contradiction that concerns an ended season is logged and skipped. An ended season's table only
+changes when an operator corrects one of its matches (below), and the command says so first.
+
+### Corrections in an ended season
+
+`match:decide`, `match:decide-team` and `match:void` replay the ladder **from the season of the
+match they edit**, and every later season is re-derived from the corrected result — a player's
+start in the next season is the soft reset of his corrected finish. Seasons before that one are
+not touched. Correcting a match of an ended season rewrites that season's final table (places and
+medals); the dry run prints a NOTE saying so and shows the movement season by season.
+
+### Rolling back past seasons
+
+`elo_ratings`, the table before seasons, is frozen by migration 0024: nothing reads or writes it
+any more, and it still holds the ratings as they were the moment the migration ran. An older
+build reads exactly that table, so a rollback is: check out the previous commit, restart, and —
+because the frozen numbers miss every match rated since — run that build's own
+`admin.ts elo:recompute --apply` to bring them up to date. `season_ratings` is left behind
+untouched, and redeploying seasons picks it up again; replay from season 1 afterwards
+(`elo:recompute --apply`) so it includes anything the old build rated meanwhile.
+
+### `scripts/reset-elo.ts` is retired
+
+It wiped every rating once, for a reason that no longer applies (see the comment at the top of
+the file). With seasons it would have erased every season's history, so it now refuses to do
+anything. A season restarts the ladder by itself; to correct ratings, use the operator commands.
 
 ## Reading the match confirmations
 
@@ -360,7 +404,7 @@ cd /opt/wol-lobby
 sudo -u wol-lobby ./node_modules/.bin/tsx scripts/admin.ts help
 ```
 
-Run it as the **service user**, exactly like `reset-elo.ts`: as your own login user it can
+Run it as the **service user**: as your own login user it can
 read neither the service's `.env` nor the database. (`npm run admin -- <command>` is the same
 thing, if you are already that user.)
 
@@ -378,10 +422,11 @@ match:decide-team <id> --losers <a,b[,c]>
                                           rate a stored 2v2/3v3 from its recordings by
                                           naming the losing side, then replay both ladders
 match:void <id>                           stop it counting, then replay the ladder
-elo:recompute                             replay the ladder; run it alone to self-check
-player:show <player>                      rating, ban state, stale memberships
+elo:recompute [--from-season N]           replay the ladder; run it alone to self-check
+season:show [n] [--limit N]               an ended season's final tables (default: the last)
+player:show <player>                      this season's ratings, past finishes, ban state
 player:history <player> [--limit N]
-player:reset <player>                     one player back to 1500
+player:reset <player>                     one player back to 1500 this season
 player:ban <player> --reason "..."   |    player:unban <player>
 player:unstick <player>                   clear rows that bar them from every room
 ```
@@ -405,13 +450,13 @@ is memory-only, so a restart is still the only way.
 
 `applyMatch` has no inverse and nothing snapshots a player's prior rating, so "undo this
 match" cannot be subtracted. `match:decide`, `match:decide-team` and `match:void` instead
-change the row and **replay the whole ladder** (both of them, 1v1 and team) from match
-history, in report order. The result is the ladder as though the match had always read the
-way it now reads.
+change the row and **replay the ladder** (both of them, 1v1 and team) from match history, in
+report order, starting at the season of the match they edited (see "Rating seasons"). The
+result is the ladder as though the match had always read the way it now reads.
 
 That also repairs a corruption nothing else detects: if anything throws after `applyMatch`
 inside the late-reading path, the rollback there restores the match and participant rows but
-**not** `elo_ratings` — both players keep the points and the match becomes eligible to be
+**not** the rating rows — both players keep the points and the match becomes eligible to be
 rated again. A replay cannot express that state.
 
 **Check the tool before trusting it.** On untouched data a replay must reproduce the ratings
@@ -419,13 +464,14 @@ already stored:
 
 ```bash
 sudo -u wol-lobby ./node_modules/.bin/tsx scripts/admin.ts elo:recompute
-# → "(no rating moved)" under both the 1v1 and the team ladder. Anything else means the
+# → "(no rating moved)" under every season and both ladders. Anything else means the
 #   replay is not faithful; stop and work out why before using match:decide,
 #   match:decide-team or match:void.
 ```
 
 The dry run of a rating command does the real work on a `VACUUM INTO` snapshot and prints the
-actual movement on both ladders, so what you see is what `--apply` will do.
+actual movement, season by season and ladder by ladder, so what you see is what `--apply` will
+do.
 
 ### Rating a team match by hand
 

@@ -250,14 +250,13 @@ export function registerDiscordAuth(app: FastifyInstance, ctx: AppContext): void
             ).bind(du.username, displayName, avatarUrl ?? existing.avatar_url, effectiveUserId).run();
         } else {
             effectiveUserId = uuid();
+            // No rating row: a player gets one with his first rated match of a season, and
+            // until then reads as the starting 1500/350 everywhere (effectiveRatings).
             await ctx.db.batch([
                 ctx.db.prepare(
                     `INSERT INTO users (id, discord_id, discord_username, display_name, avatar_url)
                      VALUES (?, ?, ?, ?, ?)`,
                 ).bind(effectiveUserId, du.id, du.username, displayName, avatarUrl),
-                ctx.db.prepare(
-                    `INSERT INTO elo_ratings (user_id, mode) VALUES (?, 'default')`,
-                ).bind(effectiveUserId),
             ]);
         }
 
@@ -307,9 +306,6 @@ export function registerDiscordAuth(app: FastifyInstance, ctx: AppContext): void
                        discord_username = excluded.discord_username,
                        last_seen_at = datetime('now')`,
                 ).bind(userId, '0', username, 'Dev User'),
-                ctx.db.prepare(
-                    `INSERT OR IGNORE INTO elo_ratings (user_id, mode) VALUES (?, 'default')`,
-                ).bind(userId),
             ]);
             const { token, expiresAt } = await mintSession(userId, username, cfg.jwtSigningKey);
             return reply.send({

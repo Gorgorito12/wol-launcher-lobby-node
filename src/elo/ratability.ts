@@ -42,7 +42,12 @@ export type UnratedReason =
     | 'game_crashed'
     /** A match the server FOUNDED from a reading (src/elo/founding.ts) that a later reading
      *  of the same game contradicted. Reverted and replayed out of the ladder. */
-    | 'contradicted_founding';
+    | 'contradicted_founding'
+    /** The match was stored in a season that had ENDED by the time its result could be rated —
+     *  a team match whose corroboration, or a late reading that decided it, arrived after the
+     *  boundary (src/elo/seasons.ts). The result is kept and still advances a tournament; the
+     *  rating is not applied, because an ended season's table is a permanent record. */
+    | 'season_closed';
 
 /**
  * A win and a loss, as the stored `result` encodes them.

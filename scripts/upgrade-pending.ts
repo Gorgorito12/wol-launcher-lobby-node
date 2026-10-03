@@ -23,11 +23,20 @@
  * `unrated_reason = 'no_decided_result'`, a column written only by the code that now stores
  * the verdict — so every row from before that migration is NULL and inelegible by
  * construction. Ratings move once or not at all.</p>
+ *
+ * <p><b>It edits the rows and then REPLAYS, from the oldest season it touched.</b> It used to
+ * call applyMatch for each match it decided, outside the server's ladder lock and in this
+ * script's own order — which applied each result on top of every rating that came after it,
+ * and with seasons would even have rated an old match into the running season. Deciding first
+ * and replaying once puts every match back in its own season, in report order, exactly as the
+ * live path would have.</p>
  */
 import 'dotenv/config';
 import { Db } from '../src/db';
 import { canUpgradeFromConfirmation, WIN_AT } from '../src/elo/ratability';
-import { applyMatch, type ParticipantOutcome } from '../src/elo/glicko2';
+import { type ParticipantOutcome } from '../src/elo/glicko2';
+import { recomputeLadder } from '../src/elo/replay';
+import { seasonOfCreatedAt } from '../src/elo/seasons';
 
 function resolveDbPath(): string {
     const positional = process.argv.slice(2).find((a) => !a.startsWith('--'));
@@ -40,6 +49,7 @@ interface PendingMatch {
     unrated_reason: string | null;
     game_seed: number | null;
     game_host_time: number | null;
+    created_at: string;
 }
 
 function parseRoster(json: string | null): Set<string> | null {
@@ -57,7 +67,7 @@ async function main(): Promise<void> {
     const db = new Db(resolveDbPath());
 
     const pending = await db.prepare(
-        `SELECT id, lobby_id, unrated_reason, game_seed, game_host_time
+        `SELECT id, lobby_id, unrated_reason, game_seed, game_host_time, created_at
          FROM matches WHERE unrated_reason = 'no_decided_result' AND lobby_id IS NOT NULL
          ORDER BY created_at ASC`,
     ).bind().all<PendingMatch>();
@@ -65,6 +75,8 @@ async function main(): Promise<void> {
     const rows = pending.results ?? [];
     console.log(`${rows.length} undecided match(es) with a room.`);
     let decided = 0;
+    // The oldest season any decided match belongs to: the replay starts there.
+    let fromSeason: number | null = null;
 
     for (const match of rows) {
         const lobbyId = match.lobby_id!;
@@ -109,10 +121,9 @@ async function main(): Promise<void> {
             });
             if (!decision.ok) continue;
 
-            // Narrowed to 0 | 1, same as the live path. NOTE: tsconfig's `include` is
-            // `src/**` only, so nothing here is ever type-checked — tsx strips types without
-            // checking them. This exact line WOULD be a build error if scripts/ were added to
-            // the include, which is reason enough to keep it honest.
+            // Narrowed to 0 | 1, same as the live path, rather than cast: `row.result` is a
+            // REAL straight out of SQLite. (scripts/ IS type-checked by `npm run typecheck` —
+            // tsconfig includes it, minus the scripts/test-*.ts harnesses.)
             const ownResult: 0 | 1 = row.result >= WIN_AT ? 1 : 0;
             const outcomes: ParticipantOutcome[] = players.map((p) => ({
                 userId: p.user_id,
@@ -147,19 +158,19 @@ async function main(): Promise<void> {
                 }
             }
 
-            const diff = await applyMatch(db, outcomes);
-            const stamps = [];
-            for (const o of outcomes) {
-                const d = diff.get(o.userId);
-                if (!d) continue;
-                stamps.push(db.prepare(
-                    `UPDATE match_participants SET rating_before = ?, rating_after = ?
-                     WHERE match_id = ? AND user_id = ?`,
-                ).bind(d.before, d.after, match.id, o.userId));
-            }
-            if (stamps.length) await db.batch(stamps);
+            const season = seasonOfCreatedAt(match.created_at);
+            fromSeason = fromSeason === null ? season : Math.min(fromSeason, season);
             break;
         }
+    }
+
+    if (apply && fromSeason !== null) {
+        // ONE replay, from the oldest season touched, so every decided match is rated in its own
+        // season and in report order — and every later season is re-derived from the corrected
+        // results. Stop the service first, as for every rating-moving script: the server's ladder
+        // lock lives in its own process and cannot see this one.
+        const { matches } = await recomputeLadder(db, { fromSeason });
+        console.log(`Ladder replayed from season ${fromSeason}: ${matches} rated match(es).`);
     }
 
     console.log(

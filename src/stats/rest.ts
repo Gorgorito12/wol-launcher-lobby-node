@@ -4,6 +4,8 @@ import { requireAuth } from '../middleware/auth';
 import { Errors } from '../lib/errors';
 import { WIN_AT, LOSS_AT } from '../elo/ratability';
 import { attachParticipants } from '../matches/rest';
+import { currentSeason, isClosed, seasonBounds, seasonList, seasonOfCreatedAt,
+         seasonPredicate } from '../elo/seasons';
 import type { AppContext } from '../context';
 
 /**
@@ -78,12 +80,20 @@ export const LADDER_ORDER_BY = '(e.rating - 2 * e.rd) DESC, e.user_id ASC';
  * would be invisible from either side. Two queries spelling out the same three conditions is
  * exactly the shape that drifts, so there is one string and both interpolate it.</p>
  *
- * <p>The bound parameters are positional, so a caller must bind mode then MIN_DECIDED in that
- * order, after whatever its own SELECT needs.</p>
+ * <p>The bound parameters are positional, so a caller must bind mode, MIN_DECIDED and then the
+ * SEASON, in that order, after whatever its own SELECT needs. The season is LAST on purpose: it
+ * arrived after the other two, and appending it is what kept every existing `bind()` correct
+ * except for one extra argument at its end.</p>
+ *
+ * <p><b>`e` is `season_ratings`, and the season is the CURRENT one</b> wherever this is used —
+ * the live ladder, a badge, "may wear the team badge". An ended season's table is not read
+ * through this: see {@link seasonPlacesCte}, which drops the ban filter so a past table never
+ * renumbers.</p>
  */
 export const LADDER_WHERE = `WHERE e.mode = ?
            AND u.is_banned = 0
-           AND e.games_played >= ?`;
+           AND e.games_played >= ?
+           AND e.season = ?`;
 
 /**
  * A player's position on a ladder, for the surfaces that show a player without showing the
@@ -95,14 +105,14 @@ export const LADDER_WHERE = `WHERE e.mode = ?
  * with a second alias, which is the two-copies shape {@link LADDER_WHERE} exists to prevent.
  * Here the list and the position cannot filter or order differently.</p>
  *
- * <p>Binds: mode, MIN_DECIDED, then the user ids.</p>
+ * <p>Binds: mode, MIN_DECIDED, season, then the user ids.</p>
  */
 export function ladderRankSql(userCount: number): string {
     const ids = Array.from({ length: userCount }, () => '?').join(', ');
     return `WITH ranked AS (
                 SELECT e.user_id AS user_id,
                        ROW_NUMBER() OVER (ORDER BY ${LADDER_ORDER_BY}) AS ladder_pos
-                FROM elo_ratings e
+                FROM season_ratings e
                 JOIN users u ON u.id = e.user_id
                 ${LADDER_WHERE}
             )
@@ -120,13 +130,14 @@ export async function ladderRanks(
     ctx: AppContext,
     userIds: string[],
     mode: 'default' | 'team' = 'default',
+    season: number = currentSeason(Date.now()),
 ): Promise<Map<string, number>> {
     const unique = [...new Set(userIds.filter(Boolean))];
     const out = new Map<string, number>();
     if (unique.length === 0) return out;
     try {
         const rows = await ctx.db.prepare(ladderRankSql(unique.length))
-            .bind(mode, MIN_DECIDED, ...unique)
+            .bind(mode, MIN_DECIDED, season, ...unique)
             .all<{ user_id: string; ladder_pos: number }>();
         for (const id of unique) out.set(id, 0);
         for (const r of rows.results ?? []) out.set(r.user_id, r.ladder_pos);
@@ -420,8 +431,9 @@ const communityInFlight = new Map<string, Promise<unknown>>();
  */
 export function communityKey(
     limit: number, mod: string | null, mode: string, recent: number = RECENT_MATCHES_LIMIT,
+    season: number = 1,
 ): string {
-    return `${limit}\u0000${mod ?? ''}\u0000${mode}\u0000${recent}`;
+    return `${limit}\u0000${mod ?? ''}\u0000${mode}\u0000${recent}\u0000${season}`;
 }
 
 /** Drop expired entries. Called on write, which is the only time the map grows. */
@@ -452,6 +464,10 @@ let deckCache: { at: number; mod: string | null; payload: unknown } | null = nul
 
 /** The list of mods that have matches. Its own slot; it is tiny and asked once a page. */
 let modsCache: { at: number; payload: unknown } | null = null;
+
+/** Ended seasons' tables, keyed by `season\0limit`. Bounded by the number of seasons. */
+const seasonCache = new Map<string, CacheEntry>();
+const SEASON_CACHE_TTL_MS = 5 * 60_000;
 
 /** A civilization is listed once it has been played this many RATED 1v1s. One is enough to be
  *  a fact; what needs a sample is the win RATE, and that bar lives in the launcher, next to the
@@ -502,6 +518,8 @@ interface LeaderRow {
     games_played: number;
     wins: number;
     losses: number;
+    season_wins: number;
+    season_losses: number;
 }
 
 /** One civilization a player has been seen with, and how often. */
@@ -602,13 +620,25 @@ interface TopMapRow { map_name: string; n: number }
  *
  * <p>Note `idx_elo_rating (mode, rating DESC)` no longer serves this ORDER BY. Irrelevant at
  * this size; if the table ever grows, the index to add is on the expression.</p>
+ *
+ * <p><b>One season's ladder.</b> `wins`/`losses` stay what they always were — every decided match
+ * of the mode, all time — because launchers already shipped read them. `season_wins` /
+ * `season_losses` are the RATED matches of the mode stored during this season, the record that
+ * goes with this season's rating and the one the ranking prints.</p>
  */
-async function ladder(ctx: AppContext, mode: 'default' | 'team', limit: number) {
+async function ladder(
+    ctx: AppContext,
+    mode: 'default' | 'team',
+    limit: number,
+    season: number = currentSeason(Date.now()),
+) {
+    const inSeason = seasonPredicate(season, 'm.created_at');
     const rows = await ctx.db.prepare(
         `SELECT u.id, u.discord_username, u.display_name, u.avatar_url,
                 e.rating, e.rd, e.games_played,
-                COALESCE(w.wins, 0) AS wins, COALESCE(w.losses, 0) AS losses
-         FROM elo_ratings e
+                COALESCE(w.wins, 0) AS wins, COALESCE(w.losses, 0) AS losses,
+                COALESCE(s.wins, 0) AS season_wins, COALESCE(s.losses, 0) AS season_losses
+         FROM season_ratings e
          JOIN users u ON u.id = e.user_id
          LEFT JOIN (
              SELECT mp.user_id AS user_id,
@@ -619,10 +649,25 @@ async function ladder(ctx: AppContext, mode: 'default' | 'team', limit: number) 
              WHERE COALESCE(m.rating_mode, 'default') = ?
              GROUP BY mp.user_id
          ) w ON w.user_id = e.user_id
+         LEFT JOIN (
+             SELECT mp.user_id AS user_id,
+                    SUM(CASE WHEN mp.result >= ? THEN 1 ELSE 0 END) AS wins,
+                    SUM(CASE WHEN mp.result <= ? THEN 1 ELSE 0 END) AS losses
+             FROM match_participants mp
+             JOIN matches m ON m.id = mp.match_id
+             WHERE m.rated = 1 AND COALESCE(m.rating_mode, 'default') = ?
+               AND ${inSeason.sql}
+             GROUP BY mp.user_id
+         ) s ON s.user_id = e.user_id
          ${LADDER_WHERE}
          ORDER BY ${LADDER_ORDER_BY}
          LIMIT ?`,
-    ).bind(WIN_AT, LOSS_AT, mode, mode, MIN_DECIDED, limit).all<LeaderRow>();
+    ).bind(
+        WIN_AT, LOSS_AT, mode,
+        WIN_AT, LOSS_AT, mode, ...inSeason.args,
+        mode, MIN_DECIDED, season,
+        limit,
+    ).all<LeaderRow>();
 
     const players = rows.results ?? [];
 
@@ -641,7 +686,12 @@ async function ladder(ctx: AppContext, mode: 'default' | 'team', limit: number) 
     // names the other badge — "#2 in the teams ladder · 1v1: Industrial #5" — so a 1v1 row
     // carries its team position and a team row its 1v1 one. One batched query for the page;
     // the field is omitted on failure, which the launcher reads as "unknown".
-    const other = await ladderRanks(ctx, players.map((p) => p.id), mode === 'team' ? 'default' : 'team');
+    const other = await ladderRanks(
+        ctx, players.map((p) => p.id), mode === 'team' ? 'default' : 'team', season);
+
+    // The medal a top-3 finish in an ended season earns, drawn after the name. One query for
+    // the page; omitted, never invented, when it fails.
+    const titles = await seasonTitles(ctx, players.map((p) => p.id));
 
     // The rank is decided HERE, by the same ordering that produced the list. A client
     // filtering its copy must not renumber: the third row is the third player, not the
@@ -657,10 +707,13 @@ async function ladder(ctx: AppContext, mode: 'default' | 'team', limit: number) 
         games_played: r.games_played,
         wins: r.wins,
         losses: r.losses,
+        season_wins: r.season_wins,
+        season_losses: r.season_losses,
         top_civs: topCivs.get(r.id) ?? [],
         ...(mode === 'team'
             ? { ladder_rank: other.get(r.id) }
             : { ladder_rank_team: other.get(r.id) }),
+        season_title: titles.get(r.id),
     }));
 }
 
@@ -674,14 +727,276 @@ async function ladder(ctx: AppContext, mode: 'default' | 'team', limit: number) 
  * <p>It shares {@link LADDER_WHERE} with the list itself, which is the only reason the two
  * can be trusted to describe the same set of people.</p>
  */
-export async function ladderSize(ctx: AppContext, mode: 'default' | 'team'): Promise<number> {
+export async function ladderSize(
+    ctx: AppContext,
+    mode: 'default' | 'team',
+    season: number = currentSeason(Date.now()),
+): Promise<number> {
     const row = await ctx.db.prepare(
         `SELECT COUNT(*) AS n
-         FROM elo_ratings e
+         FROM season_ratings e
          JOIN users u ON u.id = e.user_id
          ${LADDER_WHERE}`,
-    ).bind(mode, MIN_DECIDED).first<{ n: number }>();
+    ).bind(mode, MIN_DECIDED, season).first<{ n: number }>();
     return row?.n ?? 0;
+}
+
+// ---------------------------------------------------------------- the season record
+
+/**
+ * Every player's FINAL place on every ENDED season's ladders — the record a season leaves.
+ *
+ * <p>The same ordering and the same entry bar as the live ladder ({@link LADDER_ORDER_BY},
+ * {@link MIN_DECIDED}), so a season's final table is exactly the table that stood at its last
+ * instant — with one deliberate difference: <b>no ban filter</b>. A table that dropped a player
+ * banned later would renumber everybody below him, and a place somebody was told they finished
+ * in must never change by itself. Only an operator correction (void/decide, which replays from
+ * that season) can move it, and the command says so.</p>
+ *
+ * <p>ONE definition for every reader — the profile's history, the medals, the past table — so a
+ * player can never be "#3" on one screen and "#4" on another.</p>
+ *
+ * <p>A function rather than a constant for the import-cycle reason badgeMode.ts documents.</p>
+ *
+ * <p>Binds: MIN_DECIDED, then the current season (exclusive: only ended seasons).</p>
+ */
+export function seasonPlacesCte(): string {
+    return `WITH places AS (
+        SELECT e.user_id, e.season, e.mode, e.rating, e.rd, e.games_played,
+               ROW_NUMBER() OVER (PARTITION BY e.season, e.mode ORDER BY ${LADDER_ORDER_BY}) AS place,
+               COUNT(*) OVER (PARTITION BY e.season, e.mode) AS size
+          FROM season_ratings e
+         WHERE e.games_played >= ? AND e.season < ?
+    )`;
+}
+
+/** A top-3 finish in an ended season — the medal drawn after a player's name. */
+export interface SeasonTitle {
+    season: number;
+    place: number;
+    mode: 'default' | 'team';
+}
+
+/** How many places earn a medal. */
+export const SEASON_TITLE_PLACES = 3;
+
+/**
+ * Which medal a player shows when he has several: the most recent season; inside one season the
+ * better place; and between the two ladders at the same place, 1v1. Pure, for the tests.
+ */
+export function pickSeasonTitle(titles: readonly SeasonTitle[]): SeasonTitle | null {
+    let best: SeasonTitle | null = null;
+    for (const t of titles) {
+        if (t.place < 1 || t.place > SEASON_TITLE_PLACES) continue;
+        if (!best
+            || t.season > best.season
+            || (t.season === best.season && t.place < best.place)
+            || (t.season === best.season && t.place === best.place
+                && t.mode === 'default' && best.mode !== 'default')) {
+            best = t;
+        }
+    }
+    return best;
+}
+
+/**
+ * Every top-3 finish of several players, in ONE query. Never throws: on an error the map is
+ * empty and the field is omitted, which the launcher reads as "no medal known" — the same
+ * contract {@link ladderRanks} keeps.
+ */
+export async function seasonTitlesAll(
+    ctx: AppContext,
+    userIds: readonly string[],
+    nowMs: number = Date.now(),
+): Promise<Map<string, SeasonTitle[]>> {
+    const unique = [...new Set(userIds.filter(Boolean))];
+    const out = new Map<string, SeasonTitle[]>();
+    if (unique.length === 0) return out;
+    try {
+        const marks = unique.map(() => '?').join(', ');
+        const rows = await ctx.db.prepare(
+            `${seasonPlacesCte()}
+             SELECT user_id, season, mode, place FROM places
+              WHERE place <= ? AND user_id IN (${marks})
+              ORDER BY season DESC, place ASC`,
+        ).bind(MIN_DECIDED, currentSeason(nowMs), SEASON_TITLE_PLACES, ...unique)
+            .all<{ user_id: string; season: number; mode: string; place: number }>();
+        for (const r of rows.results ?? []) {
+            const list = out.get(r.user_id) ?? [];
+            list.push({ season: r.season, place: r.place, mode: r.mode === 'team' ? 'team' : 'default' });
+            out.set(r.user_id, list);
+        }
+    } catch {
+        out.clear();
+    }
+    return out;
+}
+
+/** The one medal each player shows. Omitted for a player with none, and on failure. */
+export async function seasonTitles(
+    ctx: AppContext,
+    userIds: readonly string[],
+    nowMs: number = Date.now(),
+): Promise<Map<string, SeasonTitle>> {
+    const all = await seasonTitlesAll(ctx, userIds, nowMs);
+    const out = new Map<string, SeasonTitle>();
+    for (const [id, list] of all) {
+        const best = pickSeasonTitle(list);
+        if (best) out.set(id, best);
+    }
+    return out;
+}
+
+/** One player's line in one ended season of one ladder, as his profile lists them. */
+export interface PastSeason {
+    season: number;
+    mode: 'default' | 'team';
+    place: number;
+    size: number;
+    rating: number;
+    rd: number;
+    games_played: number;
+    wins: number;
+    losses: number;
+}
+
+/**
+ * A player's record across every ended season: his final place, the size of that table, his
+ * final rating, and the rated matches he won and lost in it. Newest first.
+ *
+ * <p>The wins and losses are bucketed here by each match's own season rather than counted per
+ * season in SQL: one player's rated history is small, and the bucketing is the same
+ * {@link seasonOfCreatedAt} that filed the matches into their seasons in the first place.</p>
+ */
+export async function pastSeasonsFor(
+    ctx: AppContext,
+    userId: string,
+    nowMs: number = Date.now(),
+): Promise<PastSeason[]> {
+    const places = await ctx.db.prepare(
+        `${seasonPlacesCte()}
+         SELECT season, mode, place, size, rating, rd, games_played FROM places
+          WHERE user_id = ?
+          ORDER BY season DESC, mode ASC`,
+    ).bind(MIN_DECIDED, currentSeason(nowMs), userId).all<{
+        season: number; mode: string; place: number; size: number;
+        rating: number; rd: number; games_played: number;
+    }>();
+    const list = places.results ?? [];
+    if (list.length === 0) return [];
+
+    const record = await seasonRecordFor(ctx, userId);
+    return list.map((p) => {
+        const mode = p.mode === 'team' ? 'team' as const : 'default' as const;
+        const tally = record.get(`${p.season}|${mode}`) ?? { wins: 0, losses: 0 };
+        return {
+            season: p.season, mode, place: p.place, size: p.size,
+            rating: p.rating, rd: p.rd, games_played: p.games_played,
+            wins: tally.wins, losses: tally.losses,
+        };
+    });
+}
+
+/** A player's decided RATED matches, per (season, ladder). Key: `season|mode`. */
+export async function seasonRecordFor(
+    ctx: AppContext,
+    userId: string,
+): Promise<Map<string, { wins: number; losses: number }>> {
+    const rows = await ctx.db.prepare(
+        `SELECT m.created_at, COALESCE(m.rating_mode, 'default') AS mode, mp.result
+           FROM match_participants mp
+           JOIN matches m ON m.id = mp.match_id
+          WHERE mp.user_id = ? AND m.rated = 1`,
+    ).bind(userId).all<{ created_at: string; mode: string; result: number }>();
+    const out = new Map<string, { wins: number; losses: number }>();
+    for (const r of rows.results ?? []) {
+        const key = `${seasonOfCreatedAt(r.created_at)}|${r.mode === 'team' ? 'team' : 'default'}`;
+        const tally = out.get(key) ?? { wins: 0, losses: 0 };
+        if (r.result >= WIN_AT) tally.wins++;
+        else if (r.result <= LOSS_AT) tally.losses++;
+        out.set(key, tally);
+    }
+    return out;
+}
+
+/** An ended season's final table on one ladder, best first. */
+export async function seasonTable(
+    ctx: AppContext,
+    season: number,
+    mode: 'default' | 'team',
+    limit: number,
+    nowMs: number = Date.now(),
+) {
+    const inSeason = seasonPredicate(season, 'm.created_at');
+    const rows = await ctx.db.prepare(
+        `${seasonPlacesCte()}
+         SELECT p.user_id, p.place, p.rating, p.rd, p.games_played,
+                u.discord_username, u.display_name, u.avatar_url,
+                COALESCE(s.wins, 0) AS wins, COALESCE(s.losses, 0) AS losses
+           FROM places p
+           JOIN users u ON u.id = p.user_id
+           LEFT JOIN (
+               SELECT mp.user_id AS user_id,
+                      SUM(CASE WHEN mp.result >= ? THEN 1 ELSE 0 END) AS wins,
+                      SUM(CASE WHEN mp.result <= ? THEN 1 ELSE 0 END) AS losses
+                 FROM match_participants mp
+                 JOIN matches m ON m.id = mp.match_id
+                WHERE m.rated = 1 AND COALESCE(m.rating_mode, 'default') = ?
+                  AND ${inSeason.sql}
+                GROUP BY mp.user_id
+           ) s ON s.user_id = p.user_id
+          WHERE p.season = ? AND p.mode = ?
+          ORDER BY p.place ASC
+          LIMIT ?`,
+    ).bind(
+        MIN_DECIDED, currentSeason(nowMs),
+        WIN_AT, LOSS_AT, mode, ...inSeason.args,
+        season, mode, limit,
+    ).all<{
+        user_id: string; place: number; rating: number; rd: number; games_played: number;
+        discord_username: string; display_name: string; avatar_url: string | null;
+        wins: number; losses: number;
+    }>();
+    return (rows.results ?? []).map((r) => ({
+        // The server's place, which the launcher must not renumber — same rule as the live table.
+        rank: r.place,
+        user_id: r.user_id,
+        discord_username: r.discord_username,
+        display_name: r.display_name,
+        avatar_url: r.avatar_url,
+        rating: r.rating,
+        rd: r.rd,
+        games_played: r.games_played,
+        // A past table's record IS the season's: there is no all-time figure beside it.
+        wins: r.wins,
+        losses: r.losses,
+        season_wins: r.wins,
+        season_losses: r.losses,
+    }));
+}
+
+/** How many players finished an ended season's ladder — the "of 18" in "#3 of 18". */
+export async function seasonTableSize(
+    ctx: AppContext,
+    season: number,
+    mode: 'default' | 'team',
+    nowMs: number = Date.now(),
+): Promise<number> {
+    const row = await ctx.db.prepare(
+        `${seasonPlacesCte()}
+         SELECT COUNT(*) AS n FROM places WHERE season = ? AND mode = ?`,
+    ).bind(MIN_DECIDED, currentSeason(nowMs), season, mode).first<{ n: number }>();
+    return row?.n ?? 0;
+}
+
+/** The calendar as the launcher draws it: the running season, when it ends, and every one so far. */
+export function seasonBlock(nowMs: number) {
+    const current = currentSeason(nowMs);
+    return {
+        current,
+        ends_at: new Date(seasonBounds(current).end).toISOString(),
+        list: seasonList(nowMs),
+    };
 }
 
 export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
@@ -710,7 +1025,10 @@ export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
         const modArgs = modClause(mod).args;
 
         const now = Date.now();
-        const key = communityKey(limit, mod, mode, recent);
+        // Part of the key, so the minute-long memo cannot carry one season's ladder past the
+        // boundary into the next.
+        const season = currentSeason(now);
+        const key = communityKey(limit, mod, mode, recent, season);
 
         // THE MEMO IS CHECKED BEFORE THE QUOTA, and that ordering is the fix rather than a
         // shortcut. ipRateLimit used to be a preHandler, so a request answered entirely out
@@ -745,12 +1063,14 @@ export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
             // of the multiplayer notes: the community strip is one endpoint, because the
             // request budget is per IP and shared behind a Radmin NAT — a second route would
             // cost double for a page nobody asked twice for.
+            // Both are the CURRENT season's: a season that has just begun shows an empty table,
+            // which is the reset as a player sees it. Ended seasons are /stats/season/:n.
             const [leaderboard, leaderboard_team, ranked_players, ranked_players_team] =
                 await Promise.all([
-                    ladder(ctx, 'default', limit),
-                    ladder(ctx, 'team', limit),
-                    ladderSize(ctx, 'default'),
-                    ladderSize(ctx, 'team'),
+                    ladder(ctx, 'default', limit, season),
+                    ladder(ctx, 'team', limit, season),
+                    ladderSize(ctx, 'default', season),
+                    ladderSize(ctx, 'team', season),
                 ]);
 
             // Source is lobbies.created_at, and the wording on the card has to match:
@@ -897,6 +1217,11 @@ export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
                 generated_at: new Date(now).toISOString(),
                 min_decided: MIN_DECIDED,
                 mode,
+                // Which season the two ladders below belong to, when it ends, and every season
+                // so far — what the launcher's season selector and its end-of-season notice are
+                // built from. An older launcher ignores it; a newer one against an older server
+                // reads null and offers no selector.
+                season: seasonBlock(now),
                 leaderboard,
                 // The team ladder rides the same payload. An older launcher ignores the extra
                 // field; a newer one against an older server deserializes it to null, which it
@@ -1243,6 +1568,65 @@ export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
 
         deckCache = { at: now, mod, payload };
         reply.header('Cache-Control', 'public, max-age=60');
+        return payload;
+    });
+
+    /**
+     * An ENDED season's final tables, both ladders — what the ranking shows when a past season
+     * is picked in its selector.
+     *
+     * <p>Only ended seasons: the running one is `/stats/community`, and answering it here too
+     * would give the launcher two sources for one table. A season that has not ended is a 404,
+     * which the launcher reads as "nothing to show", never as an error.</p>
+     *
+     * <p>Memoised for five minutes per (season, limit) rather than for good: an ended season
+     * cannot change by itself, but an operator correction run from `scripts/admin.ts` replays
+     * from that season in ANOTHER process, which no in-memory memo here could hear about.</p>
+     */
+    app.get('/stats/season/:n', {
+        preHandler: [ipRateLimit(ctx, Limits.StatsSeasonIp)],
+    }, async (req, reply) => {
+        const n = parseInt((req.params as { n?: string }).n ?? '', 10);
+        const query = req.query as { limit?: string } | undefined;
+        const parsed = query?.limit ? parseInt(query.limit, 10) : MAX_LIMIT;
+        const limit = Number.isFinite(parsed) ? Math.min(MAX_LIMIT, Math.max(1, parsed)) : MAX_LIMIT;
+
+        const now = Date.now();
+        if (!Number.isFinite(n) || n < 1 || !isClosed(n, now)) throw Errors.NotFound('Season');
+
+        const key = `${n}\u0000${limit}`;
+        const hit = seasonCache.get(key);
+        if (hit && now - hit.at < SEASON_CACHE_TTL_MS) {
+            reply.header('Cache-Control', 'public, max-age=300');
+            return hit.payload;
+        }
+
+        const [leaderboard, leaderboard_team, ranked_players, ranked_players_team] =
+            await Promise.all([
+                seasonTable(ctx, n, 'default', limit, now),
+                seasonTable(ctx, n, 'team', limit, now),
+                seasonTableSize(ctx, n, 'default', now),
+                seasonTableSize(ctx, n, 'team', now),
+            ]);
+
+        const bounds = seasonBounds(n);
+        const payload = {
+            generated_at: new Date(now).toISOString(),
+            season: n,
+            starts_at: bounds.start === null ? null : new Date(bounds.start).toISOString(),
+            ends_at: new Date(bounds.end).toISOString(),
+            min_decided: MIN_DECIDED,
+            leaderboard,
+            leaderboard_team,
+            ranked_players,
+            ranked_players_team,
+        };
+
+        for (const [k, v] of seasonCache) {
+            if (now - v.at >= SEASON_CACHE_TTL_MS) seasonCache.delete(k);
+        }
+        seasonCache.set(key, { at: now, payload });
+        reply.header('Cache-Control', 'public, max-age=300');
         return payload;
     });
 

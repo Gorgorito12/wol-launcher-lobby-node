@@ -17,19 +17,28 @@
  *
  * <p><b>Order is <c>created_at</c>, not <c>started_at</c></b>: ratings were applied when each
  * match was REPORTED, and reports do not always arrive in the order the games were played.
- * Replaying by report order is the faithful reproduction.</p>
+ * Replaying by report order is the faithful reproduction. The same column files each match into
+ * its season (src/elo/seasons.ts), so a replay rebuilds every season in order and each one's
+ * first matches start from the soft reset of the season before.</p>
  *
- * <p>Ratings rows are reset in place rather than deleted, so a player who signed up and never
- * played keeps the 1500/350 row the signup created. Deleting would silently change who has a
- * row at all.</p>
+ * <p><b>It rebuilds FROM a season, never less than that season.</b> `fromSeason = k` deletes the
+ * rows of season k and every later one, clears the stamps of the matches stored since k began,
+ * and replays exactly those matches. Every season before k is left byte-for-byte as it was: its
+ * rows, and its matches' stamps. That is what lets an ended season's table be a permanent record
+ * — the automatic corrections on the server pass the CURRENT season and so can never reach a
+ * closed one, while an operator correcting an old match passes that match's season and gets every
+ * later season re-derived from the corrected result.</p>
+ *
+ * <p>Rows are deleted rather than reset: a season's rows are the players who played a rated match
+ * in it and nobody else, and that is exactly what the replay recreates.</p>
  *
  * <p><b>Inside the server it runs under {@link withLadderLock}.</b> A replay resets every
  * rating and rebuilds them one match at a time; a report rating a match halfway through that
  * would be applied to a half-built ladder and then overwritten. The lock is in-process, which
  * is the whole process — this server is one Node.</p>
  */
-import { applyMatch, DEFAULT_RATING, DEFAULT_RD, DEFAULT_VOLATILITY,
-         type ParticipantOutcome } from './glicko2';
+import { applyMatch, type ParticipantOutcome } from './glicko2';
+import { boundsAsSql, FIRST_SEASON, seasonOfCreatedAt } from './seasons';
 import type { Db } from '../db';
 
 interface ParticipantRow {
@@ -68,38 +77,60 @@ export function withLadderLock<T>(fn: () => Promise<T>): Promise<T> {
     return run;
 }
 
-export async function recomputeLadder(db: Db): Promise<{ matches: number; players: number }> {
+export interface ReplayOptions {
+    /**
+     * The first season to rebuild. Every season before it is untouched. Defaults to Season 1 —
+     * the whole history — which is what an operator's `elo:recompute` means.
+     */
+    fromSeason?: number;
+}
+
+export async function recomputeLadder(
+    db: Db,
+    opts: ReplayOptions = {},
+): Promise<{ matches: number; players: number; fromSeason: number }> {
+    const fromSeason = Math.max(FIRST_SEASON, Math.floor(opts.fromSeason ?? FIRST_SEASON));
+    // Null for Season 1, which has no beginning: everything ever stored is in range.
+    const start = boundsAsSql(fromSeason).start;
+    const since = start === null ? '' : ' AND created_at >= ?';
+    const sinceArgs = start === null ? [] : [start];
+
     // rating_mode travels with each match so the replay can feed it to the ladder it
     // actually belongs to. NULL means a row written before migration 0010, all of which
     // were 1v1 — so it reads as 'default' rather than as unknown.
+    //
+    // Fetched BEFORE the stamps are cleared below. The `rated IS NULL` branch recognises the
+    // matches from before migration 0006 by those stamps; migration 0024 wrote `rated = 1` for
+    // every one of them, so a replay that dies half-way can no longer lose them, but the branch
+    // stays for a database restored from before that migration.
     const rated = await db.prepare(
-        `SELECT id, COALESCE(rating_mode, 'default') AS rating_mode FROM matches
-          WHERE rated = 1
+        `SELECT id, created_at, COALESCE(rating_mode, 'default') AS rating_mode FROM matches
+          WHERE (rated = 1
              OR (rated IS NULL AND EXISTS (
                     SELECT 1 FROM match_participants p
-                     WHERE p.match_id = matches.id AND p.rating_after IS NOT NULL))
+                     WHERE p.match_id = matches.id AND p.rating_after IS NOT NULL)))${since}
           ORDER BY created_at ASC, id ASC`,
-    ).bind().all<{ id: string; rating_mode: string }>();
+    ).bind(...sinceArgs).all<{ id: string; created_at: string; rating_mode: string }>();
 
-    const ids = (rated.results ?? []).map((r) => ({ id: r.id, mode: r.rating_mode }));
+    const list = rated.results ?? [];
 
-    // No WHERE mode: BOTH ladders are being replayed below, so both are reset here. This
-    // is correct only because the loop feeds every match back into its own mode — if this
-    // function is ever narrowed to one ladder, this statement has to be narrowed with it,
-    // or recomputing 1v1 would flatten the team ratings on its way past.
+    // Both ladders of every season being rebuilt, and nothing else. This is correct only because
+    // the loop below feeds every match back into its own mode AND its own season — narrowing the
+    // replay to one ladder without narrowing this statement would wipe the other on its way past.
+    await db.prepare(`DELETE FROM season_ratings WHERE season >= ?`).bind(fromSeason).run();
+
+    // Every stamp in range is rewritten below for the matches that still count; clearing first
+    // is what removes stamps from a match that has just stopped counting. Matches of earlier
+    // seasons keep theirs: their season is not being touched.
     await db.prepare(
-        `UPDATE elo_ratings
-            SET rating = ?, rd = ?, volatility = ?, games_played = 0, updated_at = datetime('now')`,
-    ).bind(DEFAULT_RATING, DEFAULT_RD, DEFAULT_VOLATILITY).run();
-
-    // Every stamp is rewritten below for the matches that still count; clearing first is what
-    // removes stamps from a match that has just stopped counting.
-    await db.prepare(
-        `UPDATE match_participants SET rating_before = NULL, rating_after = NULL`,
-    ).bind().run();
+        start === null
+            ? `UPDATE match_participants SET rating_before = NULL, rating_after = NULL`
+            : `UPDATE match_participants SET rating_before = NULL, rating_after = NULL
+                WHERE match_id IN (SELECT id FROM matches WHERE created_at >= ?)`,
+    ).bind(...sinceArgs).run();
 
     const touched = new Set<string>();
-    for (const { id: matchId, mode } of ids) {
+    for (const { id: matchId, created_at: createdAt, rating_mode: mode } of list) {
         const parts = await db.prepare(
             `SELECT match_id, user_id, team, result FROM match_participants
               WHERE match_id = ? ORDER BY user_id ASC`,
@@ -115,7 +146,8 @@ export async function recomputeLadder(db: Db): Promise<{ matches: number; player
         }));
         if (outcomes.length < 2) continue;
 
-        const diff = await applyMatch(db, outcomes, isTeam ? 'team' : 'default');
+        const diff = await applyMatch(
+            db, outcomes, isTeam ? 'team' : 'default', seasonOfCreatedAt(createdAt));
         const stamps = [];
         for (const o of outcomes) {
             touched.add(o.userId);
@@ -129,5 +161,5 @@ export async function recomputeLadder(db: Db): Promise<{ matches: number; player
         if (stamps.length) await db.batch(stamps);
     }
 
-    return { matches: ids.length, players: touched.size };
+    return { matches: list.length, players: touched.size, fromSeason };
 }

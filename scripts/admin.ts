@@ -41,9 +41,18 @@ import {
     DEFAULT_RATING,
     DEFAULT_RD,
     DEFAULT_VOLATILITY,
+    effectiveRatings,
     type ParticipantOutcome,
     type RatingMode,
 } from '../src/elo/glicko2';
+import {
+    currentSeason,
+    FIRST_SEASON,
+    isClosed,
+    seasonBounds,
+    seasonOfCreatedAt,
+} from '../src/elo/seasons';
+import { MIN_DECIDED, seasonPlacesCte } from '../src/stats/rest';
 import * as tourn from './adminTournaments';
 
 // ---------------------------------------------------------------- argv
@@ -240,22 +249,39 @@ interface RatingRow {
 }
 
 /**
- * One ladder, keyed by user id. `default` is the 1v1 ladder and `team` the one 2v2 and 3v3
- * share (migration 0010). It defaults to 1v1 because that was the only ladder when every
- * existing caller was written, and `scripts/test-admin.ts` relies on that.
+ * One ladder of one season, keyed by user id. `default` is the 1v1 ladder and `team` the one
+ * 2v2 and 3v3 share (migration 0010). The defaults — 1v1, Season 1 — are what every caller meant
+ * before there were seasons, and `scripts/test-admin.ts` builds its fixtures in Season 1.
  */
 export async function readRatings(
     db: Db,
     mode: RatingMode = 'default',
+    season: number = FIRST_SEASON,
 ): Promise<Map<string, RatingRow>> {
     const rows = await db.prepare(
         `SELECT e.user_id, e.rating, e.rd, e.games_played, u.display_name
-           FROM elo_ratings e LEFT JOIN users u ON u.id = e.user_id
-          WHERE e.mode = ?`,
-    ).bind(mode).all<RatingRow>();
+           FROM season_ratings e LEFT JOIN users u ON u.id = e.user_id
+          WHERE e.mode = ? AND e.season = ?`,
+    ).bind(mode, season).all<RatingRow>();
     const map = new Map<string, RatingRow>();
     for (const r of rows.results ?? []) map.set(r.user_id, r);
     return map;
+}
+
+/** Every season that has rows, plus the running one, oldest first. */
+async function knownSeasons(db: Db): Promise<number[]> {
+    const rows = await db.prepare(`SELECT DISTINCT season FROM season_ratings`).bind()
+        .all<{ season: number }>();
+    const set = new Set<number>((rows.results ?? []).map((r) => r.season));
+    set.add(currentSeason(Date.now()));
+    return [...set].sort((a, b) => a - b);
+}
+
+/** The season a stored match belongs to, from its own `created_at`. Null when there is no such match. */
+async function seasonOfMatchId(db: Db, matchId: string): Promise<number | null> {
+    const row = await db.prepare(`SELECT created_at FROM matches WHERE id = ?`)
+        .bind(matchId).first<{ created_at: string }>();
+    return row ? seasonOfCreatedAt(row.created_at) : null;
 }
 
 /** Print who moved between two ladders. The empty case is the interesting one for --verify. */
@@ -289,28 +315,48 @@ const LADDERS: ReadonlyArray<{ mode: RatingMode; label: string }> = [
  * Perform a rating-moving change: on a snapshot when this is a dry run, on the real database
  * when it is not. Either way the operator sees the actual movement before or as it happens.
  *
- * <p>Diffs BOTH ladders, because `recomputeLadder` rebuilds both. A diff of the 1v1 ladder
- * alone printed "(no rating moved)" for a team decision, whose entire effect is on the other
- * ladder. Each one is printed even when nothing moved on it: "1v1 ladder: (no rating moved)"
- * after a team decision is the confirmation that it touched nothing else.</p>
+ * <p>`mutate` returns the SEASON to replay from — the season of the match it edited — or null
+ * to abort. The replay rebuilds that season and every one after it (src/elo/replay.ts) and
+ * leaves every earlier season untouched, so the diff is printed for exactly those seasons, both
+ * ladders each. A diff of one ladder alone printed "(no rating moved)" for a team decision,
+ * whose entire effect is on the other one; every ladder is printed even when nothing moved on
+ * it, because "(no rating moved)" is the confirmation that it touched nothing else.</p>
+ *
+ * <p>Correcting a match of a season that has ENDED rewrites that season's final table — the
+ * places, the medals — and re-derives every season after it. That is the one way a past table
+ * can change, so the command says so before it does it.</p>
  */
 async function withRatingChange(
     dbPath: string,
     label: string,
-    mutate: (db: Db) => Promise<boolean>,
+    mutate: (db: Db) => Promise<number | null>,
 ): Promise<void> {
     const run = async (db: Db, real: boolean): Promise<void> => {
-        const before: Map<string, RatingRow>[] = [];
-        for (const l of LADDERS) before.push(await readRatings(db, l.mode));
-        const ok = await mutate(db);
-        if (!ok) return;
-        const { matches } = await recomputeLadder(db);
+        const seasons = await knownSeasons(db);
+        const before = new Map<string, Map<string, RatingRow>>();
+        for (const n of seasons) {
+            for (const l of LADDERS) before.set(`${n}|${l.mode}`, await readRatings(db, l.mode, n));
+        }
+        const fromSeason = await mutate(db);
+        if (fromSeason === null) return;
+        if (isClosed(fromSeason, Date.now())) {
+            console.log(
+                `NOTE: season ${fromSeason} has ended. This rewrites its final table (places and `
+                + `medals) and re-derives every season after it.`,
+            );
+        }
+        const { matches } = await recomputeLadder(db, { fromSeason });
 
-        console.log(`Ladder replayed from ${matches} rated match(es).`);
-        for (const [i, l] of LADDERS.entries()) {
-            console.log(`${l.label}:`);
-            const moved = printRatingDiff(before[i]!, await readRatings(db, l.mode));
-            if (moved === 0) console.log('  (no rating moved)');
+        console.log(`Ladder replayed from season ${fromSeason}: ${matches} rated match(es).`);
+        if (fromSeason > FIRST_SEASON) console.log(`Seasons before ${fromSeason}: untouched.`);
+        for (const n of await knownSeasons(db)) {
+            if (n < fromSeason) continue;
+            for (const l of LADDERS) {
+                console.log(`season ${n} · ${l.label}:`);
+                const moved = printRatingDiff(
+                    before.get(`${n}|${l.mode}`) ?? new Map(), await readRatings(db, l.mode, n));
+                if (moved === 0) console.log('  (no rating moved)');
+            }
         }
         console.log(
             real
@@ -347,7 +393,7 @@ async function cmdVersions(db: Db): Promise<void> {
     const rows = await db.prepare(
         `SELECT COALESCE(u.last_launcher_version, '') AS version, COUNT(*) AS n
            FROM users u
-          WHERE EXISTS (SELECT 1 FROM elo_ratings e WHERE e.user_id = u.id)
+          WHERE EXISTS (SELECT 1 FROM season_ratings e WHERE e.user_id = u.id)
              OR u.last_launcher_version IS NOT NULL
           GROUP BY version
           ORDER BY n DESC`,
@@ -409,15 +455,18 @@ async function cmdStatus(db: Db): Promise<void> {
     if (reasonRows.length === 0) console.log('  (none)');
     for (const r of reasonRows) console.log(`  ${pad(r.unrated_reason, 26)} ${r.n}`);
 
+    const season = currentSeason(Date.now());
     const players = await db.prepare(
-        `SELECT COUNT(*) AS n FROM elo_ratings WHERE mode = 'default' AND games_played > 0`,
-    ).bind().first<{ n: number }>();
+        `SELECT COUNT(*) AS n FROM season_ratings
+          WHERE mode = 'default' AND season = ? AND games_played > 0`,
+    ).bind(season).first<{ n: number }>();
     const banned = await db.prepare(
         `SELECT COUNT(*) AS n FROM users WHERE is_banned = 1`,
     ).bind().first<{ n: number }>();
 
+    console.log(`Season ${season} (ends ${new Date(seasonBounds(season).end).toISOString()})`);
     console.log('Players');
-    console.log(`  with games ${players?.n ?? 0}   banned ${banned?.n ?? 0}`);
+    console.log(`  with games this season ${players?.n ?? 0}   banned ${banned?.n ?? 0}`);
 }
 
 interface LobbyRow {
@@ -724,10 +773,10 @@ async function cmdMatchDecide(dbPath: string): Promise<void> {
 
     await withRatingChange(dbPath, `match ${id} decided`, async (db) => {
         const m = await db.prepare(`SELECT * FROM matches WHERE id = ?`).bind(id).first<MatchRow>();
-        if (!m) { console.log(`No match '${id}'.`); return false; }
+        if (!m) { console.log(`No match '${id}'.`); return null; }
 
         const user = await findUser(db, winner);
-        if (!user) return false;
+        if (!user) return null;
 
         const parts = await db.prepare(
             `SELECT match_id, user_id, result FROM match_participants WHERE match_id = ?`,
@@ -739,11 +788,11 @@ async function cmdMatchDecide(dbPath: string): Promise<void> {
                 `Match has ${rows.length} participants — only a 1v1 can be decided here.`
                 + (rows.length === 4 || rows.length === 6
                     ? ' For a 2v2 or 3v3 use match:decide-team.' : ''));
-            return false;
+            return null;
         }
         if (!rows.some((p) => p.user_id === user.id)) {
             console.log(`${user.display_name} did not play in this match.`);
-            return false;
+            return null;
         }
 
         console.log(`Match ${id}: winner ${user.display_name}, was '${m.unrated_reason ?? 'rated'}'.`);
@@ -756,7 +805,7 @@ async function cmdMatchDecide(dbPath: string): Promise<void> {
                 `UPDATE match_participants SET result = ? WHERE match_id = ? AND user_id = ?`,
             ).bind(p.user_id === user.id ? 1.0 : 0.0, id, p.user_id)),
         ]);
-        return true;
+        return seasonOfCreatedAt(m.created_at);
     });
 }
 
@@ -928,18 +977,18 @@ async function cmdMatchDecideTeam(dbPath: string): Promise<void> {
         const loserIds: string[] = [];
         for (const needle of needles) {
             const user = await findUser(db, needle);
-            if (!user) return false;   // findUser has already said why.
+            if (!user) return null;   // findUser has already said why.
             loserIds.push(user.id);
         }
 
         const d = await decideTeamMatch(db, id, loserIds);
-        if (!d.ok) { console.log(d.error); return false; }
+        if (!d.ok) { console.log(d.error); return null; }
 
         const names = (ps: TeamDecisionPlayer[]): string => ps.map((p) => p.displayName).join(', ');
         const was = d.was.unratedReason
             ?? (d.was.rated === 1 ? 'rated' : d.was.rated === 0 ? 'unrated' : 'unknown');
         console.log(`Match ${id}: winners ${names(d.winners)}; losers ${names(d.losers)}; was '${was}'.`);
-        return true;
+        return await seasonOfMatchId(db, id);
     });
 }
 
@@ -949,7 +998,7 @@ async function cmdMatchVoid(dbPath: string): Promise<void> {
 
     await withRatingChange(dbPath, `match ${id} voided`, async (db) => {
         const m = await db.prepare(`SELECT * FROM matches WHERE id = ?`).bind(id).first<MatchRow>();
-        if (!m) { console.log(`No match '${id}'.`); return false; }
+        if (!m) { console.log(`No match '${id}'.`); return null; }
 
         console.log(`Match ${id}: voiding (was rated=${m.rated}, reason='${m.unrated_reason ?? '-'}').`);
         // The row is KEPT. It happened, and deleting it would make the history a player has
@@ -963,19 +1012,76 @@ async function cmdMatchVoid(dbPath: string): Promise<void> {
                 `UPDATE match_participants SET result = 0.5 WHERE match_id = ?`,
             ).bind(id),
         ]);
-        return true;
+        return seasonOfCreatedAt(m.created_at);
     });
 }
 
 /**
- * Rebuild the ladder from match history.
+ * Rebuild the ladder from match history — all of it, or from `--from-season N` on.
  *
  * <p>Run it with no other change to CHECK the tool: on untouched data the replay must
- * reproduce the ratings that are already there. If it moves somebody, the replay is not
- * faithful and no correction command should be trusted until that is understood.</p>
+ * reproduce the ratings that are already there, season by season. If it moves somebody, the
+ * replay is not faithful and no correction command should be trusted until that is
+ * understood. Run it BEFORE deploying the seasons migration too: Season 1 is a copy of the
+ * ladder as it stands, and it must equal what a replay produces.</p>
  */
 async function cmdEloRecompute(dbPath: string): Promise<void> {
-    await withRatingChange(dbPath, 'ladder recomputed', async () => true);
+    const raw = flag('from-season');
+    const from = raw === null ? FIRST_SEASON : Math.max(FIRST_SEASON, Math.floor(Number(raw)));
+    if (!Number.isFinite(from)) { console.log('Usage: elo:recompute [--from-season N] [--apply]'); return; }
+    await withRatingChange(dbPath, 'ladder recomputed', async () => from);
+}
+
+/**
+ * An ended season's final tables — who won it, for announcing.
+ *
+ * <p>Read with the same definition the launcher's history and medals use (`seasonPlacesCte`),
+ * so the places printed here are the places players are shown. Defaults to the most recent
+ * season that has ended.</p>
+ */
+async function cmdSeasonShow(db: Db): Promise<void> {
+    const now = Date.now();
+    const running = currentSeason(now);
+    const raw = positionals()[0];
+    const n = raw === undefined ? running - 1 : Math.floor(Number(raw));
+    const limit = Number(flag('limit') ?? 10);
+
+    if (!Number.isFinite(n) || n < FIRST_SEASON) {
+        console.log(
+            `No season has ended yet: season ${running} runs until `
+            + `${new Date(seasonBounds(running).end).toISOString()}.`);
+        return;
+    }
+    if (!isClosed(n, now)) {
+        console.log(`Season ${n} has not ended yet (it ends ${new Date(seasonBounds(n).end).toISOString()}).`);
+        return;
+    }
+
+    const b = seasonBounds(n);
+    console.log(
+        `Season ${n}  ${b.start === null ? 'start' : new Date(b.start).toISOString()} -> `
+        + `${new Date(b.end).toISOString()}`);
+    for (const l of LADDERS) {
+        const rows = await db.prepare(
+            `${seasonPlacesCte()}
+             SELECT p.place, p.size, p.rating, p.rd, p.games_played,
+                    COALESCE(u.display_name, p.user_id) AS name
+               FROM places p LEFT JOIN users u ON u.id = p.user_id
+              WHERE p.season = ? AND p.mode = ?
+              ORDER BY p.place ASC
+              LIMIT ?`,
+        ).bind(MIN_DECIDED, running, n, l.mode, limit).all<{
+            place: number; size: number; rating: number; rd: number; games_played: number; name: string;
+        }>();
+        const list = rows.results ?? [];
+        console.log(`${l.label}${list.length ? ` (${list[0]!.size} player(s))` : ''}:`);
+        if (list.length === 0) console.log('  (nobody played it)');
+        for (const r of list) {
+            console.log(
+                `  #${pad(r.place, 3)} ${pad(r.name, 22)} ${pad(num(r.rating, 1), 8)}`
+                + ` rd ${pad(num(r.rd, 0), 4)} games ${r.games_played}`);
+        }
+    }
 }
 
 async function cmdPlayerShow(db: Db): Promise<void> {
@@ -984,21 +1090,32 @@ async function cmdPlayerShow(db: Db): Promise<void> {
     const u = await findUser(db, needle);
     if (!u) return;
 
-    const r = await db.prepare(
-        `SELECT rating, rd, volatility, games_played, updated_at
-           FROM elo_ratings WHERE user_id = ? AND mode = 'default'`,
-    ).bind(u.id).first<{
-        rating: number; rd: number; volatility: number; games_played: number; updated_at: string;
-    }>();
-
+    const season = currentSeason(Date.now());
     console.log(`${u.display_name}  (${u.discord_username})`);
     console.log(`  id       ${u.id}`);
     console.log(`  banned   ${u.is_banned === 1 ? `yes — ${u.ban_reason ?? 'no reason recorded'}` : 'no'}`);
-    console.log(
-        r
-            ? `  rating   ${num(r.rating, 1)}  rd ${num(r.rd, 1)}  games ${r.games_played}  (${r.updated_at})`
-            : `  rating   no row — counts as ${DEFAULT_RATING}/${DEFAULT_RD}`,
-    );
+    // The running season, as every surface reads it: this season's row, else the soft reset of
+    // the last season played, else the defaults — and which of the three it is.
+    for (const l of LADDERS) {
+        const r = (await effectiveRatings(db, [u.id], l.mode, season)).get(u.id)!;
+        const where = r.source === 'season' ? `season ${season}`
+            : r.source === 'carried' ? 'carried from an earlier season'
+                : `no rated match — counts as ${DEFAULT_RATING}/${DEFAULT_RD}`;
+        console.log(
+            `  ${pad(l.label, 12)} ${num(r.rating, 1)}  rd ${num(r.rd, 1)}  games ${r.games_played}  (${where})`);
+    }
+    const past = await db.prepare(
+        `${seasonPlacesCte()}
+         SELECT season, mode, place, size, rating FROM places
+          WHERE user_id = ? ORDER BY season DESC, mode ASC`,
+    ).bind(MIN_DECIDED, season, u.id).all<{
+        season: number; mode: string; place: number; size: number; rating: number;
+    }>();
+    for (const p of past.results ?? []) {
+        console.log(
+            `  season ${p.season} ${p.mode === 'team' ? 'team' : '1v1 '}  finished #${p.place} of ${p.size}`
+            + `  at ${num(p.rating, 1)}`);
+    }
 
     const stuck = await db.prepare(
         `SELECT m.lobby_id, l.status FROM lobby_members m
@@ -1048,14 +1165,21 @@ async function cmdPlayerReset(dbPath: string): Promise<void> {
     try {
         const u = await findUser(db, needle);
         if (!u) return;
-        console.log(`  ${u.display_name}: rating -> ${DEFAULT_RATING}, rd -> ${DEFAULT_RD}, games -> 0`);
+        const season = currentSeason(Date.now());
+        console.log(
+            `  ${u.display_name}: season ${season} 1v1 rating -> ${DEFAULT_RATING}, `
+            + `rd -> ${DEFAULT_RD}, games -> 0`);
         console.log('Note: this does not erase their matches, so an elo:recompute would undo it.');
+        console.log('Earlier seasons are not touched: they are the record.');
         if (APPLY) {
             await db.prepare(
-                `UPDATE elo_ratings SET rating = ?, rd = ?, volatility = ?, games_played = 0,
-                        updated_at = datetime('now')
-                  WHERE user_id = ? AND mode = 'default'`,
-            ).bind(DEFAULT_RATING, DEFAULT_RD, DEFAULT_VOLATILITY, u.id).run();
+                `INSERT INTO season_ratings
+                     (user_id, mode, season, rating, rd, volatility, games_played, updated_at)
+                 VALUES (?, 'default', ?, ?, ?, ?, 0, datetime('now'))
+                 ON CONFLICT (user_id, mode, season) DO UPDATE SET
+                   rating = excluded.rating, rd = excluded.rd, volatility = excluded.volatility,
+                   games_played = 0, updated_at = datetime('now')`,
+            ).bind(u.id, season, DEFAULT_RATING, DEFAULT_RD, DEFAULT_VOLATILITY).run();
         }
         summarise(1, 'player');
     } finally {
@@ -1130,10 +1254,11 @@ function usage(): void {
                                             rate a stored 2v2/3v3 from its recordings by
                                             naming the losing side, then replay both ladders
   match:void <id>                           stop it counting, then replay the ladder
-  elo:recompute                             replay the ladder; run it alone to self-check
+  elo:recompute [--from-season N]           replay the ladder; run it alone to self-check
+  season:show [n] [--limit N]               an ended season's final tables (default: the last)
   player:show <player>                      rating, ban state, stale memberships
   player:history <player> [--limit N]
-  player:reset <player>                     one player back to ${DEFAULT_RATING}
+  player:reset <player>                     one player back to ${DEFAULT_RATING} this season
   player:ban <player> --reason "..."        |  player:unban <player>
   player:unstick <player>                   clear rows that bar them from every room
 
@@ -1155,7 +1280,7 @@ const KNOWN = new Set([
     'status',
     'rooms:list', 'rooms:close', 'rooms:prune',
     'match:list', 'match:show', 'match:decide', 'match:decide-team', 'match:void',
-    'elo:recompute',
+    'elo:recompute', 'season:show',
     'player:show', 'player:history', 'player:reset',
     'versions',
     'player:ban', 'player:unban', 'player:unstick',
@@ -1197,6 +1322,7 @@ async function main(): Promise<void> {
             case 'player:unban': return await cmdPlayerBan(db, false);
             case 'player:unstick': return await cmdPlayerUnstick(db);
             case 'versions': return await cmdVersions(db);
+            case 'season:show': return await cmdSeasonShow(db);
 
             // Tournaments and teams. The maintainer inspects and overrules; creating,
             // seeding and starting belong to whoever owns the tournament.

@@ -7,6 +7,8 @@ import { join } from 'node:path';
 import { mkdirSync } from 'node:fs';
 import { loadConfig } from './env';
 import { Db } from './db';
+import { effectiveRatings } from './elo/glicko2';
+import { currentSeason } from './elo/seasons';
 import { KvStore } from './kv';
 import { LobbyRoomRegistry, attachGlobalChat } from './lobbies/LobbyRoom';
 import { GlobalChatRoom } from './global/GlobalChatRoom';
@@ -187,17 +189,20 @@ async function main(): Promise<void> {
     registerUsersRest(app, ctx);
 
     // /me — current user + ELO snapshot. Requires auth.
+    //
+    // The rating is the RUNNING season's 1v1 rating, through the same helper every other
+    // surface and applyMatch read — no join on the ratings table, which holds a row per season.
     app.get('/me', { preHandler: [requireAuth()] }, async (req, _reply) => {
         const u = await db.prepare(
             `SELECT u.id, u.discord_username, u.display_name, u.avatar_url, u.created_at,
-                    u.badge_mode,
-                    e.rating, e.rd, e.games_played
+                    u.badge_mode
              FROM users u
-             LEFT JOIN elo_ratings e ON e.user_id = u.id AND e.mode = 'default'
              WHERE u.id = ?`,
-        ).bind(req.userId!).first();
+        ).bind(req.userId!).first<Record<string, unknown>>();
         if (!u) throw Errors.NotFound('User');
-        return u;
+        const elo = (await effectiveRatings(db, [req.userId!], 'default', currentSeason(Date.now())))
+            .get(req.userId!);
+        return { ...u, rating: elo?.rating ?? null, rd: elo?.rd ?? null, games_played: elo?.games_played ?? 0 };
     });
 
     // ----- WebSocket: per-lobby room -----

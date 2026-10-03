@@ -5,8 +5,9 @@ import { isBanned } from '../middleware/auth';
 import { notifyRoomChanged, finalizeRoom } from './discordAnnounce';
 import { runFoundingHook } from '../matches/foundingHook';
 import { verifyCrash, normaliseRecordingOutcome, isNtstatusFailure } from '../elo/crashEvidence';
-import { DEFAULT_RATING, DEFAULT_RD } from '../elo/glicko2';
-import { ladderRanks } from '../stats/rest';
+import { DEFAULT_RATING, DEFAULT_RD, effectiveRatings } from '../elo/glicko2';
+import { currentSeason } from '../elo/seasons';
+import { ladderRanks, seasonTitles, type SeasonTitle } from '../stats/rest';
 import { normalizeBadgeMode } from '../users/badgeMode';
 import type { AppContext } from '../context';
 
@@ -43,25 +44,22 @@ export function attachGlobalChat(gc: { refreshPlayers(): void }): void {
  * number the client sent goes into `client_seconds`, which no verdict reads.</p>
  */
 /**
- * The hello's membership check, which also reads what the roster paints: the avatar, both
- * ladders' rating and deviation, and the badge preference (design handoff 51).
+ * The hello's membership check, which also reads the avatar and the badge preference (design
+ * handoff 51).
  *
- * <p><b>BOTH elo_ratings joins MUST stay LEFT.</b> A row here means "you are in this lobby", so
- * an inner join would throw everybody without a rating row out of the room with 4004
- * not_in_lobby — every player right after a ratings reset, and on the TEAM join every player
- * who has never played a rated team match, which today is nearly everyone. Exported so a test
- * can pin that.</p>
+ * <p><b>It carries NO rating join, and a test pins that.</b> A row here means "you are in this
+ * lobby", so anything joined into it decides who is let in. It used to LEFT JOIN the ratings
+ * table twice — LEFT because an inner join throws everybody without a rating row out with 4004.
+ * With seasons that table holds a row per season, and any join on it would either duplicate the
+ * member or, mis-bound, answer not_in_lobby for everyone. The ratings are read separately, through
+ * effectiveRatings, and a failure there costs a number on the roster, never the room.</p>
  *
  * <p>Binds: lobby id, user id.</p>
  */
 export const MEMBER_HELLO_SQL =
-    `SELECT u.avatar_url AS avatar_url, u.badge_mode AS badge_mode,
-            e.rating AS rating, e.rd AS rd,
-            t.rating AS rating_team, t.rd AS rd_team
+    `SELECT u.avatar_url AS avatar_url, u.badge_mode AS badge_mode
      FROM lobby_members lm
      JOIN users u ON u.id = lm.user_id
-     LEFT JOIN elo_ratings e ON e.user_id = lm.user_id AND e.mode = 'default'
-     LEFT JOIN elo_ratings t ON t.user_id = lm.user_id AND t.mode = 'team'
      WHERE lm.lobby_id = ? AND lm.user_id = ? LIMIT 1`;
 
 export const GAME_EXIT_INSERT_SQL =
@@ -181,6 +179,11 @@ interface MemberEntry {
      * 'highest' | '1v1' | 'team'. A snapshot at join, like everything else here.
      */
     badgeMode?: string;
+    /**
+     * The medal of this member's best recent top-3 finish in an ended season, drawn after the
+     * name. Absent for nearly everybody, and on a failed lookup. A snapshot at join.
+     */
+    seasonTitle?: SeasonTitle;
 }
 
 interface ChatLine {
@@ -411,21 +414,12 @@ class LobbyRoom {
             return;
         }
 
-        // Verify membership AND fetch the avatar AND the rating in one query, so the
-        // roster can paint the member's real Discord photo and their ELO
-        // (room_state/member_joined) without a single extra round-trip.
-        //
-        // The elo_ratings join MUST stay a LEFT JOIN. This query is also the
-        // membership check — a row means "you are in this lobby" — so an inner join
-        // would throw out of the room, with 4004 not_in_lobby, everyone who has no
-        // rating row yet. Right after a ratings reset that is every single player.
+        // Verify membership AND fetch the avatar in one query. The ratings are NOT in it: this
+        // query is the membership check, and see MEMBER_HELLO_SQL for why nothing about ratings
+        // may decide who gets in.
         const member = await ctx.db.prepare(MEMBER_HELLO_SQL).bind(this.lobbyId, userId).first<{
             avatar_url: string | null;
             badge_mode: string | null;
-            rating: number | null;
-            rd: number | null;
-            rating_team: number | null;
-            rd_team: number | null;
         }>();
         if (!member) {
             this.sendError(ws, 'not_in_lobby', 'You are not a member of this lobby');
@@ -441,18 +435,36 @@ class LobbyRoom {
         ).bind(this.lobbyId, userId).run().catch(() => { /* best-effort */ });
 
         const avatarUrl = member.avatar_url ?? undefined;
-        // No row means unrated, and unrated IS the starting rating — see the note on
-        // Member.rating. One place covers both frames below, since room_state sends
-        // this.members as-is and member_joined reuses these two.
-        const rating = member.rating ?? DEFAULT_RATING;
-        const rd = member.rd ?? DEFAULT_RD;
+        // The running season's ratings, through the same helper applyMatch reads: no row means
+        // unrated, which IS the starting rating — see the note on Member.rating — and a player
+        // carried over from last season shows his soft-reset number. A failure leaves them
+        // undefined, so both frames omit them and the launcher shows no number: that costs a
+        // figure on the roster, never the room.
+        const season = currentSeason(Date.now());
+        let rating: number | undefined;
+        let rd: number | undefined;
+        let ratingTeam: number | undefined;
+        let rdTeam: number | undefined;
+        try {
+            const [solo, team] = await Promise.all([
+                effectiveRatings(ctx.db, [userId], 'default', season),
+                effectiveRatings(ctx.db, [userId], 'team', season),
+            ]);
+            rating = solo.get(userId)?.rating ?? DEFAULT_RATING;
+            rd = solo.get(userId)?.rd ?? DEFAULT_RD;
+            ratingTeam = team.get(userId)?.rating ?? DEFAULT_RATING;
+            rdTeam = team.get(userId)?.rd ?? DEFAULT_RD;
+        } catch {
+            // See above.
+        }
         // Never throws; undefined when it could not be worked out, so both frames omit it.
-        const ladderRank = (await ladderRanks(ctx, [userId])).get(userId);
-        // The team ladder (design handoff 51), defaulted and omitted the same way.
-        const ratingTeam = member.rating_team ?? DEFAULT_RATING;
-        const rdTeam = member.rd_team ?? DEFAULT_RD;
-        const ladderRankTeam = (await ladderRanks(ctx, [userId], 'team')).get(userId);
+        const ladderRank = (await ladderRanks(ctx, [userId], 'default', season)).get(userId);
+        // The team ladder (design handoff 51), omitted the same way.
+        const ladderRankTeam = (await ladderRanks(ctx, [userId], 'team', season)).get(userId);
         const badgeMode = normalizeBadgeMode(member.badge_mode);
+        // The medal a top-3 finish in an ended season earns. Omitted when there is none, and on
+        // failure — never invented.
+        const seasonTitle = (await seasonTitles(ctx, [userId])).get(userId);
 
         const now = Date.now();
         this.attached.set(ws, {
@@ -477,6 +489,7 @@ class LobbyRoom {
             rdTeam,
             ladderRankTeam,
             badgeMode,
+            seasonTitle,
         };
 
         this.send(ws, {
@@ -498,6 +511,7 @@ class LobbyRoom {
             rd_team: rdTeam,
             ladder_rank_team: ladderRankTeam,
             badge_mode: badgeMode,
+            season_title: seasonTitle,
         }, ws);
     }
 

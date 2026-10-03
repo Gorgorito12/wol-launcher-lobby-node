@@ -17,6 +17,8 @@
  *    a busy tournament is archived out from under its players.
  */
 import type { Db } from '../db';
+import { effectiveRatings } from '../elo/glicko2';
+import { currentSeason } from '../elo/seasons';
 import type { BracketMatch, BracketUpdate, Slot } from './bracket';
 import type { EntrantStatus, TournamentFormat, TeamSource } from './entrants';
 import { aliveWhereClause, CAPPED_STATUSES, type TournamentStatus } from './lifecycle';
@@ -421,7 +423,12 @@ export async function listOwnDrafts(db: Db, userId: string): Promise<TournamentL
     return r.results ?? [];
 }
 
-/** Rating rows for seeding, for exactly the users asked about. */
+/**
+ * Ratings for seeding, for exactly the users asked about — the RUNNING season's, through the
+ * same helper every rating reader uses. At the start of a season that is the soft reset of the
+ * last one, which is still the best estimate of who is strong; a player with no rated match at
+ * all is left out, and seeding reads that as the default.
+ */
 export async function ratingsFor(
     db: Db,
     userIds: readonly string[],
@@ -429,12 +436,11 @@ export async function ratingsFor(
 ): Promise<Map<string, { rating: number; rd: number }>> {
     const out = new Map<string, { rating: number; rd: number }>();
     if (userIds.length === 0) return out;
-    const marks = userIds.map(() => '?').join(',');
-    const r = await db.prepare(
-        `SELECT user_id, rating, rd FROM elo_ratings
-          WHERE mode = ? AND user_id IN (${marks})`,
-    ).bind(mode, ...userIds).all<{ user_id: string; rating: number; rd: number }>();
-    for (const row of r.results ?? []) out.set(row.user_id, { rating: row.rating, rd: row.rd });
+    const eff = await effectiveRatings(db, userIds, mode, currentSeason(Date.now()));
+    for (const [id, r] of eff) {
+        if (r.source === 'default') continue;
+        out.set(id, { rating: r.rating, rd: r.rd });
+    }
     return out;
 }
 

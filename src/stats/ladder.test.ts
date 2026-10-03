@@ -17,6 +17,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
     MIN_DECIDED, LADDER_ORDER_BY, LADDER_WHERE, conservativeRating, compareLadder, ladderRankSql,
+    seasonPlacesCte, pickSeasonTitle,
 } from './rest';
 
 /** The live table, the day the rule changed. */
@@ -111,6 +112,50 @@ test('the ladder and its size ask the same question', () => {
     // And that it is a WHERE rather than something that would silently splice into the
     // COUNT query, which has no JOINs of its own to hang a condition on.
     assert.match(LADDER_WHERE.trim(), /^WHERE/);
+});
+
+test("THE LADDER IS ONE SEASON'S, and the season is bound LAST", () => {
+    // Without the season the table would list a player once per season he has played, and the
+    // reset would never happen. The season was appended after mode and MIN_DECIDED so every
+    // caller's bind() stayed in order with one extra argument at its end — three, exactly.
+    assert.match(LADDER_WHERE, /e\.season\s*=\s*\?\s*$/);
+    assert.equal((LADDER_WHERE.match(/\?/g) ?? []).length, 3);
+    const order = ['e.mode', 'e.games_played', 'e.season'].map((c) => LADDER_WHERE.indexOf(c));
+    assert.deepEqual([...order].sort((a, b) => a - b), order, 'mode, MIN_DECIDED, season');
+});
+
+test("an ended season's table never renumbers: no ban filter, the ladder's own order", () => {
+    const cte = seasonPlacesCte();
+    assert.ok(cte.includes(`ORDER BY ${LADDER_ORDER_BY}`), 'the same order as the live table');
+    assert.match(cte, /PARTITION BY e\.season, e\.mode/);
+    assert.match(cte, /e\.games_played >= \?/);
+    // Only ENDED seasons, and nobody dropped for a ban that came later.
+    assert.match(cte, /e\.season < \?/);
+    assert.doesNotMatch(cte, /is_banned/);
+});
+
+test('a medal: the most recent season, then the better place, then 1v1', () => {
+    assert.equal(pickSeasonTitle([]), null);
+    assert.deepEqual(
+        pickSeasonTitle([
+            { season: 1, place: 1, mode: 'default' },
+            { season: 2, place: 3, mode: 'team' },
+        ]),
+        { season: 2, place: 3, mode: 'team' });
+    assert.deepEqual(
+        pickSeasonTitle([
+            { season: 2, place: 3, mode: 'default' },
+            { season: 2, place: 2, mode: 'team' },
+        ]),
+        { season: 2, place: 2, mode: 'team' });
+    assert.deepEqual(
+        pickSeasonTitle([
+            { season: 2, place: 1, mode: 'team' },
+            { season: 2, place: 1, mode: 'default' },
+        ]),
+        { season: 2, place: 1, mode: 'default' });
+    // A fourth place is not a medal, whatever else it is.
+    assert.equal(pickSeasonTitle([{ season: 3, place: 4, mode: 'default' }]), null);
 });
 
 test("the room's position and the table's are the same query", () => {
