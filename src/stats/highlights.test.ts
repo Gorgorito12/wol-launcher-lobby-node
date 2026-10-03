@@ -1,7 +1,7 @@
 /** Monthly highlights and the Discord message. Run: `npm test`. */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { computeHighlights, monthBounds, monthOf, previousMonth, renderDiscord, type HighlightRow } from './highlights';
+import { computeHighlights, forCommunity, HIGHLIGHT_LEADERS, monthBounds, monthOf, previousMonth, renderDiscord, type HighlightRow } from './highlights';
 import { dueMonth } from './highlightsAnnounce';
 
 const H = 60 * 60 * 1000;
@@ -199,4 +199,59 @@ test('the favourite winning every match is no upset at all', () => {
         crow('even', 2, 1, { before: 1600, match: 'm2' }), crow('even2', 2, 0, { before: 1600, match: 'm2' }),
     ];
     assert.equal(computeHighlights(rows, b, b.endMs + 1).biggest_upset, null);
+});
+
+// ---------------------------------------------------------------- the top lists (leaders)
+
+test('THE ONE THAT MATTERS: every singular field is the first of its top list', () => {
+    const b = monthBounds('2026-09');
+    const rows: HighlightRow[] = [];
+    // Seven players with different records, enough of everything to fill every list.
+    const names = ['ana', 'beto', 'ciro', 'dora', 'eva', 'fito', 'gus'];
+    names.forEach((n, i) => {
+        for (let d = 1; d <= 12; d++) {
+            rows.push(crow(n, d, d <= 12 - i ? 1 : 0, {
+                before: 1500 + i * 30, ordinal: 30 + d, match: `${n}-${d}`, civ: i % 2 ? 'Germans' : 'Dutch',
+            }));
+        }
+    });
+    const h = computeHighlights(rows, b, b.endMs + 1);
+    assert.deepEqual(h.most_wins, h.leaders.most_wins[0]);
+    assert.deepEqual(h.most_matches, h.leaders.most_matches[0]);
+    assert.deepEqual(h.best_win_rate, h.leaders.best_win_rate[0]);
+    assert.deepEqual(h.top_civ, h.leaders.top_civ[0]);
+    assert.deepEqual(h.biggest_upset ?? null, h.leaders.biggest_upset[0] ?? null);
+    assert.deepEqual(h.biggest_climb.default ?? null, h.leaders.biggest_climb.default[0] ?? null);
+    assert.deepEqual(h.best_streak.default ?? null, h.leaders.best_streak.default[0] ?? null);
+    // At most five, in order.
+    assert.equal(h.leaders.most_wins.length, HIGHLIGHT_LEADERS);
+    assert.deepEqual(h.leaders.most_wins.map((p) => p.user_id), ['ana', 'beto', 'ciro', 'dora', 'eva']);
+    assert.deepEqual(h.leaders.most_wins.map((p) => p.wins), [12, 11, 10, 9, 8]);
+    // Most matches carries the wins too, for the detail line.
+    assert.ok(h.leaders.most_matches.every((p) => typeof p.wins === 'number'));
+});
+
+test('the top lists keep their thresholds: a 9-0, a placement upset and a 2-pick civ stay out', () => {
+    const b = monthBounds('2026-09');
+    const rows: HighlightRow[] = [];
+    for (let d = 1; d <= 9; d++) rows.push(crow('perfecto', d, 1, { civ: 'Rara' }));
+    rows.push(crow('dos', 1, 1, { civ: 'Dos' }), crow('dos', 2, 0, { civ: 'Dos' }));
+    for (let d = 1; d <= 10; d++) rows.push(crow('ana', d, d <= 5 ? 1 : 0, { civ: 'Germans' }));
+    // A newcomer (ordinal 4) beating someone 500 above him: not an upset.
+    rows.push(crow('nuevo', 20, 1, { before: 1500, ordinal: 4, match: 'm-new' }));
+    rows.push(crow('alto', 20, 0, { before: 2000, match: 'm-new' }));
+    const h = computeHighlights(rows, b, b.endMs + 1);
+    assert.deepEqual(h.leaders.best_win_rate.map((p) => p.user_id), ['ana'], 'the 9-0 never enters');
+    assert.ok(h.leaders.biggest_upset.every((u) => u.match_id !== 'm-new'));
+    assert.deepEqual(h.leaders.top_civ.map((c) => c.civ), ['Germans', 'Rara'], 'Dos, with 2 picks, never enters');
+});
+
+test('the community payload carries no top lists', () => {
+    const b = monthBounds('2026-09');
+    const h = computeHighlights([crow('ana', 1, 1)], b, b.endMs + 1);
+    const pair = forCommunity({ current: h, previous: h })!;
+    assert.equal('leaders' in pair.current, false);
+    assert.equal('leaders' in pair.previous, false);
+    assert.equal(pair.current.most_wins?.user_id, 'ana', 'the singular fields stay');
+    assert.equal(forCommunity(null), null);
 });

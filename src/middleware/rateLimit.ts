@@ -168,6 +168,10 @@ export const Limits = {
     // open, and behind one Radmin NAT they share the count. The answer never changes once the
     // season is over, so the launcher keeps it for the session and honest use stays far below.
     StatsSeasonIp:    { scope: 'statss',    keyKind: 'ip',   perMinute: 20,  perDay: 600  } as const,
+    // The month's top lists (the ranking's Highlights view). Its own scope for the same reason
+    // as the tables above: opened lazily by people who keep the community strip open, and
+    // behind one Radmin NAT they share the count. Memoised five minutes server-side.
+    StatsHighlightsIp: { scope: 'statsh',   keyKind: 'ip',   perMinute: 20,  perDay: 600  } as const,
     // Keyed by USER, not IP: two players behind one Radmin NAT each upload their own decks,
     // and an IP budget would make the second one's silently fail. Deliberately tiny — the
     // launcher uploads once a session, and there is no reason for a legitimate client to

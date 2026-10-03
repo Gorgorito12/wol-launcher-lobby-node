@@ -1,13 +1,13 @@
 import type { FastifyInstance } from 'fastify';
 import { chargeIpQuota, ipRateLimit, userRateLimit, Limits } from '../middleware/rateLimit';
 import { requireAuth } from '../middleware/auth';
-import { Errors } from '../lib/errors';
+import { Errors, HttpError } from '../lib/errors';
 import { WIN_AT, LOSS_AT } from '../elo/ratability';
 import { attachParticipants } from '../matches/rest';
 import { decayRd, type RatingMode } from '../elo/glicko2';
 import { isInactive, orderPlacement, PLACEMENT_REQUIRED, placementRequired } from '../elo/placement';
 import { normaliseSqliteTimestamp, sqliteTimestampToMs } from '../lib/time';
-import { highlightsFor, monthOf, previousMonth, type Highlights } from './highlights';
+import { forCommunity, highlightsFor, monthOf, previousMonth, type Highlights } from './highlights';
 import { maybePostMonthlyHighlights } from './highlightsAnnounce';
 import { currentStreaks } from './currentStreaks';
 import type { AppContext } from '../context';
@@ -850,7 +850,9 @@ export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
                     placementSize(ctx, 'default'),
                     placementSize(ctx, 'team'),
                 ]);
-            const monthly_highlights = await cachedHighlights(now);
+            // Without the top lists: every launcher asks for this payload once a minute, and only
+            // the ranking's Highlights view needs them (GET /stats/highlights).
+            const monthly_highlights = forCommunity(await cachedHighlights(now));
 
             // Source is lobbies.created_at, and the wording on the card has to match:
             // this is when people OPEN ROOMS, not when they play. Rooms are stamped by
@@ -1101,6 +1103,21 @@ export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
      * The launcher decides what to SHOW: the record and the count always, a percentage only past
      * its own bar, and never an ordering by that percentage. This endpoint only counts.
      */
+    /**
+     * The month's top lists (the ranking's Highlights view): this month so far and the last one,
+     * with `leaders` — the top five of every highlight. The same five-minute memo as the
+     * community payload, so both answers come from one computation. Fetched lazily, only when
+     * that view opens, under its own rate-limit scope.
+     */
+    app.get('/stats/highlights', {
+        preHandler: [ipRateLimit(ctx, Limits.StatsHighlightsIp)],
+    }, async (_req, reply) => {
+        const payload = await cachedHighlights(Date.now());
+        if (!payload) throw new HttpError(503, 'highlights_unavailable', 'The highlights could not be computed.');
+        reply.header('Cache-Control', 'public, max-age=60');
+        return payload;
+    });
+
     app.get('/stats/civs', {
         preHandler: [ipRateLimit(ctx, Limits.StatsCivsIp)],
     }, async (req, reply) => {

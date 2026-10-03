@@ -326,6 +326,12 @@ civilization of the month (per mod and civ, at least 3 picks) and biggest upset 
 before the match; every participant past placement). Nothing needs a migration: the civilization
 and the mod come from `match_participants.civ` and `matches.mod_id`.
 
+The top five of every one of those (`leaders`) are served apart, by `GET /stats/highlights` —
+the launcher's Ranking › Highlights view, fetched only when it opens. It shares the five-minute
+memo with `/stats/community` (one computation for both) and has its own rate-limit scope,
+`statsh` (20/min · 600/day per IP). `/stats/community` sends the singular fields only, which are
+the first entry of each list.
+
 ### `scripts/reset-elo.ts` is retired
 
 It refuses to run. To correct ratings, use the operator commands.

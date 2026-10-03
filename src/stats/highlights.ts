@@ -52,6 +52,9 @@ export const HIGHLIGHT_MIN_RATE_MATCHES = 10;
 /** Fewest picks in the month for "civilization of the month". */
 export const HIGHLIGHT_MIN_CIV_PICKS = 3;
 
+/** How many entries each top list of the ranking's Highlights view carries. */
+export const HIGHLIGHT_LEADERS = 5;
+
 /** The boundary hour, UTC. */
 const BOUNDARY_HOUR = 6;
 
@@ -136,6 +139,17 @@ export interface UpsetHighlight {
     losers_rating: number;
 }
 
+/** One month's top lists — the ranking's Highlights view reads these (GET /stats/highlights). */
+export interface HighlightLeaders {
+    biggest_climb: Record<RatingMode, ClimbHighlight[]>;
+    most_wins: Array<PlayerRef & { wins: number; matches: number }>;
+    most_matches: Array<PlayerRef & { matches: number; wins: number }>;
+    best_streak: Record<RatingMode, Array<PlayerRef & { wins: number }>>;
+    best_win_rate: Array<PlayerRef & { wins: number; matches: number; percent: number }>;
+    top_civ: CivHighlight[];
+    biggest_upset: UpsetHighlight[];
+}
+
 export interface Highlights {
     month: string;
     starts_at: string;
@@ -144,13 +158,24 @@ export interface Highlights {
     so_far: boolean;
     total_rated: number;
     min_matches: number;
+    /** The thresholds of the best win rate and the civilization of the month, sent so the
+     *  launcher states them without keeping a copy that could drift. */
+    min_rate_matches: number;
+    min_civ_picks: number;
     biggest_climb: Record<RatingMode, ClimbHighlight | null>;
-    most_matches: (PlayerRef & { matches: number }) | null;
+    most_matches: (PlayerRef & { matches: number; wins: number }) | null;
     best_streak: Record<RatingMode, (PlayerRef & { wins: number }) | null>;
     most_wins: (PlayerRef & { wins: number; matches: number }) | null;
     best_win_rate: (PlayerRef & { wins: number; matches: number; percent: number }) | null;
     top_civ: CivHighlight | null;
     biggest_upset: UpsetHighlight | null;
+    /**
+     * The top {@link HIGHLIGHT_LEADERS} of every category. The singular fields above are DERIVED
+     * from these lists (their first entry), never computed apart, so the two cannot disagree.
+     * `/stats/community` strips this before sending ({@link withoutLeaders}): every launcher asks
+     * for that payload once a minute, and only the ranking's Highlights view needs the lists.
+     */
+    leaders: HighlightLeaders;
 }
 
 function better<T extends PlayerRef>(value: (x: T) => number) {
@@ -158,6 +183,11 @@ function better<T extends PlayerRef>(value: (x: T) => number) {
         value(b) - value(a)
         || a.display_name.localeCompare(b.display_name, undefined, { sensitivity: 'base' })
         || (a.user_id < b.user_id ? -1 : a.user_id > b.user_id ? 1 : 0);
+}
+
+/** The first `HIGHLIGHT_LEADERS` of a list already in order. */
+function top<T>(sorted: T[]): T[] {
+    return sorted.slice(0, HIGHLIGHT_LEADERS);
 }
 
 /**
@@ -168,8 +198,8 @@ export function computeHighlights(rows: readonly HighlightRow[], bounds: MonthBo
     const inMonth = rows.filter((r) => r.atMs >= bounds.startMs && r.atMs < bounds.endMs);
     const matchIds = new Set(inMonth.map((r) => r.match_id));
 
-    const climb: Record<RatingMode, ClimbHighlight | null> = { default: null, team: null };
-    const streak: Record<RatingMode, (PlayerRef & { wins: number }) | null> = { default: null, team: null };
+    const climbs: Record<RatingMode, ClimbHighlight[]> = { default: [], team: [] };
+    const streaks: Record<RatingMode, Array<PlayerRef & { wins: number }>> = { default: [], team: [] };
     for (const mode of MODES) {
         const byUser = new Map<string, HighlightRow[]>();
         for (const r of inMonth) {
@@ -178,8 +208,8 @@ export function computeHighlights(rows: readonly HighlightRow[], bounds: MonthBo
             list.push(r);
             byUser.set(r.user_id, list);
         }
-        const climbs: ClimbHighlight[] = [];
-        const streaks: Array<PlayerRef & { wins: number }> = [];
+        const modeClimbs: ClimbHighlight[] = [];
+        const modeStreaks: Array<PlayerRef & { wins: number }> = [];
         for (const list of byUser.values()) {
             list.sort((a, b) => a.atMs - b.atMs || (a.match_id < b.match_id ? -1 : 1));
             const ref = { user_id: list[0]!.user_id, display_name: list[0]!.display_name, avatar_url: list[0]!.avatar_url };
@@ -189,23 +219,15 @@ export function computeHighlights(rows: readonly HighlightRow[], bounds: MonthBo
                 const to = placed[placed.length - 1]!.rating_after;
                 const points = Math.round(to - from);
                 if (points > 0) {
-                    climbs.push({ ...ref, points, matches: placed.length, rating_from: Math.round(from), rating_to: Math.round(to) });
+                    modeClimbs.push({ ...ref, points, matches: placed.length, rating_from: Math.round(from), rating_to: Math.round(to) });
                 }
             }
             const wins = bestWinRunWithin(list.map((r) => ({ atMs: r.atMs, result: r.result })), bounds.startMs, bounds.endMs);
-            if (wins > 0) streaks.push({ ...ref, wins });
+            if (wins > 0) modeStreaks.push({ ...ref, wins });
         }
-        climb[mode] = climbs.sort(better((x) => x.points))[0] ?? null;
-        streak[mode] = streaks.sort(better((x) => x.wins))[0] ?? null;
+        climbs[mode] = top(modeClimbs.sort(better((x) => x.points)));
+        streaks[mode] = top(modeStreaks.sort(better((x) => x.wins)));
     }
-
-    const counts = new Map<string, PlayerRef & { matches: number }>();
-    for (const r of inMonth) {
-        const c = counts.get(r.user_id) ?? { user_id: r.user_id, display_name: r.display_name, avatar_url: r.avatar_url, matches: 0 };
-        c.matches += 1;
-        counts.set(r.user_id, c);
-    }
-    const most = [...counts.values()].sort(better((x) => x.matches))[0] ?? null;
 
     const tally = new Map<string, PlayerRef & { wins: number; matches: number }>();
     for (const r of inMonth) {
@@ -215,13 +237,26 @@ export function computeHighlights(rows: readonly HighlightRow[], bounds: MonthBo
         tally.set(r.user_id, t);
     }
     const players = [...tally.values()];
-    const mostWins = players
+    const mostMatches = top([...players].sort(better((x) => x.matches)))
+        .map((p) => ({ user_id: p.user_id, display_name: p.display_name, avatar_url: p.avatar_url, matches: p.matches, wins: p.wins }));
+    const mostWins = top(players
         .filter((p) => p.wins > 0)
-        .sort((a, b) => b.wins - a.wins || a.matches - b.matches || byName(a, b))[0] ?? null;
-    const bestRate = players
+        .sort((a, b) => b.wins - a.wins || a.matches - b.matches || byName(a, b)))
+        .map((p) => ({ ...p }));
+    const bestRate = top(players
         .filter((p) => p.matches >= HIGHLIGHT_MIN_RATE_MATCHES)
-        .sort((a, b) => b.wins / b.matches - a.wins / a.matches || b.matches - a.matches || byName(a, b))
-        .map((p) => ({ ...p, percent: Math.round((100 * p.wins) / p.matches) }))[0] ?? null;
+        .sort((a, b) => b.wins / b.matches - a.wins / a.matches || b.matches - a.matches || byName(a, b)))
+        .map((p) => ({ ...p, percent: Math.round((100 * p.wins) / p.matches) }));
+
+    const leaders: HighlightLeaders = {
+        biggest_climb: climbs,
+        most_wins: mostWins,
+        most_matches: mostMatches,
+        best_streak: streaks,
+        best_win_rate: bestRate,
+        top_civ: topCivs(inMonth),
+        biggest_upset: biggestUpsets(inMonth),
+    };
 
     return {
         month: bounds.month,
@@ -230,14 +265,30 @@ export function computeHighlights(rows: readonly HighlightRow[], bounds: MonthBo
         so_far: nowMs < bounds.endMs,
         total_rated: matchIds.size,
         min_matches: HIGHLIGHT_MIN_MATCHES,
-        biggest_climb: climb,
-        most_matches: most,
-        best_streak: streak,
-        most_wins: mostWins,
-        best_win_rate: bestRate,
-        top_civ: topCiv(inMonth),
-        biggest_upset: biggestUpset(inMonth),
+        min_rate_matches: HIGHLIGHT_MIN_RATE_MATCHES,
+        min_civ_picks: HIGHLIGHT_MIN_CIV_PICKS,
+        biggest_climb: { default: climbs.default[0] ?? null, team: climbs.team[0] ?? null },
+        most_matches: mostMatches[0] ?? null,
+        best_streak: { default: streaks.default[0] ?? null, team: streaks.team[0] ?? null },
+        most_wins: mostWins[0] ?? null,
+        best_win_rate: bestRate[0] ?? null,
+        top_civ: leaders.top_civ[0] ?? null,
+        biggest_upset: leaders.biggest_upset[0] ?? null,
+        leaders,
     };
+}
+
+/** The same month without its top lists — what `/stats/community` sends. */
+export function withoutLeaders(h: Highlights): Omit<Highlights, 'leaders'> {
+    const { leaders: _leaders, ...rest } = h;
+    return rest;
+}
+
+/** This month and the last as `/stats/community` sends them: without their top lists. */
+export function forCommunity(
+    pair: { current: Highlights; previous: Highlights } | null,
+): { current: Omit<Highlights, 'leaders'>; previous: Omit<Highlights, 'leaders'> } | null {
+    return pair ? { current: withoutLeaders(pair.current), previous: withoutLeaders(pair.previous) } : null;
 }
 
 function byName(a: PlayerRef, b: PlayerRef): number {
@@ -245,8 +296,8 @@ function byName(a: PlayerRef, b: PlayerRef): number {
         || (a.user_id < b.user_id ? -1 : a.user_id > b.user_id ? 1 : 0);
 }
 
-/** The most picked civilization of the month, per (mod, civ). */
-export function topCiv(inMonth: readonly HighlightRow[]): CivHighlight | null {
+/** The most picked civilizations of the month, per (mod, civ), most picked first. */
+export function topCivs(inMonth: readonly HighlightRow[]): CivHighlight[] {
     const picks = new Map<string, CivHighlight>();
     for (const r of inMonth) {
         const civ = (r.civ ?? '').trim();
@@ -258,18 +309,24 @@ export function topCiv(inMonth: readonly HighlightRow[]): CivHighlight | null {
         if (r.result >= 0.999) c.wins += 1;
         picks.set(key, c);
     }
-    return [...picks.values()]
+    return top([...picks.values()]
         .filter((c) => c.picks >= HIGHLIGHT_MIN_CIV_PICKS)
         .sort((a, b) => b.picks - a.picks || b.wins - a.wins
             || a.civ.localeCompare(b.civ, undefined, { sensitivity: 'base' })
-            || (a.mod_id < b.mod_id ? -1 : a.mod_id > b.mod_id ? 1 : 0))[0] ?? null;
+            || (a.mod_id < b.mod_id ? -1 : a.mod_id > b.mod_id ? 1 : 0)));
+}
+
+/** The most picked civilization of the month (the first of {@link topCivs}). */
+export function topCiv(inMonth: readonly HighlightRow[]): CivHighlight | null {
+    return topCivs(inMonth)[0] ?? null;
 }
 
 /**
- * The match won by the side furthest below the losers, on the average rating before it. Every
- * participant must have finished placement on that ladder, and both sides must be present.
+ * The matches won by the side furthest below the losers, on the average rating before them,
+ * biggest gap first. Every participant must have finished placement on that ladder, and both
+ * sides must be present.
  */
-export function biggestUpset(inMonth: readonly HighlightRow[]): UpsetHighlight | null {
+export function biggestUpsets(inMonth: readonly HighlightRow[]): UpsetHighlight[] {
     const byMatch = new Map<string, HighlightRow[]>();
     for (const r of inMonth) {
         const list = byMatch.get(r.match_id) ?? [];
@@ -300,7 +357,12 @@ export function biggestUpset(inMonth: readonly HighlightRow[]): UpsetHighlight |
             losers_rating: Math.round(losersRating),
         });
     }
-    return upsets.sort((a, b) => b.gap - a.gap || (a.match_id < b.match_id ? -1 : a.match_id > b.match_id ? 1 : 0))[0] ?? null;
+    return top(upsets.sort((a, b) => b.gap - a.gap || (a.match_id < b.match_id ? -1 : a.match_id > b.match_id ? 1 : 0)));
+}
+
+/** The biggest upset of the month (the first of {@link biggestUpsets}). */
+export function biggestUpset(inMonth: readonly HighlightRow[]): UpsetHighlight | null {
+    return biggestUpsets(inMonth)[0] ?? null;
 }
 
 /** Every rated participation stored before `endMs`, with its ladder ordinal. Banned players excluded. */
