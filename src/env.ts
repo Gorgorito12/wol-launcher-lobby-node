@@ -114,6 +114,28 @@ export interface Config {
      * release is out locks every player out at once. See DEPLOY.md.</p>
      */
     minLauncherVersion: string;
+
+    /**
+     * The secret behind the one-way IP hashes (src/lib/ipHash.ts). Empty means "derive one from
+     * JWT_SIGNING_KEY", which is fine as long as that key never changes; set it explicitly to
+     * rotate the signing key without forgetting who shared a network last week.
+     */
+    ipHashSecret: string;
+    /** Under this many seconds a match is "very short" for the new-account rule and the alerts. */
+    newAccountShortMatchSeconds: number;
+    /** Alert the operator when one side has beaten the same opponent this many times in a row. */
+    alertFarmStreak: number;
+    /** …or when a pair has played this many very short matches within the window below. */
+    alertShortMatches: number;
+    alertShortWindowDays: number;
+    /** Optional: an operator-only Discord webhook for those alerts. Nothing is posted without it. */
+    discordAdminWebhookUrl: string;
+    /** Where the monthly highlights go. Defaults to the first room-announcement webhook. */
+    discordHighlightsWebhookUrls: string[];
+    /** 'es' | 'en' | 'both'. */
+    discordHighlightsLang: string;
+    /** The highlights of a month are posted only within this many days after it ends. */
+    highlightsPostWindowDays: number;
 }
 
 function intEnv(name: string, fallback: number): number {
@@ -242,6 +264,21 @@ export function loadConfig(): Config {
         crashVoidPerWindow: intEnv('CRASH_VOID_PER_WINDOW', 1),
         crashVoidWindowSeconds: intEnv('CRASH_VOID_WINDOW_SECONDS', 24 * 60 * 60),
         minLauncherVersion: strEnv('MIN_LAUNCHER_VERSION', ''),
+
+        ipHashSecret: strEnv('IP_HASH_SECRET', ''),
+        newAccountShortMatchSeconds: intEnv('NEW_ACCOUNT_SHORT_MATCH_SECONDS', 600),
+        alertFarmStreak: intEnv('ALERT_FARM_STREAK', 5),
+        alertShortMatches: intEnv('ALERT_SHORT_MATCHES', 3),
+        alertShortWindowDays: intEnv('ALERT_SHORT_WINDOW_DAYS', 7),
+        discordAdminWebhookUrl: strEnv('DISCORD_ADMIN_WEBHOOK_URL', ''),
+        discordHighlightsWebhookUrls: (() => {
+            const own = urlListEnv('DISCORD_HIGHLIGHTS_WEBHOOK_URL');
+            if (own.length > 0) return own;
+            const rooms = urlListEnv('DISCORD_WEBHOOK_URL');
+            return rooms.length > 0 ? [rooms[0]!] : [];
+        })(),
+        discordHighlightsLang: strEnv('DISCORD_HIGHLIGHTS_LANG', 'es'),
+        highlightsPostWindowDays: intEnv('HIGHLIGHTS_POST_WINDOW_DAYS', 3),
     };
 
     // Hard fail on missing secrets — we don't want the service to start

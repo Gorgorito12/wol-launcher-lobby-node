@@ -46,25 +46,26 @@ test("unlocking Teams asks the ladder's own question", () => {
 });
 
 test("THE HELLO CARRIES NO RATING JOIN — it is the membership check", () => {
-    // A row here means "you are in this lobby". It used to LEFT JOIN the ratings table twice;
-    // with a row per SEASON in it now, any join there would either list the member once per
-    // season or, mis-bound, answer 4004 not_in_lobby for everyone. The ratings are read
+    // A row here means "you are in this lobby". A join on a ratings table could only duplicate
+    // the member or, mis-bound, answer 4004 not_in_lobby for everyone. The ratings are read
     // separately (effectiveRatings), and a failure there costs a number, never the room.
-    assert.doesNotMatch(MEMBER_HELLO_SQL, /elo_ratings|season_ratings/);
+    // It DOES read the member's role and team, which are lobby_members' own columns.
+    assert.doesNotMatch(MEMBER_HELLO_SQL, /elo_ratings|season_ratings|player_ratings/);
     assert.match(MEMBER_HELLO_SQL, /FROM lobby_members lm/);
     assert.match(MEMBER_HELLO_SQL, /lm\.lobby_id = \? AND lm\.user_id = \?/);
+    assert.match(MEMBER_HELLO_SQL, /lm\.team/);
 });
 
 test("the rooms list carries no rating join either", () => {
-    // Same reason as the hello: a host with rows in two seasons would list his room twice.
-    assert.doesNotMatch(LOBBY_LIST_SQL, /elo_ratings|season_ratings/);
+    // Same reason as the hello: a host with no rating row would vanish from an inner join.
+    assert.doesNotMatch(LOBBY_LIST_SQL, /elo_ratings|season_ratings|player_ratings/);
     assert.match(LOBBY_LIST_SQL, /FROM lobbies l/);
 });
 
-test("unlocking Teams asks THIS season's team ladder", () => {
-    // A place on last season's team ladder does not unlock this season's team badge, exactly as
-    // the badge itself reads Discovery until the first team match of the season.
+test("unlocking Teams asks the TEAM ladder: finished team placement", () => {
+    // Choosing the Teams badge is possible exactly when the team ladder ranks the player, i.e.
+    // after five rated team matches. Before that the badge would read as Discovery.
     const sql = teamBadgeEligibleSql();
-    assert.match(sql, /FROM season_ratings e/);
+    assert.match(sql, /FROM player_ratings e/);
     assert.ok(sql.includes(LADDER_WHERE), sql);
 });

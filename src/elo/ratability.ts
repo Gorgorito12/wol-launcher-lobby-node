@@ -43,11 +43,16 @@ export type UnratedReason =
     /** A match the server FOUNDED from a reading (src/elo/founding.ts) that a later reading
      *  of the same game contradicted. Reverted and replayed out of the ladder. */
     | 'contradicted_founding'
-    /** The match was stored in a season that had ENDED by the time its result could be rated —
-     *  a team match whose corroboration, or a late reading that decided it, arrived after the
-     *  boundary (src/elo/seasons.ts). The result is kept and still advances a tournament; the
-     *  rating is not applied, because an ended season's table is a permanent record. */
-    | 'season_closed';
+    /** LEGACY, never produced any more: seasons were removed (migration 0025). Kept in the type
+     *  because rows stored before that may still carry it, and the launcher still explains it. */
+    | 'season_closed'
+    /** A team game whose sides in the RECORDING differ from the teams chosen in the room
+     *  (`lobbies.teams_at_start`). Stored, shown with both line-ups, not rated: the room promised
+     *  one match and the game played another. */
+    | 'teams_mismatch'
+    /** An account younger than seven days, a very short match, and an opponent on the same
+     *  network (src/elo/newAccount.ts). Stored and shown, not rated. */
+    | 'new_account_short';
 
 /**
  * A win and a loss, as the stored `result` encodes them.
@@ -87,18 +92,6 @@ export function compareReadings(reported: number, confirmed: number): ReadingAgr
     const confirmedWon = confirmed >= WIN_AT;
     return reportedWon === confirmedWon ? 'agree' : 'disagree';
 }
-
-/**
- * Rating deviation above which Glicko is still finding a player's level.
- *
- * Mirrors MatchOutcomeView.ProvisionalRd in the launcher, which uses it to decide
- * whether a rating may be shown at all — a number the server handed out for free
- * must never be painted as if it had been earned. The leaderboard applies the same
- * line: a ladder that mixes settled ratings with three-game ones is sorting noise.
- * The launcher compares with a strict >, so exactly 110 counts as settled on both
- * sides.
- */
-export const PROVISIONAL_RD = 110;
 
 /**
  * A match shorter than this was not a match. The launcher already refuses to

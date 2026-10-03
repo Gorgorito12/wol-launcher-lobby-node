@@ -10,8 +10,8 @@
  * derives. The server only stores the preference and refuses a Teams choice nobody could wear.</p>
  */
 import type { AppContext } from '../context';
-import { currentSeason } from '../elo/seasons';
-import { LADDER_WHERE, MIN_DECIDED } from '../stats/rest';
+import { placementRequired } from '../elo/placement';
+import { LADDER_WHERE } from '../stats/rest';
 
 export const BADGE_MODES = ['highest', '1v1', 'team'] as const;
 export type BadgeMode = (typeof BADGE_MODES)[number];
@@ -41,11 +41,10 @@ export function normalizeBadgeMode(raw: unknown): BadgeMode {
  * <p>Built on {@link LADDER_WHERE}, never restating it: "may wear the team badge" and "is on the
  * team ladder" must be the SAME question, or the selector would unlock a badge the ladder then
  * draws as Discovery (or lock one it draws in colour). A team match only rates once both sides'
- * readings agree, so this is exactly "has a decided team match" while MIN_DECIDED is 1.</p>
+ * readings agree; with placement, it means "has finished team placement" (5 rated team
+ * matches), which is exactly when the team badge stops reading as Discovery.</p>
  *
- * <p>Binds: `'team'`, MIN_DECIDED, the season, the user id. The season is the RUNNING one: a place
- * on last season's team ladder does not unlock this season's team badge, exactly as the badge
- * itself reads Discovery until the first team match of the season.</p>
+ * <p>Binds: `'team'`, the team placement requirement, the user id.</p>
  *
  * <p><b>A function, not a constant, and that is load-bearing:</b> `stats/rest` → `matches/rest`
  * → this module → `stats/rest` is an import cycle, so at the moment this module is evaluated
@@ -55,7 +54,7 @@ export function normalizeBadgeMode(raw: unknown): BadgeMode {
  */
 export function teamBadgeEligibleSql(): string {
     return `SELECT 1 AS ok
-         FROM season_ratings e
+         FROM player_ratings e
          JOIN users u ON u.id = e.user_id
          ${LADDER_WHERE}
            AND e.user_id = ?
@@ -64,7 +63,7 @@ export function teamBadgeEligibleSql(): string {
 
 export async function hasTeamPlace(ctx: AppContext, userId: string): Promise<boolean> {
     const row = await ctx.db.prepare(teamBadgeEligibleSql())
-        .bind('team', MIN_DECIDED, currentSeason(Date.now()), userId)
+        .bind('team', placementRequired('team'), userId)
         .first<{ ok: number }>();
     return !!row;
 }

@@ -25,3 +25,15 @@ export function sqliteTimestampToMs(ts: string | null | undefined): number | nul
     const ms = Date.parse(normaliseSqliteTimestamp(ts));
     return Number.isFinite(ms) ? ms : null;
 }
+
+/**
+ * An epoch instant as SQLite writes `datetime('now')`: `'YYYY-MM-DD HH:MM:SS'`, UTC, no zone.
+ *
+ * <p>Bounds on `matches.created_at` are compared as TEXT, which is only correct because every
+ * insert into `matches` leaves that column to its DEFAULT (a test scans the source to keep it that
+ * way). An ISO value with a `T` would sort after every space-form value of the same day whatever
+ * its time.</p>
+ */
+export function toSqliteText(ms: number): string {
+    return new Date(ms).toISOString().replace('T', ' ').slice(0, 19);
+}
