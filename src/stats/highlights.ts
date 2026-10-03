@@ -1,6 +1,8 @@
 /**
- * Monthly highlights: who climbed the most, who played the most, and the best streak of the
- * month — on the launcher's Rooms page (design 55l) and, once a month, on Discord (55m).
+ * Monthly highlights: who climbed the most, who won and played the most, the best win rate and
+ * streak, the civilization of the month and its biggest upset — on the launcher's Rooms page
+ * (design 55l) and, once a month, on Discord (55m). The Discord message names only the first
+ * three; the rest are launcher-only.
  *
  * <p><b>A month</b> runs from the 1st at 06:00 UTC to the next 1st at 06:00 UTC: midnight in
  * Central America and Mexico, already that day everywhere in Latin America and in Spain. The same
@@ -16,6 +18,18 @@
  *   <li><b>Most matches</b>: rated matches of both ladders.</li>
  *   <li><b>Best streak of the month</b>, per ladder: the longest run of wins whose matches are all
  *       inside the month (src/elo/streaks.ts, bestWinRunWithin).</li>
+ *   <li><b>Most wins</b>: rated wins of both ladders. A tie goes to whoever played FEWER matches —
+ *       the same number of wins out of fewer games is the better month.</li>
+ *   <li><b>Best win rate</b>: rated wins over rated matches, both ladders, for players with at
+ *       least {@link HIGHLIGHT_MIN_RATE_MATCHES} matches in the month, so a 2-0 cannot top it.</li>
+ *   <li><b>Civilization of the month</b>: the most picked civilization in rated matches, per
+ *       (mod, civ) — two mods can share a name and are not the same civilization. Blank civs are
+ *       ignored, and it needs {@link HIGHLIGHT_MIN_CIV_PICKS} picks. The only community figure here:
+ *       it names no player.</li>
+ *   <li><b>Biggest upset</b>: the rated match won by the side whose average rating before it was
+ *       furthest BELOW the losers'. Only matches in which every participant had finished placement
+ *       count — a newcomer's rating is a starting guess, and beating someone "200 above" him says
+ *       nothing yet.</li>
  * </ul>
  * <p>Banned players never appear. A tie goes to the bigger value, then by name, then by id, so the
  * same data always names the same player.</p>
@@ -31,6 +45,12 @@ import type { RatingMode } from '../elo/glicko2';
 
 /** Fewest post-placement rated matches in the month for "biggest climb". */
 export const HIGHLIGHT_MIN_MATCHES = 5;
+
+/** Fewest rated matches in the month for "best win rate". */
+export const HIGHLIGHT_MIN_RATE_MATCHES = 10;
+
+/** Fewest picks in the month for "civilization of the month". */
+export const HIGHLIGHT_MIN_CIV_PICKS = 3;
 
 /** The boundary hour, UTC. */
 const BOUNDARY_HOUR = 6;
@@ -79,6 +99,10 @@ export interface HighlightRow {
     rating_after: number;
     ordinal: number;
     match_id: string;
+    /** The civilization this player played, as the report stored it; null or blank when unknown. */
+    civ?: string | null;
+    /** The match's mod. */
+    mod_id?: string;
 }
 
 export interface PlayerRef {
@@ -94,6 +118,24 @@ export interface ClimbHighlight extends PlayerRef {
     rating_to: number;
 }
 
+export interface CivHighlight {
+    mod_id: string;
+    civ: string;
+    picks: number;
+    wins: number;
+}
+
+export interface UpsetHighlight {
+    mode: RatingMode;
+    match_id: string;
+    /** Losers' average rating before the match minus the winners', rounded; at least 1. */
+    gap: number;
+    winners: PlayerRef[];
+    losers: PlayerRef[];
+    winners_rating: number;
+    losers_rating: number;
+}
+
 export interface Highlights {
     month: string;
     starts_at: string;
@@ -105,6 +147,10 @@ export interface Highlights {
     biggest_climb: Record<RatingMode, ClimbHighlight | null>;
     most_matches: (PlayerRef & { matches: number }) | null;
     best_streak: Record<RatingMode, (PlayerRef & { wins: number }) | null>;
+    most_wins: (PlayerRef & { wins: number; matches: number }) | null;
+    best_win_rate: (PlayerRef & { wins: number; matches: number; percent: number }) | null;
+    top_civ: CivHighlight | null;
+    biggest_upset: UpsetHighlight | null;
 }
 
 function better<T extends PlayerRef>(value: (x: T) => number) {
@@ -161,6 +207,22 @@ export function computeHighlights(rows: readonly HighlightRow[], bounds: MonthBo
     }
     const most = [...counts.values()].sort(better((x) => x.matches))[0] ?? null;
 
+    const tally = new Map<string, PlayerRef & { wins: number; matches: number }>();
+    for (const r of inMonth) {
+        const t = tally.get(r.user_id) ?? { user_id: r.user_id, display_name: r.display_name, avatar_url: r.avatar_url, wins: 0, matches: 0 };
+        t.matches += 1;
+        if (r.result >= 0.999) t.wins += 1;
+        tally.set(r.user_id, t);
+    }
+    const players = [...tally.values()];
+    const mostWins = players
+        .filter((p) => p.wins > 0)
+        .sort((a, b) => b.wins - a.wins || a.matches - b.matches || byName(a, b))[0] ?? null;
+    const bestRate = players
+        .filter((p) => p.matches >= HIGHLIGHT_MIN_RATE_MATCHES)
+        .sort((a, b) => b.wins / b.matches - a.wins / a.matches || b.matches - a.matches || byName(a, b))
+        .map((p) => ({ ...p, percent: Math.round((100 * p.wins) / p.matches) }))[0] ?? null;
+
     return {
         month: bounds.month,
         starts_at: new Date(bounds.startMs).toISOString(),
@@ -171,7 +233,74 @@ export function computeHighlights(rows: readonly HighlightRow[], bounds: MonthBo
         biggest_climb: climb,
         most_matches: most,
         best_streak: streak,
+        most_wins: mostWins,
+        best_win_rate: bestRate,
+        top_civ: topCiv(inMonth),
+        biggest_upset: biggestUpset(inMonth),
     };
+}
+
+function byName(a: PlayerRef, b: PlayerRef): number {
+    return a.display_name.localeCompare(b.display_name, undefined, { sensitivity: 'base' })
+        || (a.user_id < b.user_id ? -1 : a.user_id > b.user_id ? 1 : 0);
+}
+
+/** The most picked civilization of the month, per (mod, civ). */
+export function topCiv(inMonth: readonly HighlightRow[]): CivHighlight | null {
+    const picks = new Map<string, CivHighlight>();
+    for (const r of inMonth) {
+        const civ = (r.civ ?? '').trim();
+        if (!civ) continue;
+        const mod = r.mod_id ?? '';
+        const key = `${mod}\u0000${civ}`;
+        const c = picks.get(key) ?? { mod_id: mod, civ, picks: 0, wins: 0 };
+        c.picks += 1;
+        if (r.result >= 0.999) c.wins += 1;
+        picks.set(key, c);
+    }
+    return [...picks.values()]
+        .filter((c) => c.picks >= HIGHLIGHT_MIN_CIV_PICKS)
+        .sort((a, b) => b.picks - a.picks || b.wins - a.wins
+            || a.civ.localeCompare(b.civ, undefined, { sensitivity: 'base' })
+            || (a.mod_id < b.mod_id ? -1 : a.mod_id > b.mod_id ? 1 : 0))[0] ?? null;
+}
+
+/**
+ * The match won by the side furthest below the losers, on the average rating before it. Every
+ * participant must have finished placement on that ladder, and both sides must be present.
+ */
+export function biggestUpset(inMonth: readonly HighlightRow[]): UpsetHighlight | null {
+    const byMatch = new Map<string, HighlightRow[]>();
+    for (const r of inMonth) {
+        const list = byMatch.get(r.match_id) ?? [];
+        list.push(r);
+        byMatch.set(r.match_id, list);
+    }
+    const avg = (rows: readonly HighlightRow[]) => rows.reduce((s, r) => s + r.rating_before, 0) / rows.length;
+    const ref = (r: HighlightRow): PlayerRef => ({ user_id: r.user_id, display_name: r.display_name, avatar_url: r.avatar_url });
+    const upsets: UpsetHighlight[] = [];
+    for (const [matchId, rows] of byMatch) {
+        const mode = rows[0]!.mode;
+        if (rows.some((r) => r.ordinal <= placementRequired(mode))) continue;
+        const winners = rows.filter((r) => r.result >= 0.999);
+        const losers = rows.filter((r) => r.result <= 0.001);
+        if (winners.length === 0 || losers.length === 0 || winners.length + losers.length !== rows.length) continue;
+        const winnersRating = avg(winners);
+        const losersRating = avg(losers);
+        const gap = Math.round(losersRating - winnersRating);
+        if (gap < 1) continue;
+        const sorted = (list: HighlightRow[]) => [...list].sort((a, b) => byName(ref(a), ref(b))).map(ref);
+        upsets.push({
+            mode,
+            match_id: matchId,
+            gap,
+            winners: sorted(winners),
+            losers: sorted(losers),
+            winners_rating: Math.round(winnersRating),
+            losers_rating: Math.round(losersRating),
+        });
+    }
+    return upsets.sort((a, b) => b.gap - a.gap || (a.match_id < b.match_id ? -1 : a.match_id > b.match_id ? 1 : 0))[0] ?? null;
 }
 
 /** Every rated participation stored before `endMs`, with its ladder ordinal. Banned players excluded. */
@@ -179,7 +308,7 @@ export async function loadHighlightRows(ctx: AppContext, endMs: number): Promise
     const rows = await ctx.db.prepare(
         `WITH rated AS (
              SELECT p.user_id, COALESCE(m.rating_mode, 'default') AS mode, m.id AS match_id,
-                    m.created_at, p.result, p.rating_before, p.rating_after,
+                    m.created_at, p.result, p.rating_before, p.rating_after, p.civ, m.mod_id,
                     ROW_NUMBER() OVER (PARTITION BY p.user_id, COALESCE(m.rating_mode, 'default')
                                        ORDER BY m.created_at, m.id) AS ordinal
                FROM matches m JOIN match_participants p ON p.match_id = m.id
@@ -191,6 +320,7 @@ export async function loadHighlightRows(ctx: AppContext, endMs: number): Promise
     ).bind(toSqliteText(endMs)).all<{
         user_id: string; mode: string; match_id: string; created_at: string; result: number;
         rating_before: number; rating_after: number; ordinal: number;
+        civ: string | null; mod_id: string;
         display_name: string; avatar_url: string | null;
     }>();
     return (rows.results ?? []).map((r) => ({
@@ -204,6 +334,8 @@ export async function loadHighlightRows(ctx: AppContext, endMs: number): Promise
         rating_after: r.rating_after,
         ordinal: r.ordinal,
         match_id: r.match_id,
+        civ: r.civ,
+        mod_id: r.mod_id,
     }));
 }
 

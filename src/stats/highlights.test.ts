@@ -99,3 +99,104 @@ test('when the post is due: within the window, and only for a month that ended a
     assert.equal(dueMonth(octFirst + 4 * D, epochBefore, 3), null, 'past the window');
     assert.equal(dueMonth(octFirst, Date.UTC(2026, 9, 1, 7), 3), null, 'deployed after the month ended');
 });
+
+// ---------------------------------------------------------------- most wins, win rate, civ, upset
+
+function crow(user: string, day: number, result: number, opts: {
+    mode?: 'default' | 'team'; before?: number; ordinal?: number; match?: string; civ?: string | null; mod?: string;
+} = {}): HighlightRow {
+    const r = row(user, opts.mode ?? 'default', day, result, opts.before ?? 1500, (opts.before ?? 1500) + (result ? 10 : -10),
+        opts.ordinal ?? 30, opts.match ?? `${user}-${day}-${result}`);
+    return { ...r, civ: opts.civ ?? null, mod_id: opts.mod ?? 'wol' };
+}
+
+test('most wins adds up both ladders, and a tie goes to whoever played fewer', () => {
+    const b = monthBounds('2026-09');
+    const rows: HighlightRow[] = [
+        // Ana: 3 wins out of 5, two of them in teams.
+        crow('ana', 1, 1), crow('ana', 2, 1, { mode: 'team' }), crow('ana', 3, 1, { mode: 'team' }),
+        crow('ana', 4, 0), crow('ana', 5, 0),
+        // Beto: 3 wins out of 3 — the same wins, fewer games: his month.
+        crow('beto', 1, 1), crow('beto', 2, 1), crow('beto', 3, 1),
+        // Ciro: played the most, won once.
+        ...[1, 2, 3, 4, 5, 6].map((d) => crow('ciro', d, d === 1 ? 1 : 0)),
+    ];
+    const h = computeHighlights(rows, b, b.endMs + 1);
+    assert.equal(h.most_wins?.user_id, 'beto');
+    assert.equal(h.most_wins?.wins, 3);
+    assert.equal(h.most_wins?.matches, 3);
+    assert.equal(h.most_matches?.user_id, 'ciro', 'most matches is still its own highlight');
+});
+
+test('nobody with a win, no most-wins highlight', () => {
+    const b = monthBounds('2026-09');
+    const h = computeHighlights([crow('ana', 1, 0), crow('beto', 2, 0)], b, b.endMs + 1);
+    assert.equal(h.most_wins, null);
+});
+
+test('THE ONE THAT MATTERS: best win rate needs 10 matches — a 9-0 does not enter, a 10-1 does', () => {
+    const b = monthBounds('2026-09');
+    const rows: HighlightRow[] = [];
+    for (let d = 1; d <= 9; d++) rows.push(crow('perfecto', d, 1));
+    for (let d = 1; d <= 11; d++) rows.push(crow('ana', d, d === 11 ? 0 : 1));
+    for (let d = 1; d <= 12; d++) rows.push(crow('beto', d, d <= 6 ? 1 : 0));
+    const h = computeHighlights(rows, b, b.endMs + 1);
+    assert.equal(h.best_win_rate?.user_id, 'ana');
+    assert.equal(h.best_win_rate?.wins, 10);
+    assert.equal(h.best_win_rate?.matches, 11);
+    assert.equal(h.best_win_rate?.percent, 91);
+});
+
+test('with nobody at 10 matches there is no best win rate', () => {
+    const b = monthBounds('2026-09');
+    const rows: HighlightRow[] = [];
+    for (let d = 1; d <= 9; d++) rows.push(crow('ana', d, 1));
+    assert.equal(computeHighlights(rows, b, b.endMs + 1).best_win_rate, null);
+});
+
+test('civilization of the month: blank civs ignored, 3 picks needed, two mods kept apart', () => {
+    const b = monthBounds('2026-09');
+    const rows: HighlightRow[] = [
+        // "Germans" twice in WoL and twice in another mod: two different civilizations, 2 picks each.
+        crow('a', 1, 1, { civ: 'Germans' }), crow('b', 1, 0, { civ: 'Germans' }),
+        crow('c', 2, 1, { civ: 'Germans', mod: 'improvement-mod' }), crow('d', 2, 0, { civ: 'Germans', mod: 'improvement-mod' }),
+        // Blank and null are not a civilization, however many there are.
+        crow('e', 3, 1, { civ: ' ' }), crow('f', 3, 0, { civ: ' ' }), crow('g', 4, 1, { civ: null }),
+        crow('h', 4, 0, { civ: null }), crow('i', 5, 1, { civ: null }),
+    ];
+    assert.equal(computeHighlights(rows, b, b.endMs + 1).top_civ, null, 'nothing reaches 3 picks');
+
+    rows.push(crow('j', 6, 1, { civ: 'Germans' }));
+    const h = computeHighlights(rows, b, b.endMs + 1);
+    assert.deepEqual(h.top_civ, { mod_id: 'wol', civ: 'Germans', picks: 3, wins: 2 });
+});
+
+test('THE ONE THAT MATTERS: the biggest upset uses side averages and only placed players', () => {
+    const b = monthBounds('2026-09');
+    const rows: HighlightRow[] = [
+        // A 1v1 the favourite won: not an upset.
+        crow('fav', 1, 1, { before: 1800, match: 'm1' }), crow('weak', 1, 0, { before: 1500, match: 'm1' }),
+        // A 2v2: Ana (1500) + Luis (1540) beat Pedro (1700) + Sara (1660). Gap = 1680 - 1520 = 160.
+        crow('ana', 2, 1, { mode: 'team', before: 1500, match: 'm2' }), crow('luis', 2, 1, { mode: 'team', before: 1540, match: 'm2' }),
+        crow('pedro', 2, 0, { mode: 'team', before: 1700, match: 'm2' }), crow('sara', 2, 0, { mode: 'team', before: 1660, match: 'm2' }),
+        // A bigger gap, but the winner is still in placement (ordinal 4 of 10): it does not count.
+        crow('nuevo', 3, 1, { before: 1500, ordinal: 4, match: 'm3' }), crow('alto', 3, 0, { before: 2000, match: 'm3' }),
+    ];
+    const h = computeHighlights(rows, b, b.endMs + 1);
+    assert.equal(h.biggest_upset?.match_id, 'm2');
+    assert.equal(h.biggest_upset?.mode, 'team');
+    assert.equal(h.biggest_upset?.gap, 160);
+    assert.deepEqual(h.biggest_upset?.winners.map((p) => p.user_id), ['ana', 'luis']);
+    assert.deepEqual(h.biggest_upset?.losers.map((p) => p.user_id), ['pedro', 'sara']);
+    assert.equal(h.biggest_upset?.winners_rating, 1520);
+    assert.equal(h.biggest_upset?.losers_rating, 1680);
+});
+
+test('the favourite winning every match is no upset at all', () => {
+    const b = monthBounds('2026-09');
+    const rows: HighlightRow[] = [
+        crow('fav', 1, 1, { before: 1800, match: 'm1' }), crow('weak', 1, 0, { before: 1500, match: 'm1' }),
+        crow('even', 2, 1, { before: 1600, match: 'm2' }), crow('even2', 2, 0, { before: 1600, match: 'm2' }),
+    ];
+    assert.equal(computeHighlights(rows, b, b.endMs + 1).biggest_upset, null);
+});

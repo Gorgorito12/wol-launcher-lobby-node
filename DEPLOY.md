@@ -319,6 +319,13 @@ recomputes the community stats after the boundary (within `HIGHLIGHTS_POST_WINDO
 that ended before migration 0029 ran is never posted on its own. `highlights:show [YYYY-MM]` prints
 a month and its message; `highlights:post [YYYY-MM] [--force] --apply` posts it by hand.
 
+What `/stats/community` sends in `monthly_highlights` (each null when nobody qualifies): biggest
+climb and best streak per ladder, most matches, and — launcher only, not in the Discord post —
+most wins (a tie goes to fewer matches), best win rate (at least 10 rated matches in the month),
+civilization of the month (per mod and civ, at least 3 picks) and biggest upset (side averages
+before the match; every participant past placement). Nothing needs a migration: the civilization
+and the mod come from `match_participants.civ` and `matches.mod_id`.
+
 ### `scripts/reset-elo.ts` is retired
 
 It refuses to run. To correct ratings, use the operator commands.
