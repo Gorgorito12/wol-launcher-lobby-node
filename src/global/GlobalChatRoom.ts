@@ -2,10 +2,11 @@ import type { WebSocket } from 'ws';
 import { randomUUID } from 'node:crypto';
 import { verifyJwt } from '../lib/jwt';
 import { isBanned } from '../middleware/auth';
-import { DEFAULT_RATING, DEFAULT_RD, effectiveRatings } from '../elo/glicko2';
-import { currentSeason } from '../elo/seasons';
+import { DEFAULT_RATING, DEFAULT_RD } from '../elo/glicko2';
+import { effectiveRatings } from '../elo/ladder';
+import { isInPlacement } from '../elo/placement';
 import type { AppContext } from '../context';
-import { ladderRanks, seasonTitles, type SeasonTitle } from '../stats/rest';
+import { ladderRanks } from '../stats/rest';
 import { badgeModes, type BadgeMode } from '../users/badgeMode';
 
 /**
@@ -277,16 +278,26 @@ export class GlobalChatRoom {
         lobbyId: string;
         modId: string;
         mapName: string | null;
-        perUser: ReadonlyMap<string, { result: number; before: number | null; after: number | null }>;
+        perUser: ReadonlyMap<string, {
+            result: number; before: number | null; after: number | null;
+            /** Per-player extras: rd_before/after, placement_played/required/completed, entered_rank. */
+            extra?: Record<string, unknown>;
+        }>;
         /** Set when the announcement is that the match STOPPED counting — a verified crash
          *  voided it. The launcher then says so instead of painting a result. */
         unratedReason?: string | null;
+        /** Fields every recipient gets: elo_factor, farm_streak, rating_mode, tournament. */
+        extra?: Record<string, unknown>;
     }): void {
         try {
             for (const [ws, attached] of this.attached) {
                 const mine = notice.perUser.get(attached.userId);
                 if (!mine) continue;
                 this.send(ws, {
+                    // The extras first, so the fields every launcher already reads can never be
+                    // overwritten by one of them.
+                    ...(notice.extra ?? {}),
+                    ...(mine.extra ?? {}),
                     type: 'match_rated',
                     match_id: notice.matchId,
                     lobby_id: notice.lobbyId,
@@ -629,16 +640,18 @@ export class GlobalChatRoom {
         // modes, keyed apart.
         const ratingTeamByUser = new Map<string, number>();
         const rdTeamByUser = new Map<string, number>();
-        const season = currentSeason(Date.now());
+        // Rated matches on each ladder, so the launcher can mark a placement rating with a "?"
+        // and tell a never-played 1500 from an earned one.
+        const gamesByUser = new Map<string, number>();
+        const gamesTeamByUser = new Map<string, number>();
         try {
             const ids = [...new Set([...this.attached.values()].map((a) => a.userId))];
             if (this.ctx && ids.length > 0) {
-                // The running season's ratings, through the same helper applyMatch reads — so a
-                // player carried over from last season shows the number his next match starts
-                // from. Every id comes back, the defaults standing for "unrated".
+                // Through the same helper the engine reads, the deviation grown to now. Every id
+                // comes back, the defaults standing for "unrated".
                 const [solo, team] = await Promise.all([
-                    effectiveRatings(this.ctx.db, ids, 'default', season),
-                    effectiveRatings(this.ctx.db, ids, 'team', season),
+                    effectiveRatings(this.ctx.db, ids, 'default'),
+                    effectiveRatings(this.ctx.db, ids, 'team'),
                 ]);
                 for (const [id, r] of solo) {
                     ratingByUser.set(id, r.rating);
@@ -646,10 +659,12 @@ export class GlobalChatRoom {
                     // ambiguous: the client could not tell a 1500 nobody has played for from
                     // one somebody landed on, so the panel showed both the same.
                     rdByUser.set(id, r.rd);
+                    gamesByUser.set(id, r.games_played);
                 }
                 for (const [id, r] of team) {
                     ratingTeamByUser.set(id, r.rating);
                     rdTeamByUser.set(id, r.rd);
+                    gamesTeamByUser.set(id, r.games_played);
                 }
                 // Set only here: without a ctx no query ran at all, and an empty
                 // roster has nobody to report either way.
@@ -666,29 +681,26 @@ export class GlobalChatRoom {
         // sent WITHOUT the field, which the launcher reads as "unknown" and draws no badge.
         const connectedIds = [...this.attached.values()].map((a) => a.userId);
         const ranks = this.ctx
-            ? await ladderRanks(this.ctx, connectedIds, 'default', season)
+            ? await ladderRanks(this.ctx, connectedIds, 'default')
             : new Map<string, number>();
         // The team ladder and the badge preference, for the badge each player CHOSE (design
         // handoff 51b-51c). Read here rather than cached on the socket for the reason the
         // ratings are: a preference changed mid-session must show on the next broadcast, and
         // POST /me/badge-mode calls refreshPlayers() to cause one.
         const teamRanks = this.ctx
-            ? await ladderRanks(this.ctx, connectedIds, 'team', season)
+            ? await ladderRanks(this.ctx, connectedIds, 'team')
             : new Map<string, number>();
         const modes = this.ctx
             ? await badgeModes(this.ctx, connectedIds)
             : new Map<string, BadgeMode>();
-        // The medal each one earned with a top-3 finish in an ended season, for the players
-        // panel. Absent for most, and for everybody on a failed lookup.
-        const titles = this.ctx
-            ? await seasonTitles(this.ctx, connectedIds)
-            : new Map<string, SeasonTitle>();
 
         const out: {
             userId: string; login: string; avatarUrl: string | null;
             status: string; rating: number | null; rd: number | null; ladderRank?: number;
             ratingTeam: number | null; rdTeam: number | null; ladderRankTeam?: number;
-            badgeMode?: string; seasonTitle?: SeasonTitle;
+            badgeMode?: string;
+            gamesPlayed?: number; gamesPlayedTeam?: number;
+            inPlacement?: boolean; inPlacementTeam?: boolean;
         }[] = [];
         for (const a of this.attached.values()) {
             out.push({
@@ -705,7 +717,12 @@ export class GlobalChatRoom {
                 rdTeam: ratingsKnown ? (rdTeamByUser.get(a.userId) ?? DEFAULT_RD) : null,
                 ladderRankTeam: teamRanks.get(a.userId),
                 badgeMode: modes.get(a.userId),
-                seasonTitle: titles.get(a.userId),
+                gamesPlayed: ratingsKnown ? (gamesByUser.get(a.userId) ?? 0) : undefined,
+                gamesPlayedTeam: ratingsKnown ? (gamesTeamByUser.get(a.userId) ?? 0) : undefined,
+                inPlacement: ratingsKnown
+                    ? isInPlacement(gamesByUser.get(a.userId) ?? 0, 'default') : undefined,
+                inPlacementTeam: ratingsKnown
+                    ? isInPlacement(gamesTeamByUser.get(a.userId) ?? 0, 'team') : undefined,
             });
         }
         return out;

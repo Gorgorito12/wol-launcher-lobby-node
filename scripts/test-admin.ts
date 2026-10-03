@@ -1,6 +1,7 @@
 /**
- * Harness for the operator commands — above all, for the rating replay they lean on — and for
- * rating seasons, which only a real database can exercise.
+ * Harness for the operator commands — above all, for the rating replay they lean on — and for the
+ * rating rules that only a real database can exercise: decay over time, anti-farm, refunds, the
+ * new-account fence and placement.
  *
  * Run: `npx tsx scripts/test-admin.ts`
  *
@@ -9,7 +10,7 @@
  * the ladder without it". That is only sound if a replay over UNCHANGED data reproduces the
  * ratings already in the database, exactly. If it does not, the replay is not faithful and no
  * correction command can be trusted — so that property is asserted before anything else, and
- * asserted again across a season boundary.</p>
+ * again with gaps of days between matches (the deviation decay) and with anti-farm in play.</p>
  *
  * <p>Not in `npm test`, which runs the pure unit tests. This one builds a real SQLite file, so it
  * belongs beside the other `scripts/test-*.ts` harnesses.</p>
@@ -19,15 +20,14 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { FastifyBaseLogger } from 'fastify';
 import { Db } from '../src/db';
-import { applyMatch, effectiveRatings, DEFAULT_RATING, type RatingMode } from '../src/elo/glicko2';
-import { SEASON_2_START, seasonOfCreatedAt, softReset } from '../src/elo/seasons';
+import { DEFAULT_RATING, type RatingMode } from '../src/elo/glicko2';
+import { applyRefund, effectiveRatings, rateStoredMatch } from '../src/elo/ladder';
 import type { AppContext } from '../src/context';
 import { LOBBY_LIST_SQL } from '../src/lobbies/rest';
 import { MEMBER_HELLO_SQL } from '../src/lobbies/LobbyRoom';
 import { latePathsForTests } from '../src/matches/rest';
-import {
-    ladderRanks, ladderSize, pastSeasonsFor, seasonTitlesAll, seasonTable,
-} from '../src/stats/rest';
+import { ladderRanks, ladderSize } from '../src/stats/rest';
+import { loadHighlightRows } from '../src/stats/highlights';
 import { decideTeamMatch, recomputeLadder, readRatings, type TeamRefusal } from './admin';
 
 let failures = 0;
@@ -56,7 +56,7 @@ function sameLadder(a: Map<string, { rating: number; games_played: number }>,
 
 interface Seeded { db: Db; dir: string; }
 
-/** A user row. No rating row: a player gets one with his first rated match of a season. */
+/** A user row. No rating row: a player gets one with his first rated match. */
 async function addUser(db: Db, id: string, name: string): Promise<void> {
     await db.prepare(
         `INSERT INTO users (id, discord_id, discord_username, display_name) VALUES (?, ?, ?, ?)`,
@@ -64,16 +64,17 @@ async function addUser(db: Db, id: string, name: string): Promise<void> {
 }
 
 /**
- * Store a rated 1v1 at `at` and rate it the way the live path does: in the season its own
- * created_at files it into, at report time, then stamp.
+ * Store a rated 1v1 at `at` and rate it the way the live path does: through rateStoredMatch, from
+ * the stored rows, at report time.
  */
-async function playRated(db: Db, id: string, winner: string, loser: string, at: string): Promise<void> {
+async function playRated(db: Db, id: string, winner: string, loser: string, at: string,
+    tournamentMatchId: string | null = null): Promise<void> {
     await db.prepare(
         `INSERT INTO matches (id, lobby_id, host_user_id, mod_id, mod_combined_hash,
                               map_name, duration_seconds, started_at, ended_at, created_at,
-                              rated, unrated_reason)
-         VALUES (?, NULL, ?, 'wol', 'h', 'test_map', 600, ?, ?, ?, 1, NULL)`,
-    ).bind(id, winner, at, at, at).run();
+                              rated, unrated_reason, tournament_match_id)
+         VALUES (?, NULL, ?, 'wol', 'h', 'test_map', 900, ?, ?, ?, 1, NULL, ?)`,
+    ).bind(id, winner, at, at, at, tournamentMatchId).run();
 
     for (const [u, r] of [[winner, 1.0], [loser, 0.0]] as Array<[string, number]>) {
         await db.prepare(
@@ -81,22 +82,13 @@ async function playRated(db: Db, id: string, winner: string, loser: string, at: 
         ).bind(id, u, r).run();
     }
 
-    const diff = await applyMatch(db, [
-        { userId: winner, result: 1 },
-        { userId: loser, result: 0 },
-    ], 'default', seasonOfCreatedAt(at));
-    for (const [uid, d] of diff) {
-        await db.prepare(
-            `UPDATE match_participants SET rating_before = ?, rating_after = ?
-              WHERE match_id = ? AND user_id = ?`,
-        ).bind(d.before, d.after, id, uid).run();
-    }
+    await rateStoredMatch(db, id, 'default');
 }
 
 /**
- * Build a database that looks like one the live server produced: three users, three rated 1v1s
- * in Season 1, and the ratings applied in REPORT order — which is what the live path does, and
- * what the replay has to reproduce.
+ * Build a database that looks like one the live server produced: three users, three rated 1v1s,
+ * and the ratings applied in REPORT order — which is what the live path does, and what the replay
+ * has to reproduce.
  */
 async function seed(): Promise<Seeded> {
     const dir = mkdtempSync(join(tmpdir(), 'wol-admin-test-'));
@@ -155,23 +147,9 @@ async function stateOf(db: Db): Promise<string> {
     return JSON.stringify([
         await read(`SELECT * FROM matches ORDER BY id`),
         await read(`SELECT * FROM match_participants ORDER BY match_id, user_id`),
-        await read(`SELECT user_id, mode, season, rating, rd, volatility, games_played
-                      FROM season_ratings ORDER BY user_id, mode, season`),
+        await read(`SELECT user_id, mode, rating, rd, volatility, games_played
+                      FROM player_ratings ORDER BY user_id, mode`),
     ]);
-}
-
-/** One season's rows and its matches' stamps, to the last bit — "this season was not touched". */
-async function seasonState(db: Db, season: number, before: string): Promise<string> {
-    const rows = await db.prepare(
-        `SELECT user_id, mode, rating, rd, volatility, games_played FROM season_ratings
-          WHERE season = ? ORDER BY user_id, mode`,
-    ).bind(season).all();
-    const stamps = await db.prepare(
-        `SELECT p.match_id, p.user_id, p.rating_before, p.rating_after
-           FROM match_participants p JOIN matches m ON m.id = p.match_id
-          WHERE m.created_at < ? ORDER BY p.match_id, p.user_id`,
-    ).bind(before).all();
-    return JSON.stringify([rows.results, stamps.results]);
 }
 
 /** The same ladder to the last bit (rating, deviation and games), for "exactly unchanged". */
@@ -193,7 +171,7 @@ function identicalLadder(a: Map<string, { rating: number; rd: number; games_play
 function fakeContext(db: Db, announced: unknown[]): AppContext {
     return {
         db,
-        config: { rankedModIds: ['wol'] },
+        config: { rankedModIds: ['wol'], newAccountShortMatchSeconds: 600 },
         rooms: { get: () => undefined },
         globalChat: {
             announceMatchRated: (n: unknown) => { announced.push(n); },
@@ -203,11 +181,6 @@ function fakeContext(db: Db, announced: unknown[]): AppContext {
 }
 
 const quietLog = { info() {}, warn() {}, error() {}, debug() {} } as unknown as FastifyBaseLogger;
-
-/** Rating of one player on one ladder in one season, NaN when he has no row there. */
-async function ratingIn(db: Db, user: string, season: number, mode: RatingMode = 'default'): Promise<number> {
-    return (await readRatings(db, mode, season)).get(user)?.rating ?? NaN;
-}
 
 async function main(): Promise<void> {
     // ---- 1. fidelity: a replay of untouched history must change nothing -------------
@@ -336,7 +309,7 @@ async function main(): Promise<void> {
 
         await recomputeLadder(db);
         const after = await readRatings(db);
-        const eff = (await effectiveRatings(db, ['u-z'], 'default', 1)).get('u-z');
+        const eff = (await effectiveRatings(db, ['u-z'], 'default')).get('u-z');
         check(
             'a player who never played has no rating row and reads as the starting 1500',
             !after.has('u-z') && eff?.source === 'default'
@@ -488,259 +461,144 @@ async function main(): Promise<void> {
         rmSync(dir, { recursive: true, force: true });
     }
 
-    // ================================================================ seasons
+    // ================================================================ the new rules
 
-    // ---- 9. a new season starts from the soft reset — and the stamp says so -------------
+    // ---- 9. decay: days between matches, and the replay still reproduces them exactly ---
     {
         const { db, dir } = await seed();
-        const aEnd = await ratingIn(db, 'u-a', 1);
-        const cEnd = await ratingIn(db, 'u-c', 1);
+        await playRated(db, 'g1', 'u-b', 'u-a', '2026-08-20 10:00:00');   // after 19 idle days
+        await playRated(db, 'g2', 'u-c', 'u-b', '2026-09-30 22:00:00');   // after 40 more
+        const live = await readRatings(db);
+        await recomputeLadder(db);
+        const replayed = await readRatings(db);
+        const drift = identicalLadder(live, replayed);
+        check('with idle gaps between matches, a replay reproduces the ladder to the bit', drift === null, drift ?? '');
 
-        await playRated(db, 's2a', 'u-c', 'u-a', '2026-12-02 20:00:00');
-
-        const stamp = await db.prepare(
-            `SELECT user_id, rating_before FROM match_participants WHERE match_id = 's2a' ORDER BY user_id`,
-        ).bind().all<{ user_id: string; rating_before: number }>();
-        const before = new Map((stamp.results ?? []).map((r) => [r.user_id, r.rating_before]));
-        const aStart = softReset({ rating: aEnd, rd: 0, volatility: 0.06 }).rating;
-        const cStart = softReset({ rating: cEnd, rd: 0, volatility: 0.06 }).rating;
-        check(
-            "THE ONE THAT MATTERS: a player's first match of a season starts from the soft reset",
-            Math.abs((before.get('u-a') ?? NaN) - aStart) < 0.001
-            && Math.abs((before.get('u-c') ?? NaN) - cStart) < 0.001,
-            `a ${before.get('u-a')} vs ${aStart}; c ${before.get('u-c')} vs ${cStart}`,
-        );
-
-        const s2 = await readRatings(db, 'default', 2);
-        check(
-            'the new season has rows only for who played in it, one game each',
-            s2.size === 2 && s2.get('u-a')?.games_played === 1 && s2.get('u-c')?.games_played === 1,
-            [...s2.keys()].join(),
-        );
-        check(
-            'Season 1 keeps its final rows untouched',
-            Math.abs((await ratingIn(db, 'u-a', 1)) - aEnd) < 1e-9
-            && Math.abs((await ratingIn(db, 'u-c', 1)) - cEnd) < 1e-9,
-        );
-
-        // And the number the profile shows before that first match is the same number.
-        const bEff = (await effectiveRatings(db, ['u-b'], 'default', 2)).get('u-b')!;
-        check(
-            'a carried player reads as the soft-reset number, with no games this season',
-            bEff.source === 'carried' && bEff.games_played === 0
-            && Math.abs(bEff.rating - softReset({
-                rating: await ratingIn(db, 'u-b', 1), rd: 0, volatility: 0.06 }).rating) < 0.001,
-            JSON.stringify(bEff),
-        );
+        const atMatch = (await effectiveRatings(db, ['u-a'], 'default', Date.parse('2026-08-01T10:03:00Z'))).get('u-a')!;
+        const later = (await effectiveRatings(db, ['u-a'], 'default', Date.parse('2026-12-01T10:03:00Z'))).get('u-a')!;
+        check('a player who sits out is shown a larger deviation, never a different rating',
+            later.rd > atMatch.rd && later.rating === atMatch.rating,
+            `${atMatch.rd.toFixed(1)} -> ${later.rd.toFixed(1)}`);
         db.close();
         rmSync(dir, { recursive: true, force: true });
     }
 
-    // ---- 10. replay fidelity across a boundary, every season and both ladders ----------
+    // ---- 10. anti-farm: stored per match, and the replay reproduces every factor ----------
     {
         const { db, dir } = await seed();
-        await playRated(db, 's2a', 'u-c', 'u-a', '2026-12-02 20:00:00');
-        await playRated(db, 's2b', 'u-b', 'u-c', '2027-01-15 21:00:00');
-        await playRated(db, 's3a', 'u-a', 'u-b', '2027-03-10 18:00:00');
-
-        const live = [1, 2, 3].map(async (n) => [n, await readRatings(db, 'default', n)] as const);
-        const before = await Promise.all(live);
-        const { matches } = await recomputeLadder(db);
-        let drift: string | null = null;
-        for (const [n, ladder] of before) {
-            const d = identicalLadder(ladder, await readRatings(db, 'default', n));
-            if (d) { drift = `season ${n}: ${d}`; break; }
+        for (let i = 0; i < 5; i++) {
+            await playRated(db, `f${i}`, 'u-a', 'u-b', `2026-08-02 1${i}:00:00`);
         }
-        check('a full replay reads every season\'s matches', matches === 6, `got ${matches}`);
-        check('replaying unchanged history reproduces EVERY season exactly', drift === null, drift ?? '');
+        const factors = async () => (await db.prepare(
+            `SELECT elo_factor, farm_streak FROM matches WHERE id LIKE 'f%' ORDER BY id`,
+        ).bind().all<{ elo_factor: number; farm_streak: number }>()).results ?? [];
+        const live = await factors();
+        // m1 already had a beat b on 08-01, so these are wins 2..6 of the streak.
+        check('the factors of a streak against the same rival: 100, 90, 80, 70, 60',
+            JSON.stringify(live.map((r) => r.elo_factor)) === JSON.stringify([1, 0.9, 0.8, 0.7, 0.6]),
+            JSON.stringify(live));
+        const stamps = await db.prepare(
+            `SELECT rating_before, rating_after FROM match_participants WHERE match_id = 'f4' ORDER BY user_id`,
+        ).bind().all<{ rating_before: number; rating_after: number }>();
+        const [winner, loser] = stamps.results ?? [];
+        check('both players are scaled: the loser loses less too',
+            winner!.rating_after > winner!.rating_before && loser!.rating_after < loser!.rating_before);
+        const ratingsBefore = await readRatings(db);
+        await recomputeLadder(db);
+        check('the replay stores the same factors', JSON.stringify(await factors()) === JSON.stringify(live));
+        const drift = identicalLadder(ratingsBefore, await readRatings(db));
+        check('and the same ladder', drift === null, drift ?? '');
         db.close();
         rmSync(dir, { recursive: true, force: true });
     }
 
-    // ---- 11. a row with no games carries nothing ----------------------------------------
+    // ---- 11. a tournament game is never discounted and never part of the chain ------------
     {
         const { db, dir } = await seed();
-        await addUser(db, 'u-r', 'reset');
-        // What `player:reset` leaves: a row with no games — here at a rating that would matter.
+        await playRated(db, 'f1', 'u-a', 'u-b', '2026-08-02 10:00:00');
+        await playRated(db, 'f2', 'u-a', 'u-b', '2026-08-02 11:00:00', 'TM-1');
+        await playRated(db, 'f3', 'u-a', 'u-b', '2026-08-02 12:00:00');
+        const rows = (await db.prepare(
+            `SELECT id, elo_factor, farm_streak FROM matches WHERE id IN ('f1','f2','f3') ORDER BY id`,
+        ).bind().all<{ id: string; elo_factor: number; farm_streak: number | null }>()).results ?? [];
+        check('the tournament game counts in full and is not in the chain',
+            rows[1]!.elo_factor === 1 && rows[1]!.farm_streak === null, JSON.stringify(rows[1]));
+        // m1 (the day before, under 24 h earlier) and f1 are wins 1 and 2; f3 is the 3rd — the
+        // tournament game in between neither counted nor broke the chain.
+        check('the next ordinary game continues the chain as if it were not there',
+            rows[2]!.elo_factor === 0.9 && rows[2]!.farm_streak === 3, JSON.stringify(rows[2]));
+        db.close();
+        rmSync(dir, { recursive: true, force: true });
+    }
+
+    // ---- 12. ban refunds ----------------------------------------------------------------
+    {
+        const { db, dir } = await seed();
+        // a beat b (m1) and a beat c (m3): b and c lost points to a. Ban a with a refund.
+        const bBefore = (await readRatings(db)).get('u-b')!.rating;
+        await db.prepare(`UPDATE users SET is_banned = 1 WHERE id = 'u-a'`).bind().run();
         await db.prepare(
-            `INSERT INTO season_ratings (user_id, mode, season, rating, rd, volatility, games_played)
-             VALUES ('u-r', 'default', 1, 1900, 120, 0.06, 0)`,
+            `INSERT INTO ban_refunds (id, banned_user_id, reason) VALUES ('R1', 'u-a', 'cheating')`,
         ).bind().run();
-        const eff = (await effectiveRatings(db, ['u-r'], 'default', 2)).get('u-r')!;
-        check(
-            'a season with no games carries nothing into the next one',
-            eff.source === 'default' && Math.abs(eff.rating - DEFAULT_RATING) < 0.05,
-            JSON.stringify(eff),
-        );
+        const given = await applyRefund(db, 'R1');
+        const b = given.find((g) => g.userId === 'u-b');
+        const lostToA = await db.prepare(
+            `SELECT rating_before - rating_after AS lost FROM match_participants WHERE match_id = 'm1' AND user_id = 'u-b'`,
+        ).bind().first<{ lost: number }>();
+        check('THE ONE THAT MATTERS: each opponent gets back exactly what he lost to the cheater',
+            !!b && Math.abs(b.points - lostToA!.lost) < 1e-9 && given.every((g) => g.userId !== 'u-a'),
+            JSON.stringify(given));
+        check('the refund lands on the rating',
+            Math.abs((await readRatings(db)).get('u-b')!.rating - (bBefore + b!.points)) < 1e-9);
+
+        await db.prepare(`UPDATE rating_refunds SET seen_at = '2026-10-01 00:00:00' WHERE user_id = 'u-b'`).bind().run();
+        const once = await readRatings(db);
+        await recomputeLadder(db);
+        const again = await readRatings(db);
+        const drift = identicalLadder(once, again);
+        check('a replay re-derives the refund and changes nothing', drift === null, drift ?? '');
+        const seen = await db.prepare(`SELECT seen_at FROM rating_refunds WHERE user_id = 'u-b'`).bind()
+            .first<{ seen_at: string | null }>();
+        check('and keeps the player\'s "Got it"', seen?.seen_at === '2026-10-01 00:00:00');
+
+        // Voiding m1 means b never lost to a: his refund disappears with the replay.
+        await db.prepare(`UPDATE matches SET rated = 0, unrated_reason = 'voided_by_operator' WHERE id = 'm1'`).bind().run();
+        await db.prepare(`UPDATE match_participants SET result = 0.5 WHERE match_id = 'm1'`).bind().run();
+        await recomputeLadder(db);
+        const left = await db.prepare(`SELECT COUNT(*) AS n FROM rating_refunds WHERE user_id = 'u-b'`).bind()
+            .first<{ n: number }>();
+        check('voiding the match it paid for removes the refund line', left?.n === 0);
+
+        await db.prepare(`UPDATE ban_refunds SET revoked_at = datetime('now') WHERE id = 'R1'`).bind().run();
+        await recomputeLadder(db);
+        const none = await db.prepare(`SELECT COUNT(*) AS n FROM rating_refunds`).bind().first<{ n: number }>();
+        check('a revoked refund leaves nothing behind', none?.n === 0);
         db.close();
         rmSync(dir, { recursive: true, force: true });
     }
 
-    // ---- 12. skipping a season carries once -----------------------------------------------
+    // ---- 13. the new-account fence in a late path ------------------------------------------
     {
-        const { db, dir } = await seed();
-        const aEnd = await ratingIn(db, 'u-a', 1);
-        const bEnd = await ratingIn(db, 'u-b', 1);
-        // Nothing in Season 2. Back in Season 3.
-        await playRated(db, 's3a', 'u-a', 'u-b', '2027-03-10 18:00:00');
-        const stamp = await db.prepare(
-            `SELECT rating_before FROM match_participants WHERE match_id = 's3a' AND user_id = 'u-a'`,
-        ).bind().first<{ rating_before: number }>();
-        const once = softReset({ rating: aEnd, rd: 0, volatility: 0.06 }).rating;
-        check(
-            'a player who skipped a season starts from ONE soft reset of the last one he played',
-            Math.abs((stamp?.rating_before ?? NaN) - once) < 0.001,
-            `${stamp?.rating_before} vs ${once} (two would be ${softReset({ rating: once, rd: 0, volatility: 0.06 }).rating})`,
-        );
-        check('and Season 2 has no rows at all', (await readRatings(db, 'default', 2)).size === 0);
-        check('nor did Season 1 move', Math.abs((await ratingIn(db, 'u-b', 1)) - bEnd) < 1e-9);
-        db.close();
-        rmSync(dir, { recursive: true, force: true });
-    }
-
-    // ---- 13. a replay from Season 2 leaves Season 1 byte-identical ------------------------
-    {
-        const { db, dir } = await seed();
-        await playRated(db, 's2a', 'u-c', 'u-a', '2026-12-02 20:00:00');
-        await playRated(db, 's2b', 'u-b', 'u-c', '2027-01-15 21:00:00');
-        const boundary = '2026-12-01 06:00:00';
-        const s1Before = await seasonState(db, 1, boundary);
-        const s2Before = await readRatings(db, 'default', 2);
-
-        // Void a Season 2 match and replay from Season 2 — what the server does for a crash void.
-        await db.prepare(`UPDATE matches SET rated = 0, unrated_reason = 'game_crashed' WHERE id = 's2b'`)
-            .bind().run();
-        const { matches, fromSeason } = await recomputeLadder(db, { fromSeason: 2 });
-
-        check('a scoped replay reads only the matches from its season on', matches === 1 && fromSeason === 2,
-            `matches ${matches}, from ${fromSeason}`);
-        check(
-            'THE RECORD: Season 1\'s rows and stamps are byte-for-byte untouched',
-            s1Before === await seasonState(db, 1, boundary),
-        );
-        const s2After = await readRatings(db, 'default', 2);
-        check(
-            'Season 2 is rebuilt without the voided match',
-            s2After.size === 2 && s2After.get('u-b') === undefined
-            && s2After.get('u-c')?.games_played === 1 && s2Before.get('u-c')?.games_played === 2,
-            [...s2After.entries()].map(([id, r]) => `${id}:${r.games_played}`).join(' '),
-        );
-        db.close();
-        rmSync(dir, { recursive: true, force: true });
-    }
-
-    // ---- 14. an operator correction of a Season 1 match re-derives Season 2 ----------------
-    {
-        const { db, dir } = await seed();
-        await playRated(db, 's2a', 'u-a', 'u-c', '2026-12-02 20:00:00');
-        const aS1 = await ratingIn(db, 'u-a', 1);
-        const aS2 = await ratingIn(db, 'u-a', 2);
-
-        // m1 read the wrong way round, corrected by hand: a LOST to b.
-        await db.prepare(`UPDATE match_participants SET result = 0.0 WHERE match_id = 'm1' AND user_id = 'u-a'`)
-            .bind().run();
-        await db.prepare(`UPDATE match_participants SET result = 1.0 WHERE match_id = 'm1' AND user_id = 'u-b'`)
-            .bind().run();
-        await recomputeLadder(db, { fromSeason: seasonOfCreatedAt('2026-08-01 10:01:00') });
-
-        const aS1After = await ratingIn(db, 'u-a', 1);
-        const aS2After = await ratingIn(db, 'u-a', 2);
-        check('the corrected Season 1 match moves Season 1', aS1After < aS1,
-            `${aS1.toFixed(1)} -> ${aS1After.toFixed(1)}`);
-        check(
-            'and Season 2 is re-derived from the corrected finish, not left stale',
-            aS2After < aS2,
-            `${aS2.toFixed(1)} -> ${aS2After.toFixed(1)}`,
-        );
-        const stamp = await db.prepare(
-            `SELECT rating_before FROM match_participants WHERE match_id = 's2a' AND user_id = 'u-a'`,
-        ).bind().first<{ rating_before: number }>();
-        check(
-            'the Season 2 stamp starts from the soft reset of the CORRECTED Season 1',
-            Math.abs((stamp?.rating_before ?? NaN)
-                - softReset({ rating: aS1After, rd: 0, volatility: 0.06 }).rating) < 0.001,
-        );
-        db.close();
-        rmSync(dir, { recursive: true, force: true });
-    }
-
-    // ---- 15. with two seasons of data, every reader answers ONE row per player ------------
-    {
-        const { db, dir } = await seed();
-        await playRated(db, 's2a', 'u-c', 'u-a', '2026-12-02 20:00:00');
-        await playRated(db, 's2b', 'u-b', 'u-c', '2027-01-15 21:00:00');
-        const ctx = fakeContext(db, []);
-        const inSeason3 = Date.parse('2027-03-15T12:00:00Z');
-
-        const ranks = await ladderRanks(ctx, ['u-a', 'u-b', 'u-c'], 'default', 2);
-        check(
-            'positions are the season\'s own table: three players, three places',
-            [...ranks.values()].sort().join() === '1,2,3',
-            JSON.stringify([...ranks]),
-        );
-        check('the size is the season\'s, not the sum of two', await ladderSize(ctx, 'default', 2) === 3
-            && await ladderSize(ctx, 'default', 1) === 3);
-
-        const eff = await effectiveRatings(db, ['u-a', 'u-b', 'u-c'], 'default', 2);
-        check('one effective rating per player', eff.size === 3);
-
-        const hosts = await db.prepare(LOBBY_LIST_SQL).bind().all<{ id: string }>();
-        check(
-            'the rooms list lists each room once, whatever its host has played',
-            (hosts.results ?? []).length === 1 && hosts.results![0]!.id === 'L-GHOST',
-            JSON.stringify(hosts.results),
-        );
-        await db.prepare(`INSERT INTO lobby_members (lobby_id, user_id) VALUES ('L-GHOST', 'u-b')`)
-            .bind().run();
-        const hello = await db.prepare(MEMBER_HELLO_SQL).bind('L-GHOST', 'u-b').all();
-        check('the hello finds the member exactly once', (hello.results ?? []).length === 1);
-
-        const past = await pastSeasonsFor(ctx, 'u-a', inSeason3);
-        check(
-            'the history lists each ended season once, with its final place and record',
-            past.map((p) => `${p.season}:${p.mode}`).join() === '2:default,1:default'
-            && past.every((p) => p.size === 3)
-            && past.find((p) => p.season === 1)!.wins === 2,
-            JSON.stringify(past),
-        );
-        const titles = await seasonTitlesAll(ctx, ['u-a', 'u-b', 'u-c'], inSeason3);
-        check(
-            'every top-3 finish is a medal: three players, two seasons, six medals',
-            [...titles.values()].reduce((n, l) => n + l.length, 0) === 6,
-        );
-        const table = await seasonTable(ctx, 1, 'default', 50, inSeason3);
-        check(
-            'an ended season\'s table carries the places in order and the season\'s record',
-            table.map((r) => r.rank).join() === '1,2,3'
-            && table.find((r) => r.user_id === 'u-a')!.season_wins === 2,
-            JSON.stringify(table.map((r) => [r.rank, r.user_id, r.season_wins, r.season_losses])),
-        );
-        // While Season 1 is still running, it has no final table yet.
-        const notYet = await pastSeasonsFor(ctx, 'u-a', Date.parse('2026-10-01T00:00:00Z'));
-        check('a season that is still running is not in anybody\'s history', notYet.length === 0);
-        db.close();
-        rmSync(dir, { recursive: true, force: true });
-    }
-
-    // ---- 16. a team match corroborated after the boundary keeps its result, rates nothing --
-    {
-        for (const [label, nowIso, expectRated] of [
-            ['corroborated before the boundary', '2026-12-01T05:59:00Z', true],
-            ['corroborated AFTER the boundary', '2026-12-01T06:02:00Z', false],
-        ] as Array<[string, string, boolean]>) {
+        for (const [label, accountAge, sharedIp, expectRated] of [
+            ['an established pair', "datetime('now', '-60 days')", true, true],
+            ['a new account on the same network', "datetime('now', '-2 days')", true, false],
+            ['a new account on another network', "datetime('now', '-2 days')", false, true],
+        ] as Array<[string, string, boolean, boolean]>) {
             const { db, dir } = await seed();
             await addUser(db, 'u-d', 'dani');
+            // The seeded players signed up "today", which would make them all new accounts.
+            await db.prepare(`UPDATE users SET created_at = datetime('now', '-90 days')`).bind().run();
+            await db.prepare(`UPDATE users SET created_at = ${accountAge} WHERE id = 'u-d'`).bind().run();
             await db.prepare(
                 `INSERT INTO lobbies (id, host_user_id, title, mod_id, mod_combined_hash, status)
-                 VALUES ('L-TEAM', 'u-a', 'team', 'wol', 'h', 'closed')`,
+                 VALUES ('L-T', 'u-a', 'team', 'wol', 'h', 'closed')`,
             ).bind().run();
-            // Reported at 05:58 on the last day of Season 1, waiting for the other side.
             await db.prepare(
                 `INSERT INTO matches (id, lobby_id, host_user_id, mod_id, mod_combined_hash,
                                       map_name, duration_seconds, started_at, ended_at, created_at,
                                       rated, unrated_reason, rating_mode, game_seed, game_host_time)
-                 VALUES ('mt', 'L-TEAM', 'u-a', 'wol', 'h', 'map', 1500,
-                         '2026-12-01 05:30:00', '2026-12-01 05:58:00', '2026-12-01 05:58:00',
+                 VALUES ('mt', 'L-T', 'u-a', 'wol', 'h', 'map', 240,
+                         datetime('now', '-10 minutes'), datetime('now', '-5 minutes'), datetime('now', '-5 minutes'),
                          0, 'awaiting_confirmation', 'team', 777, 888)`,
             ).bind().run();
             for (const [u, team, result] of [['u-a', 0, 1], ['u-b', 0, 1], ['u-c', 1, 0], ['u-d', 1, 0]] as
@@ -749,94 +607,116 @@ async function main(): Promise<void> {
                     `INSERT INTO match_participants (match_id, user_id, team, result) VALUES ('mt', ?, ?, ?)`,
                 ).bind(u, team, result).run();
             }
-            // The opposing side's reading, agreeing, on the same game.
+            await db.prepare(
+                `INSERT INTO lobby_member_ips (lobby_id, user_id, ip_hash) VALUES ('L-T', 'u-a', 'HASH-A'), ('L-T', 'u-d', ?)`,
+            ).bind(sharedIp ? 'HASH-A' : 'HASH-D').run();
             await db.prepare(
                 `INSERT INTO match_confirmations (lobby_id, user_id, result, game_seed, game_host_time)
-                 VALUES ('L-TEAM', 'u-c', 0.0, 777, 888)`,
+                 VALUES ('L-T', 'u-c', 0.0, 777, 888)`,
             ).bind().run();
 
-            const teamBefore = await stateOf(db);
             const announced: Array<{ unratedReason?: string | null }> = [];
-            await latePathsForTests.maybeRateAwaitingTeamMatch(
-                fakeContext(db, announced), quietLog, 'L-TEAM', 'mt', Date.parse(nowIso));
-
+            await latePathsForTests.maybeRateAwaitingTeamMatch(fakeContext(db, announced), quietLog, 'L-T', 'mt');
             const row = await db.prepare(`SELECT rated, unrated_reason FROM matches WHERE id = 'mt'`)
                 .bind().first<{ rated: number; unrated_reason: string | null }>();
-            const results = await db.prepare(
-                `SELECT user_id, result FROM match_participants WHERE match_id = 'mt' ORDER BY user_id`,
-            ).bind().all<{ user_id: string; result: number }>();
-            const team = await readRatings(db, 'team', 1);
-
+            const team = await readRatings(db, 'team');
             if (expectRated) {
-                check(`${label}: rated on the team ladder of Season 1`,
-                    row?.rated === 1 && row.unrated_reason === null && team.size === 4,
-                    JSON.stringify(row));
+                check(`${label}: rated`, row?.rated === 1 && team.size === 4, JSON.stringify(row));
             } else {
-                check(
-                    `${label}: stored season_closed, the result kept`,
-                    row?.rated === 0 && row.unrated_reason === 'season_closed'
-                    && (results.results ?? []).map((r) => r.result).join() === '1,1,0,0',
-                    JSON.stringify([row, results.results]),
-                );
-                const after = await stateOf(db);
-                const ratingsOnly = (s: string) => JSON.stringify(JSON.parse(s)[2]);
-                check(`${label}: no rating anywhere moved`,
-                    ratingsOnly(teamBefore) === ratingsOnly(after) && team.size === 0);
-                check(`${label}: both sides are told it did not count, and why`,
-                    announced.length === 1 && announced[0]!.unratedReason === 'season_closed',
-                    JSON.stringify(announced));
+                check(`${label}: stored new_account_short, nobody rated, both sides told why`,
+                    row?.rated === 0 && row.unrated_reason === 'new_account_short' && team.size === 0
+                    && announced[0]?.unratedReason === 'new_account_short',
+                    JSON.stringify([row, announced]));
             }
             db.close();
             rmSync(dir, { recursive: true, force: true });
         }
     }
 
-    // ---- 17. the seasons migration copied Season 1 and nothing else -------------------
+    // ---- 14. placement: nobody is ranked before ten matches --------------------------------
+    {
+        const { db, dir } = await seed();
+        const ctx = fakeContext(db, []);
+        check('three matches each: nobody is ranked yet', await ladderSize(ctx, 'default') === 0);
+        const ranks = await ladderRanks(ctx, ['u-a', 'u-b'], 'default');
+        check('a player in placement reads 0 (no position)', ranks.get('u-a') === 0 && ranks.get('u-b') === 0);
+        for (let i = 0; i < 9; i++) {
+            await playRated(db, `p${i}`, i % 2 ? 'u-a' : 'u-c', i % 2 ? 'u-c' : 'u-a', `2026-08-0${(i % 8) + 2} 0${i}:00:00`);
+        }
+        const a = (await readRatings(db)).get('u-a')!;
+        const size = await ladderSize(ctx, 'default');
+        check('ten rated matches rank a player', a.games_played >= 10 && size >= 1,
+            `games ${a.games_played}, ranked ${size}`);
+        db.close();
+        rmSync(dir, { recursive: true, force: true });
+    }
+
+    // ---- 15. the hello and the rooms list work on a real database --------------------------
+    {
+        const { db, dir } = await seed();
+        await db.prepare(
+            `INSERT INTO lobbies (id, host_user_id, title, mod_id, mod_combined_hash, status, max_players)
+             VALUES ('L-OPEN', 'u-a', 'open', 'wol', 'h', 'open', 4)`,
+        ).bind().run();
+        await db.prepare(`INSERT INTO lobby_members (lobby_id, user_id, team) VALUES ('L-OPEN', 'u-a', 1)`).bind().run();
+        const hello = await db.prepare(MEMBER_HELLO_SQL).bind('L-OPEN', 'u-a').all<{ team: number }>();
+        check('the hello finds the member exactly once, with his team',
+            (hello.results ?? []).length === 1 && hello.results[0]!.team === 1);
+        const rooms = await db.prepare(LOBBY_LIST_SQL).bind().all();
+        check('the rooms list runs', (rooms.results ?? []).length >= 1);
+        db.close();
+        rmSync(dir, { recursive: true, force: true });
+    }
+
+    // ---- 16. the monthly highlights read a real database ------------------------------------
+    {
+        const { db, dir } = await seed();
+        const rows = await loadHighlightRows(fakeContext(db, []), Date.parse('2026-09-01T06:00:00Z'));
+        check('every rated participation is read with its ladder ordinal',
+            rows.length === 6 && rows.filter((r) => r.user_id === 'u-a').map((r) => r.ordinal).join() === '1,2',
+            JSON.stringify(rows.map((r) => [r.user_id, r.ordinal])));
+        db.close();
+        rmSync(dir, { recursive: true, force: true });
+    }
+
+    // ---- 17. migration 0025 copied Season 1 into player_ratings, and nothing else ----------
     {
         const dir = mkdtempSync(join(tmpdir(), 'wol-admin-test-'));
         const path = join(dir, 'lobby.db');
-        // Build the database as it stood BEFORE seasons: every migration up to 0023.
-        const pre = new Db(path);
-        const all = (await import('node:fs')).readdirSync('migrations').filter((f) => f.endsWith('.sql')).sort();
+        const fs = await import('node:fs');
+        const all = fs.readdirSync('migrations').filter((f) => f.endsWith('.sql')).sort();
         const preDir = mkdtempSync(join(tmpdir(), 'wol-admin-mig-'));
-        for (const f of all.filter((f) => f < '0024')) {
-            (await import('node:fs')).copyFileSync(join('migrations', f), join(preDir, f));
-        }
+        for (const f of all.filter((f) => f < '0025')) fs.copyFileSync(join('migrations', f), join(preDir, f));
+        const pre = new Db(path);
         pre.migrate(preDir);
-        for (const [id, name] of [['u-a', 'ana'], ['u-b', 'beto'], ['u-z', 'zoe']]) {
+        for (const [id, name] of [['u-a', 'ana'], ['u-b', 'beto']]) {
             await pre.prepare(
                 `INSERT INTO users (id, discord_id, discord_username, display_name) VALUES (?, ?, ?, ?)`,
             ).bind(id, `d-${id}`, name, name).run();
         }
         await pre.prepare(
-            `INSERT INTO elo_ratings (user_id, mode, rating, rd, volatility, games_played)
-             VALUES ('u-a', 'default', 1612.5, 210.25, 0.0599, 4),
-                    ('u-b', 'team', 1444.0, 280.0, 0.06, 1),
-                    ('u-z', 'default', 1500.0, 350.0, 0.06, 0)`,
+            `INSERT INTO season_ratings (user_id, mode, season, rating, rd, volatility, games_played)
+             VALUES ('u-a', 'default', 1, 1612.5, 210.25, 0.0599, 4),
+                    ('u-b', 'team', 1, 1444.0, 280.0, 0.06, 1),
+                    ('u-b', 'default', 2, 1490.0, 250.0, 0.06, 0)`,
         ).bind().run();
         pre.close();
 
         const db = new Db(path);
         db.migrate('migrations');
         const rows = await db.prepare(
-            `SELECT user_id, mode, season, rating, rd, volatility, games_played FROM season_ratings
-              ORDER BY user_id, mode`,
-        ).bind().all<{ user_id: string; mode: string; season: number; rating: number; rd: number;
-            volatility: number; games_played: number }>();
-        check(
-            'every rating with games became Season 1, exactly; the empty signup row did not',
-            JSON.stringify((rows.results ?? []).map((r) => [r.user_id, r.mode, r.season, r.rating, r.rd, r.volatility, r.games_played]))
-            === JSON.stringify([['u-a', 'default', 1, 1612.5, 210.25, 0.0599, 4], ['u-b', 'team', 1, 1444, 280, 0.06, 1]]),
-            JSON.stringify(rows.results),
-        );
+            `SELECT user_id, mode, rating, rd, volatility, games_played FROM player_ratings ORDER BY user_id, mode`,
+        ).bind().all<{ user_id: string; mode: string; rating: number; rd: number; volatility: number; games_played: number }>();
+        check('Season 1 rows with games became the interim ladder; nothing else did',
+            JSON.stringify((rows.results ?? []).map((r) => [r.user_id, r.mode, r.rating, r.rd, r.games_played]))
+            === JSON.stringify([['u-a', 'default', 1612.5, 210.25, 4], ['u-b', 'team', 1444, 280, 1]]),
+            JSON.stringify(rows.results));
         db.close();
         rmSync(dir, { recursive: true, force: true });
         rmSync(preDir, { recursive: true, force: true });
     }
 
     console.log(`\n${failures === 0 ? 'all good' : `${failures} failure(s)`}`);
-    // The boundary itself, so a reader of this output knows which instant every test assumed.
-    console.log(`(season 2 starts ${new Date(SEASON_2_START).toISOString()})`);
     process.exit(failures === 0 ? 0 : 1);
 }
 

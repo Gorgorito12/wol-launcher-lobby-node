@@ -7,8 +7,10 @@ import { finalizeRoom } from './discordAnnounce';
 import { runFoundingHook } from '../matches/foundingHook';
 import { createLobby } from './create';
 import { isEntrantMember } from '../tournaments/store';
-import { DEFAULT_RATING, DEFAULT_RD, effectiveRatings, type EffectiveRating } from '../elo/glicko2';
-import { currentSeason } from '../elo/seasons';
+import { DEFAULT_RATING, DEFAULT_RD } from '../elo/glicko2';
+import { effectiveRatings, type EffectiveRating } from '../elo/ladder';
+import { isInPlacement } from '../elo/placement';
+import { recordIpHash, requestIpHash } from '../lib/ipHash';
 import { ladderRanks } from '../stats/rest';
 import { normalizeBadgeMode } from '../users/badgeMode';
 import type { AppContext } from '../context';
@@ -83,8 +85,8 @@ interface JoinLobbyBody {
 
 /**
  * The public rooms list. Exported so a test can pin that it carries NO rating join: the hosts'
- * ratings are read separately through effectiveRatings, because the ratings table holds a row
- * per season and any join on it would list a room once per season its host has played.
+ * ratings are read separately through effectiveRatings, which also grows each deviation to now —
+ * something no join could do.
  */
 export const LOBBY_LIST_SQL =
     `SELECT l.id, l.host_user_id, l.title, l.mod_id, l.mod_combined_hash,
@@ -102,10 +104,8 @@ export const LOBBY_LIST_SQL =
             u.badge_mode AS host_badge_mode
      FROM lobbies l
      JOIN users u ON u.id = l.host_user_id
-     -- No rating join here any more: the hosts' ratings are the running season's, read
-     -- below through effectiveRatings. A join on the ratings table would have to pick a
-     -- season row per host — and a host with rows in two seasons would list his room
-     -- twice, while a host with none would need it LEFT or his room would vanish.
+     -- No rating join: the hosts' ratings are read below through effectiveRatings. A host
+     -- with no rating row would need the join LEFT or his room would vanish.
      WHERE l.status IN ('open', 'locked', 'in_game')
      ORDER BY l.created_at DESC
      LIMIT 100`;
@@ -148,22 +148,20 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
         // avatar. One query for the whole page, and absent (not 0) when it failed, so the
         // launcher draws no badge rather than a wrong one.
         const hostIds = (rows.results ?? []).map((r) => r.host_user_id);
-        const season = currentSeason(Date.now());
-        const hostRanks = await ladderRanks(ctx, hostIds, 'default', season);
+        const hostRanks = await ladderRanks(ctx, hostIds, 'default');
         // The team ladder too (design handoff 51b): a 2v2/3v3 room's row wears the host's TEAM
         // badge, and a casual room's row the badge the host chose.
-        const hostTeamRanks = await ladderRanks(ctx, hostIds, 'team', season);
+        const hostTeamRanks = await ladderRanks(ctx, hostIds, 'team');
 
-        // The hosts' ratings in the running season — the same helper applyMatch reads, so a
-        // host carried over from last season shows the soft-reset number his next match starts
-        // from. A failure sends no rating at all (null), never somebody's 1500: the launcher
+        // The hosts' ratings, through the same helper the engine reads, the deviation grown to
+        // now. A failure sends no rating at all (null), never somebody's 1500: the launcher
         // reads null as "unknown".
         let hostSolo: Map<string, EffectiveRating> | null = null;
         let hostTeam: Map<string, EffectiveRating> | null = null;
         try {
             [hostSolo, hostTeam] = await Promise.all([
-                effectiveRatings(ctx.db, hostIds, 'default', season),
-                effectiveRatings(ctx.db, hostIds, 'team', season),
+                effectiveRatings(ctx.db, hostIds, 'default'),
+                effectiveRatings(ctx.db, hostIds, 'team'),
             ]);
         } catch {
             hostSolo = null;
@@ -214,7 +212,7 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
                     // The deviation goes WITH it, and without it the rating is ambiguous: the
                     // client had no way to tell a 1500 nobody has played for from one somebody
                     // landed on, so both read the same. Same default as the rating, for the
-                    // same reason — a player with no row is unrated, which is what 350 means.
+                    // same reason — a player with no row is unrated, which is what the default means.
                     rd: hostSolo ? (hostSolo.get(r.host_user_id)?.rd ?? DEFAULT_RD) : null,
                     // Position on the 1v1 ladder; 0 = below the entry bar (MIN_DECIDED).
                     ladder_rank: hostRanks.get(r.host_user_id),
@@ -225,6 +223,14 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
                     rd_team: hostTeam ? (hostTeam.get(r.host_user_id)?.rd ?? DEFAULT_RD) : null,
                     // Which badge the host shows where the room does not decide it.
                     badge_mode: normalizeBadgeMode(r.host_badge_mode),
+                    // Rated matches on each ladder, and whether the host is still being placed:
+                    // the launcher writes a placement rating with a "?". Omitted on failure.
+                    games_played: hostSolo ? (hostSolo.get(r.host_user_id)?.games_played ?? 0) : undefined,
+                    games_played_team: hostTeam ? (hostTeam.get(r.host_user_id)?.games_played ?? 0) : undefined,
+                    in_placement: hostSolo
+                        ? isInPlacement(hostSolo.get(r.host_user_id)?.games_played ?? 0, 'default') : undefined,
+                    in_placement_team: hostTeam
+                        ? isInPlacement(hostTeam.get(r.host_user_id)?.games_played ?? 0, 'team') : undefined,
                 },
             })),
         });
@@ -253,6 +259,7 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
             password: body.password,
             askedCompetitive: body.competitive,
         });
+        await recordIpHash(ctx, created.id, req.userId!, requestIpHash(ctx, req));
         return reply.code(201).send(created);
     });
 
@@ -267,7 +274,8 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
         if (!lobby || lobby.status === 'closed') throw Errors.NotFound('Lobby');
 
         const members = await ctx.db.prepare(
-            `SELECT lm.user_id, lm.is_ready, lm.role, u.discord_username, u.display_name, u.avatar_url
+            `SELECT lm.user_id, lm.is_ready, lm.role, lm.team,
+                    u.discord_username, u.display_name, u.avatar_url
              FROM lobby_members lm
              JOIN users u ON u.id = lm.user_id
              WHERE lm.lobby_id = ?
@@ -276,6 +284,7 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
             user_id: string;
             is_ready: number;
             role: 'player' | 'spectator';
+            team: number | null;
             discord_username: string;
             display_name: string;
             avatar_url: string | null;
@@ -301,6 +310,8 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
                 avatar_url: m.avatar_url,
                 is_ready: m.is_ready === 1,
                 role: m.role,
+                // Team 1 or 2 in a 2v2/3v3 room; null while the member has not picked one.
+                team: m.team === 1 || m.team === 2 ? m.team : null,
             })),
         });
     });
@@ -392,9 +403,12 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
                 // back to watch must not keep the seat they gave up. is_ready is cleared for
                 // the same reason it always was - a returning member has not agreed to
                 // anything about the room as it now stands.
+                // The team is cleared too: a returning player picks his side again, and a seat
+                // he gave up must not keep counting for the side he left.
                 `INSERT INTO lobby_members (lobby_id, user_id, role)
                  VALUES (?, ?, ?)
-                 ON CONFLICT (lobby_id, user_id) DO UPDATE SET is_ready = 0, role = excluded.role`,
+                 ON CONFLICT (lobby_id, user_id) DO UPDATE SET is_ready = 0, role = excluded.role,
+                                                               team = NULL`,
             ).bind(lobbyId, userId, asSpectator ? 'spectator' : 'player'),
             ctx.db.prepare(
                 `UPDATE lobbies SET current_players = (
@@ -402,6 +416,9 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
                  ) WHERE id = ?`,
             ).bind(lobbyId, lobbyId),
         ]);
+
+        // Where they joined from, hashed (src/lib/ipHash.ts). Best-effort.
+        await recordIpHash(ctx, lobbyId, userId, requestIpHash(ctx, req));
 
         const joinToken = uuid();
         await ctx.kv.put(

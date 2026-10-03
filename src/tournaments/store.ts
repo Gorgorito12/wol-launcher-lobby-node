@@ -17,8 +17,7 @@
  *    a busy tournament is archived out from under its players.
  */
 import type { Db } from '../db';
-import { effectiveRatings } from '../elo/glicko2';
-import { currentSeason } from '../elo/seasons';
+import { effectiveRatings } from '../elo/ladder';
 import type { BracketMatch, BracketUpdate, Slot } from './bracket';
 import type { EntrantStatus, TournamentFormat, TeamSource } from './entrants';
 import { aliveWhereClause, CAPPED_STATUSES, type TournamentStatus } from './lifecycle';
@@ -424,10 +423,9 @@ export async function listOwnDrafts(db: Db, userId: string): Promise<TournamentL
 }
 
 /**
- * Ratings for seeding, for exactly the users asked about — the RUNNING season's, through the
- * same helper every rating reader uses. At the start of a season that is the soft reset of the
- * last one, which is still the best estimate of who is strong; a player with no rated match at
- * all is left out, and seeding reads that as the default.
+ * Ratings for seeding, for exactly the users asked about, through the same helper every rating
+ * reader uses. A player with no rated match at all is left out, and seeding reads that as the
+ * default.
  */
 export async function ratingsFor(
     db: Db,
@@ -436,7 +434,7 @@ export async function ratingsFor(
 ): Promise<Map<string, { rating: number; rd: number }>> {
     const out = new Map<string, { rating: number; rd: number }>();
     if (userIds.length === 0) return out;
-    const eff = await effectiveRatings(db, userIds, mode, currentSeason(Date.now()));
+    const eff = await effectiveRatings(db, userIds, mode);
     for (const [id, r] of eff) {
         if (r.source === 'default') continue;
         out.set(id, { rating: r.rating, rd: r.rd });

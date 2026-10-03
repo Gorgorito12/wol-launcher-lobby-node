@@ -36,7 +36,6 @@ import { Db } from '../src/db';
 import { canUpgradeFromConfirmation, WIN_AT } from '../src/elo/ratability';
 import { type ParticipantOutcome } from '../src/elo/glicko2';
 import { recomputeLadder } from '../src/elo/replay';
-import { seasonOfCreatedAt } from '../src/elo/seasons';
 
 function resolveDbPath(): string {
     const positional = process.argv.slice(2).find((a) => !a.startsWith('--'));
@@ -76,7 +75,7 @@ async function main(): Promise<void> {
     console.log(`${rows.length} undecided match(es) with a room.`);
     let decided = 0;
     // The oldest season any decided match belongs to: the replay starts there.
-    let fromSeason: number | null = null;
+    let touched = false;
 
     for (const match of rows) {
         const lobbyId = match.lobby_id!;
@@ -158,19 +157,17 @@ async function main(): Promise<void> {
                 }
             }
 
-            const season = seasonOfCreatedAt(match.created_at);
-            fromSeason = fromSeason === null ? season : Math.min(fromSeason, season);
+            touched = true;
             break;
         }
     }
 
-    if (apply && fromSeason !== null) {
-        // ONE replay, from the oldest season touched, so every decided match is rated in its own
-        // season and in report order — and every later season is re-derived from the corrected
-        // results. Stop the service first, as for every rating-moving script: the server's ladder
-        // lock lives in its own process and cannot see this one.
-        const { matches } = await recomputeLadder(db, { fromSeason });
-        console.log(`Ladder replayed from season ${fromSeason}: ${matches} rated match(es).`);
+    if (apply && touched) {
+        // ONE replay of the whole history, so every decided match is rated in report order and
+        // everything after it is re-derived from the corrected results. Stop the service first,
+        // as for every rating-moving script: the server's ladder lock lives in its own process.
+        const { matches } = await recomputeLadder(db);
+        console.log(`Ladder replayed: ${matches} rated match(es).`);
     }
 
     console.log(

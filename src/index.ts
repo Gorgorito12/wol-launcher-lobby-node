@@ -7,8 +7,8 @@ import { join } from 'node:path';
 import { mkdirSync } from 'node:fs';
 import { loadConfig } from './env';
 import { Db } from './db';
-import { effectiveRatings } from './elo/glicko2';
-import { currentSeason } from './elo/seasons';
+import { effectiveRatings } from './elo/ladder';
+import { requestIpHash } from './lib/ipHash';
 import { KvStore } from './kv';
 import { LobbyRoomRegistry, attachGlobalChat } from './lobbies/LobbyRoom';
 import { GlobalChatRoom } from './global/GlobalChatRoom';
@@ -27,6 +27,7 @@ import { registerTournamentsRest } from './tournaments/rest';
 import { registerTeamsRest } from './teams/rest';
 import { registerUsersRest } from './users/rest';
 import { sweepStaleTournaments } from './tournaments/sweep';
+import { maybePostMonthlyHighlights } from './stats/highlightsAnnounce';
 import { registerReplaysRest } from './replays/rest';
 
 const SERVICE_VERSION = '0.1.0';
@@ -190,8 +191,7 @@ async function main(): Promise<void> {
 
     // /me — current user + ELO snapshot. Requires auth.
     //
-    // The rating is the RUNNING season's 1v1 rating, through the same helper every other
-    // surface and applyMatch read — no join on the ratings table, which holds a row per season.
+    // The 1v1 rating, through the same helper every other surface and the engine read.
     app.get('/me', { preHandler: [requireAuth()] }, async (req, _reply) => {
         const u = await db.prepare(
             `SELECT u.id, u.discord_username, u.display_name, u.avatar_url, u.created_at,
@@ -200,8 +200,7 @@ async function main(): Promise<void> {
              WHERE u.id = ?`,
         ).bind(req.userId!).first<Record<string, unknown>>();
         if (!u) throw Errors.NotFound('User');
-        const elo = (await effectiveRatings(db, [req.userId!], 'default', currentSeason(Date.now())))
-            .get(req.userId!);
+        const elo = (await effectiveRatings(db, [req.userId!], 'default')).get(req.userId!);
         return { ...u, rating: elo?.rating ?? null, rd: elo?.rd ?? null, games_played: elo?.games_played ?? 0 };
     });
 
@@ -233,7 +232,9 @@ async function main(): Promise<void> {
         }
 
         const room = rooms.getOrCreate(lobbyId, lobby.host_user_id);
-        room.handleConnection(socket, ctx);
+        // The address it came from, hashed, recorded by the room once the hello proves who
+        // this is (src/lib/ipHash.ts).
+        room.handleConnection(socket, ctx, { ipHash: requestIpHash(ctx, req) });
     });
 
     // ----- WebSocket: process-wide global chat -----
@@ -288,6 +289,9 @@ async function main(): Promise<void> {
     // only tidiness — the list and both creation caps already ignore stale rows, so this
     // just makes the stored status agree with what players already see.
     void sweepStaleTournaments(ctx, app.log);
+    // The monthly highlights may be due on Discord (the 1st, early): startup is one of the
+    // moments the lazy trigger looks, since the server has no timers.
+    void maybePostMonthlyHighlights(ctx, app.log);
 
     // ----- Graceful shutdown -----
     const shutdown = async (signal: string): Promise<void> => {
