@@ -8,7 +8,7 @@ import { rateStoredMatch, type PlayerChange, type RatedMatch } from '../elo/ladd
 import { placementRequired } from '../elo/placement';
 import { isNewAccountShort } from '../elo/newAccount';
 import { checkPairAlerts } from '../elo/alerts';
-import { ratabilityReason, compareReadings, canUpgradeFromConfirmation, WIN_AT, LOSS_AT,
+import { ratabilityReason, isRankedMod, compareReadings, canUpgradeFromConfirmation, WIN_AT, LOSS_AT,
          matchShape, teamEvidenceMet, isDecided, MIN_DURATION_SECONDS, MAX_AGE_MS,
          type UnratedReason } from '../elo/ratability';
 import { decideByAbandon, PAIR_COOLDOWN_MS, type AbandonRecord } from '../elo/abandon';
@@ -1388,10 +1388,10 @@ async function foundMatchFromReadingsInner(
     const founder = readings.find((r) => r.user_id === decision.founderId)!;
 
     // The eligibility a report has to pass, asked of what the server itself knows: the mod
-    // is the room's, the clock runs from the room's start to the moment the founding reading
-    // arrived — the launcher confirms within seconds of its game closing.
-    const mod = (lobby.mod_id || '').trim().toLowerCase();
-    if (!ctx.config.rankedModIds.some((m) => m === mod)) {
+    // is the room's (ranked unless the operator narrowed RANKED_MOD_IDS), the clock runs from
+    // the room's start to the moment the founding reading arrived — the launcher confirms
+    // within seconds of its game closing.
+    if (!isRankedMod(ctx.config.rankedModIds, lobby.mod_id)) {
         log.info({ lobby_id: lobbyId, mod_id: lobby.mod_id }, 'founding refused: mod not ranked');
         return null;
     }

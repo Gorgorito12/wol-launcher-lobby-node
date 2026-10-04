@@ -13,7 +13,8 @@
 
 /** Why a match was stored but not scored. Null means it was scored. */
 export type UnratedReason =
-    /** The mod has no ladder. See Config.rankedModIds. */
+    /** The operator narrowed RANKED_MOD_IDS and this mod is outside it. With the default
+     *  `*` nothing new is refused for this; older rows still carry it. See isRankedMod. */
     | 'mod_not_ranked'
     /** The room was not created as competitive, so nobody agreed to put rating on it. */
     | 'not_competitive'
@@ -197,14 +198,33 @@ export function timingIsPlausible(input: RatabilityInput): boolean {
     return true;
 }
 
+/** The entry in RANKED_MOD_IDS that means "every mod". */
+export const ALL_MODS = '*';
+
+/**
+ * Whether a mod's matches may move the ladder. THE one place this is decided — the room
+ * clamp, the founding path, the tournament echo and ratability all ask here, because four
+ * inline copies of `some(m => m === mod)` is how `*` came to mean "no mod at all".
+ *
+ * <p>There is ONE ladder per mode and it is shared by every mod: a single match is always
+ * on one mod (the fingerprint gate keeps the players of different mods apart), and the
+ * rating measures the player across all of them. `*` (the default) ranks every mod,
+ * including ones added to the catalog later, with no change here; a list of ids narrows it.
+ * Ids compare trimmed and case-insensitively, like the list itself is parsed.</p>
+ */
+export function isRankedMod(rankedModIds: readonly string[], modId: string | null | undefined): boolean {
+    const mod = (modId || '').trim().toLowerCase();
+    if (mod.length === 0) return false;
+    return rankedModIds.some((m) => m === ALL_MODS || m === mod);
+}
+
 /**
  * The order of the checks is the order of the answers: the least specific cause
- * wins, so a team game on an unranked mod reports the mod, which is the thing the
- * player would have to change first.
+ * wins, so a team game on a mod outside a narrowed list reports the mod, which is
+ * the thing the player would have to change first.
  */
 export function ratabilityReason(input: RatabilityInput): UnratedReason | null {
-    const mod = (input.modId || '').trim().toLowerCase();
-    if (!input.rankedModIds.some((m) => m === mod)) return 'mod_not_ranked';
+    if (!isRankedMod(input.rankedModIds, input.modId)) return 'mod_not_ranked';
 
     // Second, because it is the next most fundamental fact and the one the host chose.
     // Note the `=== false`: see RatabilityInput.roomIsCompetitive for why null falls

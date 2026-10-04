@@ -7,8 +7,8 @@
  * A tournament match is played in an ordinary competitive room. The alternative to this
  * extraction was a second creation path in the tournaments route, and a second path is
  * how the two come to disagree: this one force-closes the host's previous room, checks
- * the server-wide budget, clamps `competitive` against the ranked-mod list AND the 2/4/6
- * size rule, pre-creates the in-memory room so the host's socket doesn't race, and
+ * the server-wide budget, clamps `competitive` against the ranked-mod list (every mod
+ * unless RANKED_MOD_IDS narrows it) AND the 2/4/6 size rule, pre-creates the in-memory room so the host's socket doesn't race, and
  * announces to two different channels. Any of those quietly missing from a tournament
  * room would be a bug nobody sees until a real match.
  *
@@ -30,6 +30,7 @@
 import { Errors } from '../lib/errors';
 import { shortId, sha256Hex } from '../lib/ids';
 import { announceLobbyCreated, finalizeRoom } from './discordAnnounce';
+import { isRankedMod } from '../elo/ratability';
 import type { AppContext } from '../context';
 
 /**
@@ -181,14 +182,14 @@ export async function createLobby(
 
     // Competitive is a PROMISE — only this room's matches score, and the launcher holds
     // the player to it (confirming Record Game, refusing to let the host leave before the
-    // result is in). A mod with no ladder cannot keep that promise, so the room is created
-    // casual instead of failing. The response echoes the EFFECTIVE value, which is how the
+    // result is in). Every mod shares the ladder unless the operator narrowed RANKED_MOD_IDS,
+    // and a mod outside that list cannot keep the promise, so the room is created casual
+    // instead of failing. The response echoes the EFFECTIVE value, which is how the
     // launcher explains the downgrade without holding a copy of the ranked-mod list —
     // that policy lives here and nowhere else.
     const askedCompetitive = input.askedCompetitive === true;
-    const modKey = input.modId.trim().toLowerCase();
     const competitive = askedCompetitive
-        && cfg.rankedModIds.some((m) => m === modKey)
+        && isRankedMod(cfg.rankedModIds, input.modId)
         && COMPETITIVE_SIZES.includes(playingSeats)
         ? 1 : 0;
 

@@ -97,6 +97,14 @@ test('an unrated player is worth the bottom of the list, not the middle', () => 
     assert.ok(conservativeRating({ rating: 1500, rd: 60 }) > conservativeRating(undefined));
 });
 
+test('an unplayed player starts as uncertain as the ladder says, not with v1\'s 350', () => {
+    assert.equal(DEFAULT_RATING, 1500);
+    assert.equal(DEFAULT_RD, 500);
+    // Roughly where one rated match leaves a newcomer. With the old local 350 the unplayed
+    // player (800) outranked him (660); seeding must not reward having never played.
+    assert.ok(conservativeRating({ rating: 1520, rd: 430 }) > conservativeRating(undefined));
+});
+
 test('a big deviation cannot buy a top seed', () => {
     // 1900 with a huge RD is less trustworthy than 1500 with a small one.
     assert.ok(conservativeRating({ rating: 1500, rd: 50 }) > conservativeRating({ rating: 1900, rd: 340 }));

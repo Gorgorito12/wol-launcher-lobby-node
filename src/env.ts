@@ -78,12 +78,14 @@ export interface Config {
     discordPlayersRoleIds: string[];
 
     // Mod ids whose matches are allowed to move ELO. Everything else is still
-    // stored in the match history — it just doesn't score. This is policy, not
-    // capability: a rating that adds up wins across mods is adding up games that
-    // cannot even be played against each other, since the mod fingerprint gate
-    // keeps players of different mods apart. Comma-separated; defaults to the one
-    // mod with a real ladder. Widening it needs no code change and no deploy of a
-    // new build, only a restart.
+    // stored in the match history — it just doesn't score. Defaults to `*`: EVERY
+    // mod, the base game included, shares one ladder per mode, and a mod added to
+    // the catalog later is ranked with no change here. That is a policy choice: a
+    // single match is always on one mod (the fingerprint gate keeps players of
+    // different mods apart), and the rating measures the player across all of them.
+    // A comma-separated list of ids narrows it to those mods (`*` may sit in the
+    // list too). Changing it needs no new build, only a restart. Every check goes
+    // through isRankedMod (src/elo/ratability.ts) — never compare against this raw.
     rankedModIds: string[];
 
     // How long a competitive game must have been running before walking out of it
@@ -182,7 +184,8 @@ function roleIdListEnv(name: string, fallback: string[]): string[] {
 /**
  * Parse a comma/newline-separated list of plain ids (no URL shape to validate).
  * Trims, drops empties, lowercases — ids are compared case-insensitively so an
- * operator typing "WoL" in the .env still matches the launcher's "wol".
+ * operator typing "WoL" in the .env still matches the launcher's "wol". A `*` is kept
+ * as a literal entry; giving it a meaning is the consumer's job (see isRankedMod).
  */
 function idListEnv(name: string, fallback: string[]): string[] {
     const raw = process.env[name];
@@ -256,7 +259,7 @@ export function loadConfig(): Config {
         // urlListEnv, which drops them), so the index alignment holds.
         discordPlayersRoleIds: roleIdListEnv('DISCORD_PLAYERS_ROLE_ID', ['1088344884882194563']),
 
-        rankedModIds: idListEnv('RANKED_MOD_IDS', ['wol']),
+        rankedModIds: idListEnv('RANKED_MOD_IDS', ['*']),
 
         competitiveAbandonSeconds: intEnv('COMPETITIVE_ABANDON_SECONDS', 300),
         // A verified crash voids a rated 1v1 at most this many times per player per window;

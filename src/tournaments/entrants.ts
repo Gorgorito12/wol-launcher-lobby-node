@@ -10,6 +10,8 @@
  * That is what lets one bracket, one advancement rule and one screen serve both.
  */
 
+import { DEFAULT_RATING, DEFAULT_RD } from '../elo/glicko2';
+
 /** The shapes a tournament can be played in. A 4v4 is impossible — see `rosterSizeFor`. */
 export type TournamentFormat = '1v1' | '2v2' | '3v3';
 
@@ -97,13 +99,20 @@ export function validateRoster(input: RosterInput): RosterRefusal | null {
 /**
  * The strength a seeding is sorted by.
  *
- * `rating - 2 * rd` is the CONSERVATIVE Glicko estimate, and it is used here because it
- * is already what orders the public ladder (`stats/rest.ts`). Using the raw rating
- * instead would let somebody with two games and a huge deviation outrank a settled
- * player, and seeding is exactly where that misleads: the top seed gets the bye.
+ * `rating - 2 * rd` is the CONSERVATIVE Glicko estimate. The public ladder no longer orders
+ * by it (since rating v3 it orders by the plain rating, because placement keeps players
+ * with few games off the table), but a tournament has no placement filter: anybody may
+ * enter after one match. So here the deviation term does the job placement does on the
+ * ladder. Using the raw rating would let somebody with two games and a huge deviation
+ * outrank a settled player, and seeding is exactly where that misleads: the top seed gets
+ * the bye.
+ *
+ * The defaults for a player with no rating row are the ladder's own (`elo/glicko2`,
+ * re-exported here), so an unplayed player is as uncertain here as the ladder treats him
+ * before his first match. They used to be a local 1500/350 — v1's starting deviation —
+ * which since v3 put an unplayed player ABOVE somebody with one rated match.
  */
-export const DEFAULT_RATING = 1500;
-export const DEFAULT_RD = 350;
+export { DEFAULT_RATING, DEFAULT_RD };
 
 export interface RatingRow {
     rating: number;
@@ -130,8 +139,8 @@ export interface SeedableEntrant {
  * and not by its best player. A captain-only rule would let a strong player carry two
  * novices to the top seed, and a best-player rule would do the same more quietly.
  *
- * A player with no rating row counts as an unplayed 1500/350, i.e. the bottom of the
- * list rather than the middle — the same answer the ladder gives someone with no games.
+ * A player with no rating row counts as an unplayed 1500/500 — the largest deviation the
+ * ladder allows — i.e. the bottom of the list rather than the middle.
  */
 export function seedByRating(
     entrants: readonly SeedableEntrant[],

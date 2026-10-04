@@ -42,6 +42,7 @@ import { uuid, shortId } from '../lib/ids';
 import { requireAuth, requireTournamentOwner, requireTournamentManager } from '../middleware/auth';
 import { ipRateLimit, userRateLimit, Limits } from '../middleware/rateLimit';
 import { createLobby } from '../lobbies/create';
+import { isRankedMod } from '../elo/ratability';
 import type { AppContext } from '../context';
 
 import {
@@ -206,9 +207,10 @@ export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): 
             throw Errors.BadRequest(`team_source ${teamSource} is not valid for a ${format}`);
         }
 
-        // A ranked mod is not required — an unranked one simply produces casual rooms — but
-        // saying so is the server's job, and the response echoes what was actually made.
-        const ranked = ctx.config.rankedModIds.some((m) => m === modId);
+        // Every mod is ranked unless the operator narrowed RANKED_MOD_IDS; one outside that
+        // list simply produces casual rooms. Saying so is the server's job, and the response
+        // echoes what was actually made.
+        const ranked = isRankedMod(ctx.config.rankedModIds, modId);
 
         const owned = await store.countOwnedLive(ctx.db, userId);
         if (owned >= MAX_OWNED_LIVE) throw Errors.TournamentLimitReached(MAX_OWNED_LIVE);

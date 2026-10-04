@@ -601,6 +601,11 @@ a mod outside `RANKED_MOD_IDS` **and for any size other than 2, 4 or 6 seats**, 
 casual room instead and echoing what it actually made on the 201. That echo is what lets the
 launcher explain the downgrade without holding its own copy of the ranked-mod list.
 
+`RANKED_MOD_IDS` defaults to `*`: **every mod shares one ladder per mode** (1v1 and Teams), the
+base game (`aoe3-tad`) included, and a mod added to the catalog is ranked the moment it exists.
+A list of ids narrows it. Every check goes through `isRankedMod` in `src/elo/ratability.ts` —
+before it existed, a literal `*` matched no mod at all and would have ranked nothing.
+
 The size rule is not cosmetic: a competitive room's seat count is what NAMES its format —
 2 is 1v1, 4 is 2v2, 6 is 3v3 — so a competitive room of 8 would leave a match whose format
 nothing could name. The clamp lives on the server because the client is what an attacker
@@ -834,7 +839,7 @@ loss per day, on record in `lobby_game_exits` with the signals that produced it.
 
 ```
 COMPETITIVE_ABANDON_SECONDS=300     # how far into a match a walkout must be to forfeit
-RANKED_MOD_IDS=wol                  # which mods have a ladder at all
+RANKED_MOD_IDS=*                    # which mods score: * = all of them (default); a list narrows it
 CRASH_VOID_PER_WINDOW=1             # verified crashes forgiven per player per window
 CRASH_VOID_WINDOW_SECONDS=86400     # the window
 ```
