@@ -46,7 +46,9 @@ import { isInPlacement, placementRequired } from '../src/elo/placement';
 import { matchupKey } from '../src/elo/antifarm';
 import { rawConsecutiveWins, shortMatchCount } from '../src/elo/alerts';
 import { uuid } from '../src/lib/ids';
-import { loadConfig } from '../src/env';
+import { loadConfig, replayStorageFromEnv } from '../src/env';
+import { presignObject } from '../src/replays/presign';
+import { fetch, type Response as UndiciResponse } from 'undici';
 import { KvStore } from '../src/kv';
 import type { AppContext } from '../src/context';
 import { standingFor } from '../src/stats/standing';
@@ -649,6 +651,19 @@ async function cmdMatchShow(db: Db): Promise<void> {
                   GROUP BY ip_hash HAVING COUNT(*) > 1)`,
         ).bind(m.id).first<{ n: number }>();
         console.log(`  same IP    ${(shared?.n ?? 0) > 0 ? 'YES — two players shared a network (hash only)' : 'no'}`);
+        // The competitive recording in the bucket (migration 0030), if the reporter's launcher
+        // uploaded one. `replay_key IS NULL` is "never uploaded" or "expired and forgotten".
+        const rec = await db.prepare(
+            `SELECT replay_key, replay_size_bytes, replay_uploaded_at, replay_uploader_id
+               FROM matches WHERE id = ?`,
+        ).bind(m.id).first<{
+            replay_key: string | null; replay_size_bytes: number | null;
+            replay_uploaded_at: string | null; replay_uploader_id: string | null;
+        }>();
+        console.log(rec?.replay_key
+            ? `  recording  ${rec.replay_key}  (${rec.replay_size_bytes ?? '?'} bytes, `
+              + `${rec.replay_uploaded_at ?? '?'}, by ${rec.replay_uploader_id ?? '?'})`
+            : '  recording  none');
     }
     if (m.decided_by === 'abandon') {
         console.log('             ^ decided because one player walked out, not by the recording.');
@@ -1473,6 +1488,78 @@ async function cmdPlayerUnstick(db: Db): Promise<void> {
     summarise(stale.length, 'membership row(s)');
 }
 
+// ---------------------------------------------------------------- replay storage
+
+/**
+ * Proves the recordings bucket works end to end, with no match and no launcher: PUT a tiny
+ * object through a presigned URL (with the size signed, exactly as a launcher uploads), HEAD
+ * it, GET it back, DELETE it. Each step prints the status the storage answered, and a failure
+ * prints the storage's own error body — `SignatureDoesNotMatch`, `NoSuchBucket`,
+ * `NotAuthorizedOrNotFound` name the cause better than anything this script could.
+ *
+ * Not dry-run like the rest of this file: it writes nothing to the database and leaves
+ * nothing in the bucket (the object is deleted at the end, and it lives under `selftest/`).
+ */
+async function cmdReplaySelftest(): Promise<void> {
+    const storage = replayStorageFromEnv();
+    if (!storage) {
+        console.log('Replay storage is not configured. Set REPLAY_S3_ENDPOINT (https), REPLAY_S3_REGION,');
+        console.log('REPLAY_S3_ACCESS_KEY, REPLAY_S3_SECRET_KEY and REPLAY_BUCKET in .env.');
+        process.exitCode = 1;
+        return;
+    }
+
+    const key = `selftest/${uuid()}.txt`;
+    const body = Buffer.from(`wol-lobby replay selftest ${new Date().toISOString()}\n`, 'utf8');
+    console.log(`Bucket ${storage.bucket} at ${storage.endpoint} (${storage.region})`);
+    console.log(`Object ${key} (${body.length} bytes)\n`);
+
+    let ok = true;
+    const report = async (label: string, res: UndiciResponse, good: boolean, note = '') => {
+        console.log(`  ${pad(label, 8)} ${res.status} ${good ? 'OK' : 'FAILED'}${note ? `  ${note}` : ''}`);
+        if (!good) {
+            ok = false;
+            const text = await res.text().catch(() => '');
+            if (text) console.log(`           ${text.slice(0, 500).replace(/\s+/g, ' ')}`);
+        }
+    };
+
+    try {
+        const put = await fetch(presignObject(storage, 'PUT', key, {
+            expiresSec: 300,
+            signedHeaders: { 'content-length': String(body.length) },
+        }), { method: 'PUT', body, headers: { 'content-type': 'application/octet-stream' } });
+        await report('PUT', put, put.ok);
+        if (!put.ok) return finish(false);
+
+        const head = await fetch(presignObject(storage, 'HEAD', key, { expiresSec: 60 }), { method: 'HEAD' });
+        const size = Number(head.headers.get('content-length') ?? '-1');
+        await report('HEAD', head, head.ok && size === body.length, `content-length ${size}`);
+
+        const get = await fetch(presignObject(storage, 'GET', key, {
+            expiresSec: 60,
+            query: { 'response-content-disposition': 'attachment; filename="selftest.txt"' },
+        }));
+        const got = get.ok ? Buffer.from(await get.arrayBuffer()) : Buffer.alloc(0);
+        await report('GET', get, get.ok && got.equals(body),
+            `same bytes: ${got.equals(body) ? 'yes' : 'no'}; disposition: ${get.headers.get('content-disposition') ?? '-'}`);
+
+        const del = await fetch(presignObject(storage, 'DELETE', key, { expiresSec: 60 }), { method: 'DELETE' });
+        await report('DELETE', del, del.ok || del.status === 204);
+    } catch (err) {
+        console.log(`  network error: ${(err as Error).message}`);
+        ok = false;
+    }
+    finish(ok);
+
+    function finish(success: boolean): void {
+        console.log(success
+            ? '\nThe bucket accepts uploads, serves downloads and deletes. Recordings will work.'
+            : '\nSomething failed — the storage error above names the cause.');
+        if (!success) process.exitCode = 1;
+    }
+}
+
 function usage(): void {
     console.log(`Operator commands. Dry run by default; add --apply to write.
 
@@ -1503,6 +1590,8 @@ function usage(): void {
   alerts:scan [--days 30]                   look for both patterns in the history; writes nothing
   highlights:show [YYYY-MM]                 a month's highlights and its Discord text
   highlights:post [YYYY-MM] [--force]       post them to the highlights webhook
+  replay:selftest                           upload, read and delete a tiny test object in the
+                                            recordings bucket (REPLAY_S3_*); touches no database
   season:show                               (seasons were removed; kept so old notes still run)
 
 ${tourn.TOURNAMENT_USAGE}
@@ -1529,6 +1618,7 @@ const KNOWN = new Set([
     'player:ban', 'player:unban', 'player:unstick',
     'refunds:list', 'alerts:list', 'alerts:ack', 'alerts:scan',
     'highlights:show', 'highlights:post',
+    'replay:selftest',
     ...tourn.TOURNAMENT_COMMANDS,
 ]);
 
@@ -1541,6 +1631,9 @@ async function main(): Promise<void> {
         console.log(`Unknown command '${COMMAND}'.\n`);
         return usage();
     }
+
+    // Talks to the bucket only, never to a database — answered before one is opened.
+    if (COMMAND === 'replay:selftest') return cmdReplaySelftest();
 
     const dbPath = resolveDbPath();
 

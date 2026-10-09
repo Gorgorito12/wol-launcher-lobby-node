@@ -33,7 +33,7 @@ sudo apt-get install -y nodejs nginx certbot python3-certbot-nginx \
 
 # 2. Create the service user + data dir
 sudo useradd --system --home /var/lib/wol-lobby --shell /usr/sbin/nologin wol-lobby
-sudo mkdir -p /var/lib/wol-lobby/replays
+sudo mkdir -p /var/lib/wol-lobby
 sudo chown -R wol-lobby:wol-lobby /var/lib/wol-lobby
 
 # 3. Drop the repo at /opt/wol-lobby (clone or scp)
@@ -49,7 +49,9 @@ cp .env.example .env
 #   - HOST=127.0.0.1                          (Fastify listens local; nginx proxies in)
 #   - PORT=8080
 #   - DB_PATH=/var/lib/wol-lobby/lobby.db
-#   - REPLAYS_DIR=/var/lib/wol-lobby/replays
+#   - (optional) REPLAY_S3_ENDPOINT / REPLAY_S3_REGION / REPLAY_S3_ACCESS_KEY /
+#     REPLAY_S3_SECRET_KEY / REPLAY_BUCKET — the competitive-recordings bucket.
+#     See "Replay storage" below; leave empty to run without recordings.
 #   - PUBLIC_BASE_URL=https://wol-lobby.duckdns.org
 #                                              (Match the Redirect URI registered in Discord exactly.)
 #   - JWT_SIGNING_KEY=$(openssl rand -hex 32)
@@ -404,9 +406,88 @@ The same lines are in the service log as they happen:
 journalctl -u wol-lobby | grep 'match confirmation compared'
 ```
 
+## Replay storage (Oracle Object Storage)
+
+Recordings (`.age3Yrec`) of **competitive** matches live in a private S3-compatible bucket.
+**The bytes never pass through this server**: the launcher of the player who reported the match
+asks `POST /replays/upload-url` for a presigned PUT, uploads straight to the bucket, and calls
+`POST /replays/confirm`, which HEAD-checks the object and only then records it on the match
+(`matches.replay_key`, migration 0030). Any signed-in player gets a 10-minute download link from
+`GET /matches/:id/replay-url`. Every match list (the history, `/stats/community`'s
+`recent_matches` and `GET /matches`) carries `has_replay`, `replay_expires_at` and
+`replay_size_bytes` from one rule, `replayView` in `src/replays/rules.ts`: a recording expires
+365 days after its upload (`REPLAY_RETENTION_DAYS`, which must match the bucket's lifecycle
+rule), and a match whose key was cleared still reads as expired because `replay_uploaded_at`
+is kept.
+
+`GET /matches` (public, `MatchesBrowseIp` 30/min, 1500/day) is the launcher's Ranking › Matches
+view: every community match, newest first, `?limit=` (default 30, max 50), `?q=` (a player
+name, 2-32 characters), `?replay=1` (only matches with a live recording), `?mod=`, and
+`?cursor=` (the previous page's `next_cursor`). It pages by keyset on `(created_at, id)` and
+sends `total` on the first page only.
+
+Rules the server enforces (`src/replays/rules.ts`, every one tested): the match must exist, have
+been played in a competitive room, and the caller must be the one who reported it; the size is
+declared up front, capped by `REPLAY_MAX_BYTES` (20 MiB) and **signed into the upload URL**, so
+the bucket refuses any other size; a `sha256` that differs from the one the match was reported
+with is refused; one recording per match.
+
+Presigning is hand-rolled SigV4 (`src/replays/presign.ts`, pinned by AWS's published test
+vector) rather than the AWS SDK: recent SDKs add checksum parameters to presigned PUTs that
+Oracle's S3 layer refuses, and this way a deploy needs no new dependency.
+
+### One-time setup in the Oracle console
+
+1. **Bucket** `wol-replays`, Standard tier, **Private** (never public, no pre-authenticated
+   requests), in the tenancy's home region. Note its **Namespace**.
+2. **A dedicated user** (Identity → Domains → Default → Users) with only the *Customer secret
+   keys* capability, in a group `wol-replays-writers`, and a root-compartment policy:
+   ```
+   Allow group wol-replays-writers to read buckets in tenancy where target.bucket.name = 'wol-replays'
+   Allow group wol-replays-writers to manage objects in tenancy where target.bucket.name = 'wol-replays'
+   ```
+   The key inherits that user's permissions, so a leaked `.env` reaches this bucket and
+   nothing else.
+3. **Customer secret key** for that user → the Access key and the Secret (shown once).
+4. **Lifecycle rule** on the bucket (Policies tab): Objects → Delete after **365** days. It needs
+   `Allow service objectstorage-<region> to manage object-family in tenancy` (the console offers
+   to add it). The download route HEAD-checks first, so an expired recording reads as "no
+   recording" and the match stops offering it.
+
+### Configuration
+
+| Variable | Example | What |
+|---|---|---|
+| `REPLAY_S3_ENDPOINT` | `https://<namespace>.compat.objectstorage.us-ashburn-1.oraclecloud.com` | S3 compatibility endpoint (https, no trailing path) |
+| `REPLAY_S3_REGION` | `us-ashburn-1` | region identifier, used in the signature |
+| `REPLAY_S3_ACCESS_KEY` | | the customer secret key's Access key |
+| `REPLAY_S3_SECRET_KEY` | | its Secret |
+| `REPLAY_BUCKET` | `wol-replays` | bucket name |
+| `REPLAY_MAX_BYTES` | `20971520` | largest recording accepted |
+
+All five `REPLAY_S3_*`/`REPLAY_BUCKET` must be set, or the feature is off: the routes answer
+`503 replays_disabled`, the launcher logs it and moves on, and nothing else changes. The service
+log says which at startup (`Replay storage: bucket …` / `Replay storage: disabled`).
+
+### Deploying it
+
+```bash
+cd /opt/wol-lobby && sudo -u wol-lobby git pull     # no npm install needed
+sudo systemctl restart wol-lobby                    # migration 0030 applies itself
+journalctl -u wol-lobby -n 50 | grep 'Replay storage'
+sudo -u wol-lobby ./node_modules/.bin/tsx scripts/admin.ts replay:selftest
+```
+
+`replay:selftest` uploads, reads back and deletes a tiny object under `selftest/` through
+presigned URLs, exactly as a launcher would, and prints each status. A failure prints the
+storage's own error (`SignatureDoesNotMatch` = wrong key/secret/region, `NoSuchBucket` = wrong
+namespace or bucket, `NotAuthorizedOrNotFound` = the policy). `match:show <id>` prints the
+recording a match has, if any.
+
 ## Backups
 
-The whole world fits in one folder:
+Recordings are not on the VM any more (they are in the bucket, which Oracle keeps). The rest of
+the world fits in one folder:
 
 ```bash
 sudo tar -czf wol-lobby-backup-$(date +%F).tar.gz \

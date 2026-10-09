@@ -208,4 +208,15 @@ export const Limits = {
     // writes above; generous per minute because somebody trying the three options clicks
     // three times in a row, small per day because nothing legitimate changes it often.
     BadgeModeUser:    { scope: 'badge-u',   keyKind: 'user', perMinute: 20,  perDay: 200  } as const,
+    // Competitive recordings: asking for an upload URL and confirming it. By USER for the
+    // usual reason (two players behind one Radmin NAT each report their own matches). A
+    // launcher makes two calls per reported match, so this is far above honest use.
+    ReplayUploadUser: { scope: 'replay-up', keyKind: 'user', perMinute: 10,  perDay: 100  } as const,
+    // Download links for a recording. By USER; a caster going through a tournament's
+    // matches asks for one link per match, which a handful a minute covers.
+    ReplayDownloadUser: { scope: 'replay-dl', keyKind: 'user', perMinute: 30, perDay: 500 } as const,
+    // The launcher's Ranking > Matches view: one page of community matches per call, a
+    // search waits 300 ms after the last keystroke, and "Load 30 more" is a click. By IP like
+    // the other public read surfaces, with its own scope so it never starves them.
+    MatchesBrowseIp:  { scope: 'mbrowse',   keyKind: 'ip',   perMinute: 30,  perDay: 1500 } as const,
 } satisfies Record<string, RateLimitRule>;

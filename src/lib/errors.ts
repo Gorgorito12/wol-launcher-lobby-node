@@ -155,6 +155,20 @@ export const Errors = {
         'team_badge_locked',
         'Play a rated team match to unlock the Teams badge.',
     ),
+    // The replay bucket is not configured (REPLAY_S3_* unset). A launcher treats this as
+    // "this server keeps no recordings" and stops there — it is not a failure to retry.
+    ReplaysDisabled: () => new HttpError(
+        503,
+        'replays_disabled',
+        'This server does not store match recordings.',
+    ),
+    // The object store answered something this server could not use. Distinct from a 500 so
+    // a client can tell "storage is unwell" from "this server has a bug".
+    StorageError:    () => new HttpError(
+        502,
+        'storage_error',
+        'The recording storage did not answer as expected. Try again later.',
+    ),
     Conflict:        (msg: string) => new HttpError(409, 'conflict', msg),
     Internal:        (msg = 'Unexpected server error.') =>
         new HttpError(500, 'internal', msg),

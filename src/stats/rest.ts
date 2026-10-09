@@ -4,6 +4,7 @@ import { requireAuth } from '../middleware/auth';
 import { Errors, HttpError } from '../lib/errors';
 import { WIN_AT, LOSS_AT } from '../elo/ratability';
 import { attachParticipants } from '../matches/rest';
+import { replayView } from '../replays/rules';
 import { decayRd, type RatingMode } from '../elo/glicko2';
 import { isInactive, orderPlacement, PLACEMENT_REQUIRED, placementRequired } from '../elo/placement';
 import { normaliseSqliteTimestamp, sqliteTimestampToMs } from '../lib/time';
@@ -957,7 +958,8 @@ export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
                 `SELECT m.id, m.mod_id, m.map_name, m.duration_seconds,
                         m.created_at AS reported_at,
                         m.rated, m.unrated_reason,
-                        l.competitive
+                        l.competitive,
+                        m.replay_key, m.replay_uploaded_at, m.replay_size_bytes
                    FROM matches m
                    LEFT JOIN lobbies l ON l.id = m.lobby_id
                   ${mod ? 'WHERE m.mod_id = ?' : ''}
@@ -968,11 +970,25 @@ export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
 
             // Coerced to real booleans, NULL preserved - see the identical block in
             // /matches/history for why a raw SQLite 1 takes a whole page down on the client.
-            const recent_matches = (recentRows.results ?? []).map((m) => ({
-                ...m,
-                rated: m.rated == null ? null : Boolean(m.rated),
-                competitive: m.competitive == null ? null : Boolean(m.competitive),
-            }));
+            //
+            // The recording fields come from `replayView`, the same rule every match list uses;
+            // the object key itself never leaves the server - a download asks for a signed link
+            // by match id.
+            const replayNow = new Date();
+            const recent_matches = (recentRows.results ?? []).map((m) => {
+                const { replay_key, replay_uploaded_at, replay_size_bytes, ...rest } = m as Record<string, unknown> & { id: string };
+                return {
+                    ...rest,
+                    id: m.id,
+                    rated: m.rated == null ? null : Boolean(m.rated),
+                    competitive: m.competitive == null ? null : Boolean(m.competitive),
+                    ...replayView({
+                        replay_key: replay_key as string | null,
+                        replay_uploaded_at: replay_uploaded_at as string | null,
+                        replay_size_bytes: replay_size_bytes as number | null,
+                    }, replayNow),
+                };
+            });
             // The same helper the history endpoint uses, so "who played" is assembled one way
             // in this codebase: one query for the whole page, never one per match.
             await attachParticipants(ctx, recent_matches);

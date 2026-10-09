@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import type { ReplayStorage } from './replays/presign';
 
 /**
  * Effective configuration. Mirrors the original Worker's <c>readConfig</c>
@@ -13,7 +14,12 @@ export interface Config {
 
     // Storage paths
     dbPath: string;
-    replaysDir: string;
+
+    // Where competitive match recordings live: an S3-compatible bucket (Oracle Object
+    // Storage). Null when the REPLAY_S3_* variables are not all set — the replay routes then
+    // answer 503 replays_disabled and everything else runs as usual. The bytes never pass
+    // through this server: it only signs short-lived URLs (see src/replays/).
+    replayStorage: ReplayStorage | null;
 
     // Public tunables — same defaults the original wrangler.toml declared.
     maxConcurrentUsers: number;
@@ -198,6 +204,26 @@ function idListEnv(name: string, fallback: string[]): string[] {
 }
 
 /**
+ * The replay bucket, or null when it is not configured. All five values are required and the
+ * endpoint must be https: a half-configured bucket is reported as "disabled" rather than
+ * signing URLs that can never work. Exported so `scripts/admin.ts replay:selftest` can check
+ * the credentials without loading the rest of the configuration.
+ *
+ * Deliberately NOT in the hard-fail list in loadConfig: recordings are optional, and a server
+ * that refused to boot over them would take rooms and chat down with it.
+ */
+export function replayStorageFromEnv(): ReplayStorage | null {
+    const endpoint = strEnv('REPLAY_S3_ENDPOINT', '').trim().replace(/\/+$/, '');
+    const region = strEnv('REPLAY_S3_REGION', '').trim();
+    const accessKey = strEnv('REPLAY_S3_ACCESS_KEY', '').trim();
+    const secretKey = strEnv('REPLAY_S3_SECRET_KEY', '').trim();
+    const bucket = strEnv('REPLAY_BUCKET', '').trim();
+    if (!endpoint || !region || !accessKey || !secretKey || !bucket) return null;
+    if (!/^https:\/\/[^/\s]+$/i.test(endpoint)) return null;
+    return { endpoint, region, accessKey, secretKey, bucket };
+}
+
+/**
  * Resolve the active configuration. Called once at process startup; the
  * rest of the code passes the resulting object around instead of reading
  * process.env directly so unit tests (eventually) can stub it.
@@ -208,7 +234,7 @@ export function loadConfig(): Config {
         host: strEnv('HOST', '127.0.0.1'),
 
         dbPath: strEnv('DB_PATH', './lobby.db'),
-        replaysDir: strEnv('REPLAYS_DIR', './replays'),
+        replayStorage: replayStorageFromEnv(),
 
         maxConcurrentUsers: intEnv('MAX_CONCURRENT_USERS', 60),
         maxActiveGames: intEnv('MAX_ACTIVE_GAMES', 16),
@@ -233,7 +259,7 @@ export function loadConfig(): Config {
         dailyRequestBudget: intEnv('DAILY_REQUEST_BUDGET', 100_000),
         dailyDegradeThreshold: intEnv('DAILY_DEGRADE_THRESHOLD', 80_000),
         dailyHardLimit: intEnv('DAILY_HARD_LIMIT', 95_000),
-        replayMaxBytes: intEnv('REPLAY_MAX_BYTES', 5 * 1024 * 1024),
+        replayMaxBytes: intEnv('REPLAY_MAX_BYTES', 20 * 1024 * 1024),
         lobbyMaxPlayers: intEnv('LOBBY_MAX_PLAYERS', 8),
         devAuthBypass: (process.env.DEV_AUTH_BYPASS || '').toLowerCase() === 'true',
 

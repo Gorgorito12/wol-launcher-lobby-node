@@ -4,7 +4,6 @@ import { launcherVersionOf } from './middleware/auth.js';
 import cors from '@fastify/cors';
 import websocket from '@fastify/websocket';
 import { join } from 'node:path';
-import { mkdirSync } from 'node:fs';
 import { loadConfig } from './env';
 import { Db } from './db';
 import { effectiveRatings } from './elo/ladder';
@@ -22,6 +21,7 @@ import { registerLobbiesRest } from './lobbies/rest';
 import { configure as configureDiscordAnnounce } from './lobbies/discordAnnounce';
 import { scheduleOrphanLobbySweep } from './lobbies/orphanSweep';
 import { registerMatchesRest } from './matches/rest';
+import { registerMatchesBrowse } from './matches/browse';
 import { registerStatsRest } from './stats/rest';
 import { registerTournamentsRest } from './tournaments/rest';
 import { registerTeamsRest } from './teams/rest';
@@ -34,7 +34,6 @@ const SERVICE_VERSION = '0.1.0';
 
 async function main(): Promise<void> {
     const config = loadConfig();
-    mkdirSync(config.replaysDir, { recursive: true });
 
     // ----- Storage -----
     const db = new Db(config.dbPath);
@@ -61,7 +60,7 @@ async function main(): Promise<void> {
         // Trust the first hop's x-forwarded-for so rate limits attribute
         // to the real client behind nginx.
         trustProxy: true,
-        bodyLimit: 1 * 1024 * 1024, // 1 MB default; replays override per-route
+        bodyLimit: 1 * 1024 * 1024, // 1 MB; recordings never come through here (see src/replays/rest.ts)
     });
 
     // Share config + logger + db with the Discord room-announcement module so the
@@ -69,6 +68,14 @@ async function main(): Promise<void> {
     // The db is what lets it rehydrate an announcement posted by a PREVIOUS
     // process (see discordAnnounce's ensureState).
     configureDiscordAnnounce(config, app.log, db);
+
+    // One line that says whether recordings can be kept, so a deploy that forgot the
+    // REPLAY_S3_* variables is visible in the journal instead of only as 503s in the launcher.
+    if (config.replayStorage) {
+        app.log.info(`Replay storage: bucket ${config.replayStorage.bucket} (${config.replayStorage.region})`);
+    } else {
+        app.log.info('Replay storage: disabled (REPLAY_S3_* not set)');
+    }
 
     // CORS — open like the Worker. The launcher is the only intended
     // client, but leaving CORS open keeps a future status page on a
@@ -183,6 +190,7 @@ async function main(): Promise<void> {
     registerDiscordAuth(app, ctx);
     registerLobbiesRest(app, ctx);
     registerMatchesRest(app, ctx);
+    registerMatchesBrowse(app, ctx);
     registerReplaysRest(app, ctx);
     registerStatsRest(app, ctx);
     registerTournamentsRest(app, ctx);

@@ -26,6 +26,7 @@ import { maybePostMonthlyHighlights } from '../stats/highlightsAnnounce';
 import { parseRoomTeams, sidesFromParticipants, sidesFromRoomTeams, teamsMismatch } from './teamsMismatch';
 import { recordIpHash, requestIpHash } from '../lib/ipHash';
 import { normalizeBadgeMode } from '../users/badgeMode';
+import { replayView } from '../replays/rules';
 import type { AppContext } from '../context';
 
 interface ReportMatchBody {
@@ -2363,7 +2364,8 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
             // lobby may be gone; that yields NULL, which the client renders as nothing at all.
             `SELECT m.id, m.mod_id, m.map_name, m.map_pool, m.duration_seconds, m.started_at, m.ended_at,
                     m.created_at,
-                    m.replay_object_key, m.rated, m.unrated_reason,
+                    m.replay_object_key, m.replay_key, m.replay_uploaded_at, m.replay_size_bytes,
+                    m.rated, m.unrated_reason,
                     COALESCE(m.rating_mode, 'default') AS rating_mode,
                     m.elo_factor, m.farm_streak, m.room_teams AS room_teams_json,
                     m.tournament_match_id,
@@ -2393,15 +2395,25 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
         // NULL is PRESERVED rather than folded into false. A row from before migration 0006 has
         // no answer, and "we don't know" is not "it did not count" — flattening it would make
         // every old match claim it was unrated.
+        const now = new Date();
         const matches: Array<Record<string, unknown> & { id: string }> = (rows.results ?? []).map((m) => {
             const {
                 room_teams_json, tournament_id, tournament_name, tournament_round,
-                tournament_bracket_size, ...rest
+                tournament_bracket_size, replay_key, replay_uploaded_at, replay_size_bytes, ...rest
             } = m as Record<string, unknown> & { id: string };
             return {
                 ...rest,
                 id: m.id,
                 rated: m.rated == null ? null : Boolean(m.rated),
+                // Whether a competitive recording is in the bucket (src/replays/rest.ts), when it
+                // expires, and its size - the one rule every match list uses (`replayView`). The
+                // key itself stays on the server: the client asks for a signed link by match id.
+                // `has_replay` is a real boolean for the reason `rated` is one.
+                ...replayView({
+                    replay_key: replay_key as string | null,
+                    replay_uploaded_at: replay_uploaded_at as string | null,
+                    replay_size_bytes: replay_size_bytes as number | null,
+                }, now),
                 // Same coercion and the same NULL rule, for the same two reasons. A match whose
                 // lobby row is gone is "we don't know what kind of room this was", never "casual".
                 competitive: m.competitive == null ? null : Boolean(m.competitive),
