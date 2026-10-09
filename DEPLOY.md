@@ -422,9 +422,15 @@ is kept.
 
 `GET /matches` (public, `MatchesBrowseIp` 30/min, 1500/day) is the launcher's Ranking › Matches
 view: every community match, newest first, `?limit=` (default 30, max 50), `?q=` (a player
-name, 2-32 characters), `?replay=1` (only matches with a live recording), `?mod=`, and
-`?cursor=` (the previous page's `next_cursor`). It pages by keyset on `(created_at, id)` and
-sends `total` on the first page only.
+name, 2-32 characters), `?replay=1` (only matches with a live recording), `?mod=`,
+`?sort=oldest` (oldest first), `?days=1|7|30` (a window ending now), `?kind=competitive|casual`
+(from `lobbies.competitive`; a match whose lobby row is gone is in neither), `?decided=1`
+(somebody won), and `?cursor=` (the previous page's `next_cursor`). It pages by keyset on
+`(created_at, id)` and sends `total` on the first page only. An oldest-first cursor is bound to
+that order — sent with the other one it is a `400 bad_cursor`. Every page carries
+`filters: ["sort","days","kind","decided"]`, which is how the launcher knows this server applies
+them: against a server without it, it hides those controls instead of pretending to filter.
+**Deploy this before the launcher release that shows them.**
 
 Rules the server enforces (`src/replays/rules.ts`, every one tested): the match must exist, have
 been played in a competitive room, and the caller must be the one who reported it; the size is
