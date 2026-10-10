@@ -54,7 +54,7 @@ cp .env.example .env
 #     See "Replay storage" below; leave empty to run without recordings.
 #   - PUBLIC_BASE_URL=https://wol-lobby.duckdns.org
 #                                              (Match the Redirect URI registered in Discord exactly.)
-#   - JWT_SIGNING_KEY=$(openssl rand -hex 32)
+#   - JWT_SIGNING_KEY=$(openssl rand -hex 32)   ← FIRST SETUP ONLY. See the warning below.
 #   - DISCORD_CLIENT_ID=...                   (from discord.com/developers/applications)
 #   - DISCORD_CLIENT_SECRET=...
 #   - (optional) GLOBAL_CHAT_MSGS_PER_MIN / GLOBAL_CHAT_HISTORY /
@@ -74,6 +74,18 @@ journalctl -u wol-lobby -n 50 --no-pager     # check startup logs
 curl http://127.0.0.1:8080/health
 # → {"ok":true,"version":"0.1.0", ... }
 ```
+
+> **⚠ NEVER CHANGE `JWT_SIGNING_KEY` ON A RUNNING SERVER.** It is set once, at first setup, and
+> left alone. Every player's session is a token signed with it, and the server checks against ONE
+> key (`src/lib/jwt.ts`, no previous-key fallback). Change it and every session in every launcher
+> is dead at once: the global chat answers `invalid_token`, presence and the chat go blank, and
+> every player has to sign in with Discord again. (From v1.0.17 the launcher signs the player out
+> with a message when that happens; older launchers just sit on "Connecting…" until the player
+> signs out by hand.) It also changes `IP_HASH_SECRET` when that is empty, since the hash is
+> derived from the key — set `IP_HASH_SECRET` explicitly if you ever must rotate.
+>
+> Back `.env` up before editing it (`sudo cp .env .env.bak.$(date +%F)`): `sed -i` and `nano`
+> keep no copy, and a key that is lost cannot be recovered from anywhere else.
 
 ## nginx + Let's Encrypt
 
@@ -176,7 +188,11 @@ curl http://127.0.0.1:8080/health            # → {"ok":true, ...}
 
 Most launcher-feature backends are **code-only** changes: no new deps, no
 migration, no nginx edit — `git pull` + `systemctl restart` is the whole
-deploy. Example: the recent multiplayer features — **host migration**,
+deploy. The `matches_changed` frame is one: whenever a match is stored or its result,
+rating or civilizations change, `notifyMatchesChanged` (`src/matches/rest.ts`) clears the
+stats memos and tells every launcher on `/global/ws`, batched per second, so the Rooms
+block, the ranking, Ranking › Matches and the history refresh within seconds instead of
+on their next minute (or the next tab switch). Launchers older than v1.0.17 ignore it. Example: the recent multiplayer features — **host migration**,
 the **abort-grace window**, **kick** (`handleKick`) and the per-player ping
 plumbing (`set_radmin_ip` → `member_net`) — all live in
 `src/lobbies/LobbyRoom.ts` + `src/lobbies/rest.ts` over the existing
@@ -478,11 +494,16 @@ log says which at startup (`Replay storage: bucket …` / `Replay storage: disab
 ### Deploying it
 
 ```bash
-cd /opt/wol-lobby && sudo -u wol-lobby git pull     # no npm install needed
+cd /opt/wol-lobby && git pull                       # as ubuntu: the checkout is ubuntu's (no npm install needed)
 sudo systemctl restart wol-lobby                    # migration 0030 applies itself
-journalctl -u wol-lobby -n 50 | grep 'Replay storage'
+sleep 5; journalctl -u wol-lobby --since "2 min ago" --no-pager | grep 'Replay storage'
 sudo -u wol-lobby ./node_modules/.bin/tsx scripts/admin.ts replay:selftest
 ```
+
+`git pull` runs as the user that OWNS the checkout (`ubuntu` on this VM). `sudo -u wol-lobby git
+pull` stops with *"detected dubious ownership"* — don't add a `safe.directory` exception to get
+past it, pull as the owner. The `sleep` is there because `systemctl restart` returns before Node
+has booted: grepping straight away finds nothing even when the line is about to be written.
 
 **Editing `.env`:** if it was copied from `.env.example`, the five `REPLAY_*` lines are already
 there, EMPTY. Fill those in rather than appending a second set — `grep -n '^REPLAY_' .env` shows

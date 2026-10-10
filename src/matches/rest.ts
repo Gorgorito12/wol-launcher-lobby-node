@@ -20,7 +20,7 @@ import { sqliteTimestampToMs, normaliseSqliteTimestamp } from '../lib/time';
 import { finalizeRoom } from '../lobbies/discordAnnounce';
 import { advanceTournamentFromMatch } from '../tournaments/advance';
 import { getTournament, loadBracket } from '../tournaments/store';
-import { invalidateCivStatsCaches, ladderRanks, ladderSize, ratedRecordFor } from '../stats/rest';
+import { invalidateMatchStatsCaches, ladderRanks, ladderSize, ratedRecordFor } from '../stats/rest';
 import { refundsFor, standingFor } from '../stats/standing';
 import { maybePostMonthlyHighlights } from '../stats/highlightsAnnounce';
 import { parseRoomTeams, sidesFromParticipants, sidesFromRoomTeams, teamsMismatch } from './teamsMismatch';
@@ -271,8 +271,25 @@ async function fillMissingCivs(
     }
     // The civilization and matchup tables are memoised for a minute; a match that just
     // gained its civilizations should show up on the next request, not the next minute.
-    if (filled > 0) invalidateCivStatsCaches();
+    if (filled > 0) void notifyMatchesChanged(ctx, matchId);
     return filled;
+}
+
+/**
+ * A match was stored, or its result, rating or civilizations changed: forget the stats memos
+ * built from the matches table and tell every open launcher, so the pages showing the
+ * community's matches refresh now (the `matches_changed` frame, batched per second). Looks the
+ * participants up itself so every call site is one line. Never awaited by a route and never
+ * throws: an announcement must not slow down or fail a report.
+ */
+async function notifyMatchesChanged(ctx: AppContext, matchId: string): Promise<void> {
+    try {
+        invalidateMatchStatsCaches();
+        const rows = await ctx.db.prepare(
+            `SELECT user_id FROM match_participants WHERE match_id = ?`,
+        ).bind(matchId).all<{ user_id: string }>();
+        ctx.globalChat.announceMatchesChanged(matchId, (rows.results ?? []).map((r) => r.user_id));
+    } catch { /* best-effort */ }
 }
 
 /**
@@ -563,6 +580,7 @@ async function maybeDecideByAbandonLater(
             );
 
             // The room closed minutes ago, so this is the only way either player learns it.
+            void notifyMatchesChanged(ctx, matchId);
             ctx.globalChat.announceMatchRated({
                 matchId,
                 lobbyId,
@@ -737,6 +755,7 @@ async function maybeUpgradeFromConfirmation(
             );
 
             // The room closed minutes ago, so this is the only way either player learns it.
+            void notifyMatchesChanged(ctx, matchId);
             ctx.globalChat.announceMatchRated({
                 matchId,
                 lobbyId,
@@ -920,6 +939,7 @@ async function maybeRateAwaitingTeamMatch(
 
         // The room closed when the host reported, so this is the only way anybody learns
         // the match ended up counting.
+        void notifyMatchesChanged(ctx, matchId);
         ctx.globalChat.announceMatchRated({
             matchId,
             lobbyId,
@@ -1467,6 +1487,7 @@ async function foundMatchFromReadingsInner(
         );
 
         // Nobody is in the room any more, so this is the only way either player learns it.
+        void notifyMatchesChanged(ctx, matchId);
         ctx.globalChat.announceMatchRated({
             matchId,
             lobbyId,
@@ -1590,6 +1611,7 @@ async function maybeVoidByCrashLater(
 
         // Both players learn it stopped counting. Results are kept — the card shows what the
         // recording said — and the ratings are null: nothing moved.
+        void notifyMatchesChanged(ctx, matchId);
         ctx.globalChat.announceMatchRated({
             matchId,
             lobbyId,
@@ -1703,6 +1725,7 @@ async function maybeRevertContradictedFounding(
                 { match_id: matchId, lobby_id: lobbyId, contradicted_by: c.user_id, replayed },
                 'founded match contradicted by a later reading; reverted and ladder replayed',
             );
+            void notifyMatchesChanged(ctx, matchId);
             return;
         }
     } catch (err) {
@@ -2181,8 +2204,9 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
             finalizeRoom(body.lobby_id);
         }
 
-        // Not awaited: neither may slow down or fail the report.
+        // Not awaited: none may slow down or fail the report.
         void checkPairAlerts(ctx, req.log, matchId);
+        void notifyMatchesChanged(ctx, matchId);
         void maybePostMonthlyHighlights(ctx, req.log);
 
         return reply.send({

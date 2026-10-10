@@ -419,16 +419,21 @@ let civCache: { at: number; mod: string | null; mode: string; payload: unknown }
 let matchupCache: { at: number; mod: string | null; mode: string; payload: unknown } | null = null;
 
 /**
- * Forget the civilization and matchup tables, and the community payloads that carry
- * `top_civs`. Called by the matches routes when a confirmation has just filled in a
- * civilization a report left blank (migration 0019): the memo is a minute long, and a match
- * that just learned who played what should show up on the next request, not the next
- * minute. Cheap — three slots and a small map — and a no-op when nothing was cached.
+ * Forget every memo built from the matches table: the community payloads, the civilization and
+ * matchup tables, the list of mods with matches and the month's highlights. Called by the
+ * matches routes whenever a match is stored or its result, rating or civilizations change —
+ * together with the `matches_changed` frame that makes every open launcher ask again. Without
+ * it the launchers would ask at once and be answered with the list as it stood a minute (the
+ * highlights: five minutes) before the match. Cheap — a few slots and a small map — and a no-op
+ * when nothing was cached. The deck memo is left alone: decks are what players SAY they carry,
+ * which no match changes.
  */
-export function invalidateCivStatsCaches(): void {
+export function invalidateMatchStatsCaches(): void {
     civCache = null;
     matchupCache = null;
     communityCache.clear();
+    modsCache = null;
+    highlightsCache = null;
 }
 let deckCache: { at: number; mod: string | null; payload: unknown } | null = null;
 

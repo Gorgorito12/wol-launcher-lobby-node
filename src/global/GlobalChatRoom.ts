@@ -8,6 +8,7 @@ import { isInPlacement } from '../elo/placement';
 import type { AppContext } from '../context';
 import { ladderRanks } from '../stats/rest';
 import { badgeModes, type BadgeMode } from '../users/badgeMode';
+import { MatchesChangedBatcher } from './matchesChanged';
 
 /**
  * Process-wide GLOBAL chat room — a single instance for the whole
@@ -30,9 +31,17 @@ import { badgeModes, type BadgeMode } from '../users/badgeMode';
  *
  * Wire protocol (JSON frames):
  *   client → server : hello {token}, chat {body}, invite {target_user_id, lobby_id}, ping
- *   server → client : global_state {history, online}, chat {line},
- *                     presence {online}, lobby_created {lobby}, invite {from, lobbyId,
- *                     roomName, modId}, invite_sent {login}, error {code, message}, pong
+ *   server → client, to everybody:
+ *                     chat {line}, presence {online, onlineUsers}, lobby_created {lobby},
+ *                     matches_changed {matchIds, userIds}
+ *   server → client, to the user concerned:
+ *                     global_state {history, online, onlineUsers}, invite {from, lobbyId,
+ *                     roomName, modId}, invite_sent {login}, match_rated {...},
+ *                     tournament_update {...}, team_invite {...}, error {code, message}, pong
+ *
+ * A token that does not verify (expired, or signed with a key the server no longer has) gets
+ * `error invalid_token` and a 4003 close. The launcher signs the player out on it; it used to
+ * retry for ever.
  */
 
 interface AttachedSocket {
@@ -258,6 +267,20 @@ export class GlobalChatRoom {
                 null,
             );
         } catch { /* never break room creation on a broadcast hiccup */ }
+    }
+
+    /** Collects `matches_changed` notes for a second and sends them as one frame. */
+    private readonly matchesChanged = new MatchesChangedBatcher((frame) => this.broadcast(frame, null));
+
+    /**
+     * Tell EVERY launcher that a match was stored or its result or rating changed, so the pages
+     * built from the community's matches refresh now instead of on their next minute — or, for
+     * most of them, the next time the player switched tabs. Batched (see MatchesChangedBatcher),
+     * best-effort, never throws.
+     */
+    announceMatchesChanged(matchId: string, userIds: readonly string[]): void {
+        try { this.matchesChanged.add(matchId, userIds); }
+        catch { /* never break a report on an announcement */ }
     }
 
     /**
