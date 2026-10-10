@@ -79,7 +79,7 @@ curl http://127.0.0.1:8080/health
 > left alone. Every player's session is a token signed with it, and the server checks against ONE
 > key (`src/lib/jwt.ts`, no previous-key fallback). Change it and every session in every launcher
 > is dead at once: the global chat answers `invalid_token`, presence and the chat go blank, and
-> every player has to sign in with Discord again. (From v1.0.17 the launcher signs the player out
+> every player has to sign in with Discord again. (From v1.0.16b the launcher signs the player out
 > with a message when that happens; older launchers just sit on "Connecting…" until the player
 > signs out by hand.) It also changes `IP_HASH_SECRET` when that is empty, since the hash is
 > derived from the key — set `IP_HASH_SECRET` explicitly if you ever must rotate.
@@ -192,7 +192,7 @@ deploy. The `matches_changed` frame is one: whenever a match is stored or its re
 rating or civilizations change, `notifyMatchesChanged` (`src/matches/rest.ts`) clears the
 stats memos and tells every launcher on `/global/ws`, batched per second, so the Rooms
 block, the ranking, Ranking › Matches and the history refresh within seconds instead of
-on their next minute (or the next tab switch). Launchers older than v1.0.17 ignore it. Example: the recent multiplayer features — **host migration**,
+on their next minute (or the next tab switch). Launchers older than v1.0.16b ignore it. Example: the recent multiplayer features — **host migration**,
 the **abort-grace window**, **kick** (`handleKick`) and the per-player ping
 plumbing (`set_radmin_ip` → `member_net`) — all live in
 `src/lobbies/LobbyRoom.ts` + `src/lobbies/rest.ts` over the existing
