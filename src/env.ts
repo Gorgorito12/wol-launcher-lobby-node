@@ -224,6 +224,15 @@ export function replayStorageFromEnv(): ReplayStorage | null {
 }
 
 /**
+ * The largest recording accepted. Exported for the same reason as `replayStorageFromEnv`:
+ * `scripts/admin.ts replay:attach` must enforce the cap the upload route enforces, without
+ * loading the configuration that refuses to start with no Discord secrets.
+ */
+export function replayMaxBytesFromEnv(): number {
+    return intEnv('REPLAY_MAX_BYTES', 20 * 1024 * 1024);
+}
+
+/**
  * Resolve the active configuration. Called once at process startup; the
  * rest of the code passes the resulting object around instead of reading
  * process.env directly so unit tests (eventually) can stub it.
@@ -259,7 +268,7 @@ export function loadConfig(): Config {
         dailyRequestBudget: intEnv('DAILY_REQUEST_BUDGET', 100_000),
         dailyDegradeThreshold: intEnv('DAILY_DEGRADE_THRESHOLD', 80_000),
         dailyHardLimit: intEnv('DAILY_HARD_LIMIT', 95_000),
-        replayMaxBytes: intEnv('REPLAY_MAX_BYTES', 20 * 1024 * 1024),
+        replayMaxBytes: replayMaxBytesFromEnv(),
         lobbyMaxPlayers: intEnv('LOBBY_MAX_PLAYERS', 8),
         devAuthBypass: (process.env.DEV_AUTH_BYPASS || '').toLowerCase() === 'true',
 

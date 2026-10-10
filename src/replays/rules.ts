@@ -83,6 +83,47 @@ export function uploadRefusal(input: {
 }
 
 /**
+ * Every reason the operator's `replay:attach` says no — the command that gives a reported
+ * match the recording its launcher could not upload (the server had no storage, the player
+ * closed the launcher, the upload gave up).
+ *
+ * The same facts the upload route checks, with one left out on purpose: WHO is asking. The
+ * operator attaches on the reporter's behalf, which is the whole point. Everything about the
+ * MATCH still holds — it exists, its room was competitive (an unknown room is not), it has no
+ * recording yet, the file fits — and so does the fingerprint, which only `force` overrides: a
+ * match reported with a recording names its bytes, and a different file would be a different
+ * game stored under this one.
+ */
+export function attachRefusal(input: {
+    match: ReplayMatchRow | null;
+    sizeBytes: number;
+    sha256: string;
+    maxBytes: number;
+    force: boolean;
+}): HttpError | null {
+    if (!input.match) return new HttpError(404, 'not_found', 'Match not found.');
+    if (input.match.competitive !== 1) {
+        return new HttpError(409, 'not_competitive', 'Only competitive matches keep their recording.');
+    }
+    if (input.match.replay_key) {
+        return new HttpError(409, 'already_uploaded', 'This match already has its recording.');
+    }
+    if (!Number.isInteger(input.sizeBytes) || input.sizeBytes <= 0) {
+        return new HttpError(400, 'bad_request', 'The file is empty.');
+    }
+    if (input.sizeBytes > input.maxBytes) {
+        return new HttpError(413, 'too_large', 'The recording is larger than the server accepts.', {
+            max_bytes: input.maxBytes,
+        });
+    }
+    const stored = input.match.replay_sha256?.trim().toLowerCase();
+    if (stored && stored !== input.sha256.trim().toLowerCase() && !input.force) {
+        return new HttpError(409, 'sha_mismatch', 'This is not the recording the match was reported with.');
+    }
+    return null;
+}
+
+/**
  * `replays/<mod>/<yyyy>/<matchId>.age3Yrec`. Built only from values the server owns — the
  * match id it generated, the mod id it stored — and sanitised anyway, so no client input can
  * ever shape an object key.

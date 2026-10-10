@@ -31,7 +31,8 @@
  */
 import 'dotenv/config';
 import { meetsMinimum } from '../src/lib/launcherVersion.js';
-import { rmSync } from 'node:fs';
+import { readFileSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
@@ -46,8 +47,9 @@ import { isInPlacement, placementRequired } from '../src/elo/placement';
 import { matchupKey } from '../src/elo/antifarm';
 import { rawConsecutiveWins, shortMatchCount } from '../src/elo/alerts';
 import { uuid } from '../src/lib/ids';
-import { loadConfig, replayStorageFromEnv } from '../src/env';
+import { loadConfig, replayMaxBytesFromEnv, replayStorageFromEnv } from '../src/env';
 import { presignObject } from '../src/replays/presign';
+import { attachRefusal, objectKeyFor, type ReplayMatchRow } from '../src/replays/rules';
 import { fetch, type Response as UndiciResponse } from 'undici';
 import { KvStore } from '../src/kv';
 import type { AppContext } from '../src/context';
@@ -55,27 +57,29 @@ import { standingFor } from '../src/stats/standing';
 import { highlightsFor, monthOf, previousMonth, renderDiscord } from '../src/stats/highlights';
 import { postHighlights } from '../src/stats/highlightsAnnounce';
 import * as tourn from './adminTournaments';
+import { bareArgsOf, looksLikeDbPath } from './adminArgs';
 
 // ---------------------------------------------------------------- argv
 
 const ARGV = process.argv.slice(2);
-const COMMAND = ARGV.find((a) => !a.startsWith('--')) ?? 'help';
+
+/** ARGV without the flags and the values they consumed (see adminArgs.ts), in order. */
+function bareArgs(): string[] {
+    return bareArgsOf(ARGV);
+}
+
+const COMMAND = bareArgs()[0] ?? 'help';
 const APPLY = ARGV.includes('--apply');
 
 /** Positional arguments after the command, in order, excluding flags and the db path. */
 function positionals(): string[] {
-    const all = ARGV.filter((a) => !a.startsWith('--'));
     // The db path is recognised by shape — it is the only positional that looks like a
     // path. Anything else is the command's own argument.
-    return all.slice(1).filter((a) => !looksLikeDbPath(a));
-}
-
-function looksLikeDbPath(a: string): boolean {
-    return a.endsWith('.db') || a.includes('/') || a.includes('\\');
+    return bareArgs().slice(1).filter((a) => !looksLikeDbPath(a));
 }
 
 function resolveDbPath(): string {
-    const positional = ARGV.filter((a) => !a.startsWith('--')).find(looksLikeDbPath);
+    const positional = bareArgs().find(looksLikeDbPath);
     return positional || process.env.DB_PATH || './lobby.db';
 }
 
@@ -1560,6 +1564,151 @@ async function cmdReplaySelftest(): Promise<void> {
     }
 }
 
+/**
+ * `replay:attach <matchId> --file=<path> [--force] [--apply]` — gives a reported match the
+ * recording its launcher could not upload.
+ *
+ * Why it exists. The launcher uploads a competitive recording after the report, and until
+ * launchers retried, one refusal lost it for good: the first match played on v1.0.16 was
+ * reported, rated, and answered `503 replays_disabled` because the bucket was not configured
+ * yet. The recording is still on the reporter's disk; this puts it where the launcher would
+ * have, under the same object key, and records it on the match exactly as
+ * `POST /replays/confirm` does — `replay_uploader_id` being the reporter, on whose behalf it is.
+ *
+ * The refusals are the upload route's (`attachRefusal`) minus "who is asking": a casual or
+ * unknown room, a match that already has a recording, a file over the cap, and a fingerprint
+ * that differs from the one the match was reported with — that last one only `--force`
+ * overrides, after you have checked by hand that it is the right game.
+ *
+ * Dry run by default: it prints the match, the file and the object key and sends nothing. The
+ * file's path must be given as `--file=<path>` or `--file <path>`.
+ */
+async function cmdReplayAttach(dbPath: string): Promise<void> {
+    const matchId = positionals()[0];
+    const file = flag('file');
+    if (!matchId || !file) {
+        console.log('Usage: replay:attach <matchId> --file=<path to the .age3Yrec> [--force] [--apply]');
+        process.exitCode = 1;
+        return;
+    }
+
+    const storage = replayStorageFromEnv();
+    if (!storage) {
+        console.log('Replay storage is not configured (REPLAY_S3_* and REPLAY_BUCKET in .env) — run replay:selftest.');
+        process.exitCode = 1;
+        return;
+    }
+
+    let bytes: Buffer;
+    try {
+        bytes = readFileSync(file);
+    } catch (err) {
+        console.log(`Could not read '${file}': ${(err as Error).message}`);
+        process.exitCode = 1;
+        return;
+    }
+    const sha = createHash('sha256').update(bytes).digest('hex');
+    const force = ARGV.includes('--force');
+
+    const db = new Db(dbPath);
+    try {
+        const match = await db.prepare(
+            `SELECT m.id, m.host_user_id, m.mod_id, m.started_at, m.replay_sha256,
+                    m.replay_key, m.replay_size_bytes, l.competitive
+               FROM matches m
+               LEFT JOIN lobbies l ON l.id = m.lobby_id
+              WHERE m.id = ?`,
+        ).bind(matchId).first<ReplayMatchRow>();
+
+        if (match) {
+            const info = await db.prepare(
+                `SELECT map_name, duration_seconds FROM matches WHERE id = ?`,
+            ).bind(match.id).first<{ map_name: string | null; duration_seconds: number | null }>();
+            const players = await db.prepare(
+                `SELECT p.user_id, p.result, u.display_name
+                   FROM match_participants p LEFT JOIN users u ON u.id = p.user_id
+                  WHERE p.match_id = ?`,
+            ).bind(match.id).all<{ user_id: string; result: number | null; display_name: string | null }>();
+
+            console.log(`Match ${match.id}`);
+            console.log(`  mod        ${match.mod_id}          map ${info?.map_name ?? '-'}`);
+            console.log(`  played     ${match.started_at}  (${info?.duration_seconds ?? '?'}s)`);
+            console.log(`  room       ${match.competitive === 1 ? 'COMPETITIVE' : match.competitive === 0 ? 'casual' : 'unknown'}`);
+            for (const p of players.results ?? []) {
+                const verdict = p.result === null ? '' : p.result >= 0.999 ? 'won' : p.result <= 0.001 ? 'lost' : 'no result';
+                const reporter = p.user_id === match.host_user_id ? '  (reported it)' : '';
+                console.log(`  player     ${pad(p.display_name ?? p.user_id, 24)} ${pad(verdict, 10)}${reporter}`);
+            }
+            console.log(`  reported   sha256 ${match.replay_sha256 ?? '- (no recording was read)'}`);
+        }
+        console.log(`  file       ${file}  (${bytes.length} bytes)`);
+        console.log(`             sha256 ${sha}`
+            + (match?.replay_sha256
+                ? (match.replay_sha256.trim().toLowerCase() === sha ? '  — the one the match was reported with' : '  — DIFFERENT from the reported one')
+                : ''));
+
+        const refused = attachRefusal({
+            match: match ?? null,
+            sizeBytes: bytes.length,
+            sha256: sha,
+            maxBytes: replayMaxBytesFromEnv(),
+            force,
+        });
+        if (refused) {
+            console.log(`\nRefused: ${refused.code} — ${refused.message}`);
+            if (refused.code === 'sha_mismatch') {
+                console.log('If you have checked that this file IS this match (map, players, date), re-run with --force.');
+            }
+            process.exitCode = 1;
+            return;
+        }
+
+        const key = objectKeyFor(match!.mod_id, match!.started_at, match!.id);
+        console.log(`  object     ${storage.bucket}/${key}`);
+        if (!APPLY) {
+            console.log('\nWould upload the file and record it on the match. Re-run with --apply to do it.');
+            return;
+        }
+
+        const put = await fetch(presignObject(storage, 'PUT', key, {
+            expiresSec: 300,
+            signedHeaders: { 'content-length': String(bytes.length) },
+        }), { method: 'PUT', body: bytes, headers: { 'content-type': 'application/octet-stream' } });
+        if (!put.ok) {
+            const text = await put.text().catch(() => '');
+            console.log(`\nThe storage refused the upload: HTTP ${put.status} ${text.slice(0, 500).replace(/\s+/g, ' ')}`);
+            process.exitCode = 1;
+            return;
+        }
+
+        const head = await fetch(presignObject(storage, 'HEAD', key, { expiresSec: 60 }), { method: 'HEAD' });
+        const size = Number(head.headers.get('content-length') ?? '-1');
+        if (!head.ok || size !== bytes.length) {
+            console.log(`\nUploaded, but the storage answers HEAD ${head.status} with ${size} bytes — not recording it on the match.`);
+            process.exitCode = 1;
+            return;
+        }
+
+        const res = await db.prepare(
+            `UPDATE matches
+                SET replay_key = ?, replay_size_bytes = ?, replay_uploaded_at = datetime('now'),
+                    replay_uploader_id = host_user_id
+              WHERE id = ? AND replay_key IS NULL`,
+        ).bind(key, bytes.length, match!.id).run();
+        if (res.changes === 0) {
+            console.log(`\nThe match was given a recording while this ran; it was left as it is. The object at ${key} is the file just uploaded.`);
+            process.exitCode = 1;
+            return;
+        }
+        console.log(`\nDone — match ${match!.id} has its recording (${bytes.length} bytes). Players can download it now.`);
+    } catch (err) {
+        console.log(`\nFailed: ${(err as Error).message}`);
+        process.exitCode = 1;
+    } finally {
+        db.close();
+    }
+}
+
 function usage(): void {
     console.log(`Operator commands. Dry run by default; add --apply to write.
 
@@ -1592,6 +1741,10 @@ function usage(): void {
   highlights:post [YYYY-MM] [--force]       post them to the highlights webhook
   replay:selftest                           upload, read and delete a tiny test object in the
                                             recordings bucket (REPLAY_S3_*); touches no database
+  replay:attach <id> --file=<path> [--force]
+                                            give a reported competitive match the recording
+                                            its launcher could not upload; --force only when
+                                            the fingerprint differs and you checked it by hand
   season:show                               (seasons were removed; kept so old notes still run)
 
 ${tourn.TOURNAMENT_USAGE}
@@ -1618,7 +1771,7 @@ const KNOWN = new Set([
     'player:ban', 'player:unban', 'player:unstick',
     'refunds:list', 'alerts:list', 'alerts:ack', 'alerts:scan',
     'highlights:show', 'highlights:post',
-    'replay:selftest',
+    'replay:selftest', 'replay:attach',
     ...tourn.TOURNAMENT_COMMANDS,
 ]);
 
@@ -1647,6 +1800,7 @@ async function main(): Promise<void> {
     if (COMMAND === 'player:ban' && ARGV.includes('--refund')) return cmdPlayerBanWithRefund(dbPath);
     if (COMMAND === 'player:unban' && ARGV.includes('--revoke-refunds')) return cmdPlayerUnbanRevoke(dbPath);
     if (COMMAND === 'highlights:post') return cmdHighlightsPost(dbPath);
+    if (COMMAND === 'replay:attach') return cmdReplayAttach(dbPath);
 
     const db = new Db(dbPath);
     try {

@@ -484,11 +484,39 @@ journalctl -u wol-lobby -n 50 | grep 'Replay storage'
 sudo -u wol-lobby ./node_modules/.bin/tsx scripts/admin.ts replay:selftest
 ```
 
+**Editing `.env`:** if it was copied from `.env.example`, the five `REPLAY_*` lines are already
+there, EMPTY. Fill those in rather than appending a second set — `grep -n '^REPLAY_' .env` shows
+them. Keep the file `chmod 600` and owned by the user the service and the admin script run as.
+
 `replay:selftest` uploads, reads back and deletes a tiny object under `selftest/` through
 presigned URLs, exactly as a launcher would, and prints each status. A failure prints the
 storage's own error (`SignatureDoesNotMatch` = wrong key/secret/region, `NoSuchBucket` = wrong
 namespace or bucket, `NotAuthorizedOrNotFound` = the policy). `match:show <id>` prints the
 recording a match has, if any.
+
+### A match whose recording never arrived
+
+Launchers keep a recording they could not upload and try again for 7 days (the server was
+unreachable, the storage was off). A match reported before that existed — or one whose 7 days ran
+out — can still be given its recording from the reporter's file:
+
+```bash
+# from your PC: copy the reporter's .age3Yrec to the VM
+scp "Record Game 1.age3Yrec" <user>@<vm>:/tmp/match.age3Yrec
+
+# on the VM: dry run first — prints the match, the players, the file's sha256 and the object key
+sudo chmod 644 /tmp/match.age3Yrec
+sudo -u wol-lobby ./node_modules/.bin/tsx scripts/admin.ts replay:attach <matchId> --file=/tmp/match.age3Yrec
+sudo -u wol-lobby ./node_modules/.bin/tsx scripts/admin.ts replay:attach <matchId> --file=/tmp/match.age3Yrec --apply
+sudo -u wol-lobby ./node_modules/.bin/tsx scripts/admin.ts match:show <matchId>
+rm /tmp/match.age3Yrec
+```
+
+It refuses a casual (or unknown) room, a match that already has a recording, a file over
+`REPLAY_MAX_BYTES`, and a file whose sha256 differs from the one the match was reported with —
+that last one only `--force` overrides, after checking by hand (map, players, date) that it is the
+right game. The upload is the launcher's: same object key, size signed into the PUT, HEAD-checked
+before the match is updated, and `replay_uploader_id` is the reporter, on whose behalf it is.
 
 ## Backups
 

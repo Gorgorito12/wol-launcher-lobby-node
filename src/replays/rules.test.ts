@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { objectKeyFor, replayFileName, replayView, reporterRefusal, uploadRefusal, REPLAY_RETENTION_DAYS, type ReplayMatchRow } from './rules';
+import { attachRefusal, objectKeyFor, replayFileName, replayView, reporterRefusal, uploadRefusal, REPLAY_RETENTION_DAYS, type ReplayMatchRow } from './rules';
 
 const SHA = 'a'.repeat(64);
 
@@ -192,4 +192,53 @@ test('a key the download route cleared still reads as expired, never as never-re
 
 test('a key with no upload date is offered rather than hidden', () => {
     assert.equal(replayView({ replay_key: 'k', replay_uploaded_at: null, replay_size_bytes: 5 }).has_replay, true);
+});
+
+// ---- replay:attach — the operator gives a reported match the recording it never got ---------
+
+function attach(overrides: Partial<Parameters<typeof attachRefusal>[0]> = {}) {
+    return attachRefusal({
+        match: match(),
+        sizeBytes: 695_050,
+        sha256: SHA,
+        maxBytes: 20 * 1024 * 1024,
+        force: false,
+        ...overrides,
+    });
+}
+
+test('attach: the reported recording is accepted, whoever runs the command', () => {
+    assert.equal(attach(), null);
+});
+
+test('attach: a match reported with no recording takes any file', () => {
+    assert.equal(attach({ match: match({ replay_sha256: null }), sha256: 'b'.repeat(64) }), null);
+});
+
+test('attach: no such match', () => {
+    assert.equal(attach({ match: null })?.code, 'not_found');
+});
+
+test('attach: a casual room, or one whose room is gone, keeps no recording', () => {
+    assert.equal(attach({ match: match({ competitive: 0 }) })?.code, 'not_competitive');
+    assert.equal(attach({ match: match({ competitive: null }) })?.code, 'not_competitive');
+});
+
+test('attach: a match that already has its recording is left alone', () => {
+    assert.equal(attach({ match: match({ replay_key: 'replays/wol/2026/m1.age3Yrec' }) })?.code, 'already_uploaded');
+});
+
+test('attach: an empty file, or one over the cap, is refused', () => {
+    assert.equal(attach({ sizeBytes: 0 })?.code, 'bad_request');
+    assert.equal(attach({ sizeBytes: 21 * 1024 * 1024 })?.code, 'too_large');
+});
+
+test('attach: a different file is refused unless forced', () => {
+    assert.equal(attach({ sha256: 'b'.repeat(64) })?.code, 'sha_mismatch');
+    assert.equal(attach({ sha256: 'b'.repeat(64), force: true }), null);
+});
+
+test('attach: --force never opens a casual room or overwrites a recording', () => {
+    assert.equal(attach({ match: match({ competitive: 0 }), force: true })?.code, 'not_competitive');
+    assert.equal(attach({ match: match({ replay_key: 'k' }), force: true })?.code, 'already_uploaded');
 });
