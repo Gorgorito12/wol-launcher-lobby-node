@@ -14,6 +14,13 @@
  * missing-players check applies whenever the HOST announced it, since the host is the one who
  * reads the refusal. Without either, the room behaves exactly as before.</p>
  *
+ * <p><b>Tournament rooms.</b> In a room bound to a bracket slot the sides are not a choice: they
+ * ARE the two entrants. The server seats every player on his entrant's side when he arrives
+ * (entrant 1 → Team 1, entrant 2 → Team 2) and refuses any change, the host's included
+ * (`tournament_side_locked`), and the teams are frozen at Start even with an older launcher
+ * in the room. Free choice there used to let the sides cross the entrants — the match then
+ * rated on the team ladder while the bracket could not tell who had won.</p>
+ *
  * <p>Pure; LobbyRoom does the I/O and the broadcasts.</p>
  */
 import { winProbability } from '../elo/glicko2';
@@ -44,7 +51,9 @@ export type TeamChangeError =
     | 'not_in_room'
     | 'spectator_no_team'
     | 'bad_team'
-    | 'team_full';
+    | 'team_full'
+    /** A tournament room: everybody plays on his entrant's side, and nobody moves him. */
+    | 'tournament_side_locked';
 
 export interface TeamChange {
     actorId: string;
@@ -55,6 +64,11 @@ export interface TeamChange {
     playingSeats: number;
     members: Readonly<Record<string, TeamMember>>;
     inGame: boolean;
+    /**
+     * The sides of a TOURNAMENT room — each entrant member's side, from the bracket. Null or
+     * absent for an ordinary room, which keeps the free choice.
+     */
+    lockedSides?: Readonly<Record<string, TeamNo>> | null;
 }
 
 /** Why a team change is refused, or null when it may go through. Checked in this order. */
@@ -67,6 +81,11 @@ export function validateTeamChange(c: TeamChange): TeamChangeError | null {
     if (!target) return 'not_in_room';
     if (target.role === 'spectator') return 'spectator_no_team';
     if (c.team === undefined) return 'bad_team';
+    // In a tournament room the only accepted side is the one the bracket gave him — never
+    // another, never none — whoever asks.
+    if (c.lockedSides) {
+        return c.team !== null && c.lockedSides[c.targetId] === c.team ? null : 'tournament_side_locked';
+    }
     if (c.team === null) return null;
     const taken = Object.entries(c.members)
         .filter(([id, m]) => id !== c.targetId && m.role !== 'spectator' && m.team === c.team)
@@ -144,6 +163,16 @@ export function roomOdds(playingSeats: number, players: readonly OddsPlayer[]): 
     const [a, b] = rated as [OddsPlayer, OddsPlayer];
     const p = winProbability([{ rating: a.rating!, rd: a.rd! }], [{ rating: b.rating!, rd: b.rd! }]);
     return { mode: 'default', teams: null, players: p ? { [a.id]: p.a, [b.id]: p.b } : null };
+}
+
+/**
+ * Whether the room's teams count at Start. Normally only when every player's launcher can pick
+ * a side; in a tournament room ALWAYS, because the server seated everybody itself — so the
+ * teams are frozen (and a recording that disagrees is `teams_mismatch`) even when an older
+ * launcher is in the room.
+ */
+export function teamsEnforcedFor(sidesLocked: boolean, everyoneUnderstands: boolean): boolean {
+    return sidesLocked || everyoneUnderstands;
 }
 
 /** The teams to freeze at Start, or null when the room did not use room teams. */

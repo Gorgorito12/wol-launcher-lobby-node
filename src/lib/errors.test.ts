@@ -50,3 +50,19 @@ test("the shape the launcher parses is untouched", () => {
     // saying "too old" and leaving somebody to work out what to do.
     assert.deepEqual(err.details, { min_version: "v1.0.14a" });
 });
+
+test("a team tournament that cannot be drawn names the entrants whose line-up is short", () => {
+    const err = Errors.RosterIncomplete(["e1", "e2"], 3);
+    assert.equal(err.status, 409);
+    assert.equal(err.code, "tournament_roster_incomplete");
+    // The ids let the launcher point at them; the size says what "full" means.
+    assert.deepEqual(err.details, { entrant_ids: ["e1", "e2"], roster_size: 3 });
+    // An older launcher shows the sentence verbatim, so it must say what to do.
+    assert.match(err.message, /Form the teams first/);
+});
+
+test("a draft merge naming a player who is no longer available is a 409 with its own code", () => {
+    const err = Errors.EntrantNotAvailable();
+    assert.equal(err.status, 409);
+    assert.equal(err.code, "entrant_not_available");
+});

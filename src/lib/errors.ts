@@ -137,6 +137,22 @@ export const Errors = {
         'That line-up cannot enter this tournament.',
         { reason },
     ),
+    // Seeding or starting a team tournament while some entrant is not a full line-up — a
+    // draft tournament whose teams were never formed. The ids say which, so the launcher can
+    // point at them; the sentence is what an older launcher shows verbatim.
+    RosterIncomplete: (entrantIds: readonly string[], rosterSize: number) => new HttpError(
+        409,
+        'tournament_roster_incomplete',
+        `Some entrants do not have a full line-up of ${rosterSize} yet. Form the teams first.`,
+        { entrant_ids: [...entrantIds], roster_size: rosterSize },
+    ),
+    // A draft merge naming a player who no longer holds a place — withdrawn, rejected, or
+    // already merged into another team.
+    EntrantNotAvailable: () => new HttpError(
+        409,
+        'entrant_not_available',
+        'One of those players is no longer available to join a team.',
+    ),
     TeamFull:         () => new HttpError(
         409,
         'team_full',

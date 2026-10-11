@@ -235,6 +235,34 @@ The one thing a rollback leaves behind is rows the older code has no name for �
 correction path refuses anything but `unrated_reason = 'no_decided_result'`, so an unknown value
 is inert rather than dangerous.
 
+## Discord room announcements: which mods each webhook shows
+
+Each webhook in `DISCORD_WEBHOOK_URL` has its own mod filter in `DISCORD_WEBHOOK_MOD_IDS`, one
+slot per webhook **in the same order** — the same positional rule as `DISCORD_PLAYERS_ROLE_ID`.
+A slot is a mod id or several joined with `+`; an empty slot or `*` is every mod. **A webhook with
+no slot announces every mod**, so a webhook appended to the END of `DISCORD_WEBHOOK_URL` later
+shows everything without touching the filter. Unset, every webhook announces every mod.
+
+| `DISCORD_WEBHOOK_MOD_IDS` with three webhooks | webhook 0 | webhook 1 | webhook 2 |
+|---|---|---|---|
+| (unset) | every mod | every mod | every mod |
+| `wol,wol` | WoL | WoL | every mod (no slot) |
+| `wol,*,wol+improvement-mod` | WoL | every mod | WoL + Improvement Mod |
+
+To keep the webhooks registered today on Wars of Liberty only, put one `wol` per current webhook:
+`DISCORD_WEBHOOK_MOD_IDS=wol,wol,…`. **Insert a new webhook in the middle and the filters shift
+onto the wrong channels** — append it. The filter is applied once, in `announceLobbyCreated`
+(`src/lobbies/discordAnnounce.ts`); a webhook that skipped a room never got a message, so the
+live edits and the close leave it alone. Rooms a webhook skips are still created and still show
+in the launcher (the in-app toast is not a webhook).
+
+The startup log lists each webhook (its public id, never the token) with its filter:
+
+```bash
+journalctl -u wol-lobby -n 50 --no-pager | grep "Discord announce"
+#   → {"webhook":0,"webhookId":"…","mods":["wol"]} Discord announce: webhook mod filter …
+```
+
 ## Continuous ladder and rating rules
 
 There are **no seasons** any more: one continuous ladder per mode (1v1, and teams for 2v2 + 3v3)
@@ -1107,4 +1135,36 @@ the database. Dry run first — it changes history rows that people have already
 cd /opt/wol-lobby
 npx tsx scripts/upgrade-pending.ts            # lists what it would decide, writes nothing
 npx tsx scripts/upgrade-pending.ts --apply    # writes
+```
+
+## Team tournaments: sides, corroboration and line-ups
+
+What changed, in one place (the code says why at each site):
+
+- **A tournament room seats every player on his entrant's side** (entrant 1 → Team 1) and
+  refuses any change, the host's included (`tournament_side_locked`). `room_state` carries
+  `teams_locked: true` there; a launcher that predates it simply sees its side change refused.
+- **A team tournament match moves the bracket only once the OTHER side has corroborated it**
+  (`src/tournaments/reportVerdict.ts`) — the same evidence that rates it. `teams_mismatch`
+  never moves it, and neither does a game whose players are not the two full line-ups. A 1v1
+  is unchanged. The tournament detail says why a played slot has not moved (`pending_report`).
+- **Seeding and starting refuse while any entrant's line-up is short**
+  (`tournament_roster_incomplete`) — a draft tournament whose teams were never formed.
+- **A tournament room's title** may be up to 160 characters and never cuts an entrant's name;
+  it can no longer be renamed (`tournament_room_title`).
+- **`GET /users/search?q=`** (signed in, own rate limit) finds a player by name for a team
+  invitation or a line-up.
+
+**Deploy the backend first.** Old launchers keep working against it. Before restarting, look
+for team brackets already running with a line-up that is not full — they can never finish, and
+the owner should cancel them:
+
+```bash
+sqlite3 /var/lib/wol-lobby/lobby.db "
+SELECT t.id, t.name FROM tournaments t
+ WHERE t.format <> '1v1' AND t.status = 'running'
+   AND EXISTS (SELECT 1 FROM tournament_entrants e
+                WHERE e.tournament_id = t.id AND e.status = 'confirmed'
+                  AND (SELECT COUNT(*) FROM tournament_entrant_members m WHERE m.entrant_id = e.id)
+                      <> CAST(substr(t.format, 1, 1) AS INTEGER));"
 ```

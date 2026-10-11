@@ -13,6 +13,7 @@ import {
     conservativeRating, seedByRating, seedByExplicitOrder,
     promoteFromWaitlist, entryStatusFor, occupiesTournament, playsInBracket,
     DEFAULT_RATING, DEFAULT_RD,
+    chooseRegisteredLineup, incompleteRosters, mergeRefusal, mergedSeat,
     type SeedableEntrant, type WaitlistCandidate,
 } from './entrants';
 
@@ -206,4 +207,58 @@ test('approval mode ignores capacity at registration time', () => {
     // here as well would refuse applications a tournament could still take.
     assert.equal(entryStatusFor('approval', true), 'pending');
     assert.equal(entryStatusFor('approval', false), 'pending');
+});
+
+// ---------------------------------------------------------------- team line-ups
+
+test('a draft player still alone cannot be drawn into a team bracket', () => {
+    assert.deepEqual(
+        incompleteRosters('2v2', [
+            { entrantId: 'team', memberIds: ['a', 'b'] },
+            { entrantId: 'alone', memberIds: ['c'] },
+        ]),
+        ['alone']);
+    // A 1v1 is always complete, so the guard costs nothing there.
+    assert.deepEqual(incompleteRosters('1v1', [{ entrantId: 'p', memberIds: ['a'] }]), []);
+});
+
+test('a registered captain may choose who plays, from his team', () => {
+    const team = ['cap', 'b', 'c', 'reserve'];
+    assert.deepEqual(chooseRegisteredLineup(team, ['cap', 'reserve'], '2v2'),
+        { memberIds: ['cap', 'reserve'], refusal: null });
+});
+
+test('without a choice the registered line-up is captain first, as older launchers expect', () => {
+    assert.deepEqual(chooseRegisteredLineup(['cap', 'b', 'c'], null, '2v2'),
+        { memberIds: ['cap', 'b'], refusal: null });
+});
+
+test('a choice naming somebody outside the team is refused as not_team_member', () => {
+    assert.deepEqual(chooseRegisteredLineup(['cap', 'b'], ['cap', 'stranger'], '2v2'),
+        { memberIds: [], refusal: 'not_team_member' });
+});
+
+test('THE ONE THAT MATTERS: a merged (withdrawn) solo entrant cannot be merged a second time', () => {
+    const merged = { kind: 'solo' as const, status: 'withdrawn' as const };
+    const free = { kind: 'solo' as const, status: 'confirmed' as const };
+    assert.equal(mergeRefusal('2v2', ['x', 'y'], [merged, free]), 'not_available');
+    assert.equal(mergeRefusal('2v2', ['x', 'y'], [free, free]), null);
+});
+
+test('a merge needs exactly one side of distinct, known, solo entrants', () => {
+    const free = { kind: 'solo' as const, status: 'waitlist' as const };
+    assert.equal(mergeRefusal('3v3', ['x', 'y'], [free, free]), 'wrong_count');
+    assert.equal(mergeRefusal('2v2', ['x', 'x'], [free, free]), 'duplicate_entrant');
+    assert.equal(mergeRefusal('2v2', ['x', 'y'], [free, undefined]), 'unknown_entrant');
+    assert.equal(mergeRefusal('2v2', ['x', 'y'], [free, { kind: 'team', status: 'confirmed' }]), 'not_solo');
+    assert.equal(mergeRefusal('2v2', ['x', 'y'], [free, { kind: 'solo', status: 'rejected' }]), 'not_available');
+});
+
+test('THE ONE THAT MATTERS: a team formed after the list closed keeps a seat of its own pieces', () => {
+    // Two confirmed solos become one team: one place goes back to the waitlist, one is kept.
+    // Claiming a seat again would fail with registration closed and strand the team.
+    assert.deepEqual(mergedSeat(2), { release: 1, keeps: true });
+    assert.deepEqual(mergedSeat(3), { release: 2, keeps: true });
+    // Pieces that held no place (waitlisted or pending) give the team none.
+    assert.deepEqual(mergedSeat(0), { release: 0, keeps: false });
 });

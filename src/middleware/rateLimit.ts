@@ -201,6 +201,10 @@ export const Limits = {
     // Team upkeep: creating, inviting, answering, leaving. By USER, like every other
     // write here, because two people behind one Radmin NAT each run their own team.
     TeamInviteUser:   { scope: 'team-u',   keyKind: 'user', perMinute: 10,  perDay: 60   } as const,
+    // Looking a player up by name for a team invitation or a line-up (src/users/search.ts).
+    // Asked as the user types, so generous per minute; bounded per day so the user table
+    // cannot be walked a fragment at a time.
+    UserSearchUser:   { scope: 'usearch-u', keyKind: 'user', perMinute: 30,  perDay: 600  } as const,
     LobbyCreateUser:  { scope: 'lcreate-u', keyKind: 'user', perMinute: 10,  perDay: 100  } as const,
     LobbyJoinUser:    { scope: 'ljoin-u',   keyKind: 'user', perMinute: 50,  perDay: 200  } as const,
     ReportUser:       { scope: 'report-u',  keyKind: 'user', perMinute: 5,   perDay: 20   } as const,

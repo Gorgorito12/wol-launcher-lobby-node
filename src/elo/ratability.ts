@@ -10,6 +10,7 @@
  *
  * Pure and side-effect free — the callers do the I/O and hand in plain data.
  */
+import { modIdInList } from '../lib/modIds';
 
 /** Why a match was stored but not scored. Null means it was scored. */
 export type UnratedReason =
@@ -199,7 +200,7 @@ export function timingIsPlausible(input: RatabilityInput): boolean {
 }
 
 /** The entry in RANKED_MOD_IDS that means "every mod". */
-export const ALL_MODS = '*';
+export { ALL_MODS } from '../lib/modIds';
 
 /**
  * Whether a mod's matches may move the ladder. THE one place this is decided — the room
@@ -210,12 +211,11 @@ export const ALL_MODS = '*';
  * on one mod (the fingerprint gate keeps the players of different mods apart), and the
  * rating measures the player across all of them. `*` (the default) ranks every mod,
  * including ones added to the catalog later, with no change here; a list of ids narrows it.
- * Ids compare trimmed and case-insensitively, like the list itself is parsed.</p>
+ * Ids compare trimmed and case-insensitively, like the list itself is parsed. The list
+ * rule itself is `modIdInList`, shared with the Discord announcement filter.</p>
  */
 export function isRankedMod(rankedModIds: readonly string[], modId: string | null | undefined): boolean {
-    const mod = (modId || '').trim().toLowerCase();
-    if (mod.length === 0) return false;
-    return rankedModIds.some((m) => m === ALL_MODS || m === mod);
+    return modIdInList(rankedModIds, modId);
 }
 
 /**

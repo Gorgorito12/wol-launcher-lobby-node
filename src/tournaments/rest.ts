@@ -32,9 +32,12 @@
  * ---------------------------------------------------------------------------
  * Scope of this file today
  * ---------------------------------------------------------------------------
- * Everything below is written in terms of ENTRANTS, which are teams of one in a 1v1. Only
- * creation is restricted to `1v1` / `solo` for now; opening the team formats later is
- * loosening one validation rather than rewriting routes.
+ * Everything below is written in terms of ENTRANTS, which are teams of one in a 1v1 and a
+ * whole line-up in a 2v2 or 3v3. A team line-up comes to exist three ways: a captain enters
+ * a REGISTERED team (and may choose who plays), a captain names an ADHOC line-up, or players
+ * enter alone and the owner MERGES them (draft). Seeding and starting refuse while any line-up
+ * is short, and a team match moves the bracket only once the other side has corroborated it
+ * (see advance.ts and reportVerdict.ts).
  */
 import type { FastifyInstance } from 'fastify';
 import { Errors } from '../lib/errors';
@@ -48,11 +51,17 @@ import type { AppContext } from '../context';
 import {
     validateRoster, entryStatusFor, promoteFromWaitlist, playsInBracket,
     seedByRating, seedByExplicitOrder, teamSourceAllowed, rosterSizeFor,
-    type TournamentFormat, type TeamSource, type WaitlistCandidate,
+    chooseRegisteredLineup, incompleteRosters, mergeRefusal, mergedSeat,
+    type TournamentFormat, type TeamSource, type WaitlistCandidate, type EntrantStatus,
 } from './entrants';
 import { generateBracket, advance, disqualify, roundsFor, bracketSize } from './bracket';
 import * as store from './store';
 import * as teams from '../teams/store';
+import { reportVerdictFor } from './advance';
+import { composeTournamentRoomTitle, TOURNAMENT_ROOM_TITLE_MAX } from './roomTitle';
+import {
+    invalidateTournament, readDetailCache, readListCache, writeDetailCache, writeListCache,
+} from './cache';
 
 // ---------------------------------------------------------------- bounds
 
@@ -77,41 +86,9 @@ const LIST_LIMIT = 50;
 const NAME_MAX = 80;
 const NAME_MIN = 3;
 
-const CACHE_TTL_MS = 60_000;
-
-/**
- * The detail memo, capped.
- *
- * The four memos in `stats/rest.ts` are single slots because their payloads take no
- * parameters. This one is keyed by an id the CLIENT supplies, so an uncapped Map is a
- * memory leak anybody can drive on a 1 GB box just by walking ids. Oldest-out at 50 keeps
- * the busy tournaments hot and bounds the worst case.
- */
-const DETAIL_CACHE_MAX = 50;
-const detailCache = new Map<string, { at: number; payload: unknown }>();
-
-function readDetailCache(id: string): unknown | null {
-    const hit = detailCache.get(id);
-    if (!hit || Date.now() - hit.at >= CACHE_TTL_MS) return null;
-    return hit.payload;
-}
-
-function writeDetailCache(id: string, payload: unknown): void {
-    if (detailCache.size >= DETAIL_CACHE_MAX && !detailCache.has(id)) {
-        // Map iterates in insertion order, so the first key is the oldest.
-        const oldest = detailCache.keys().next().value;
-        if (oldest !== undefined) detailCache.delete(oldest);
-    }
-    detailCache.set(id, { at: Date.now(), payload });
-}
-
-/** Every write must call this, or readers serve a bracket that predates the change. */
-function invalidate(id: string): void {
-    detailCache.delete(id);
-    listCache = null;
-}
-
-let listCache: { at: number; payload: unknown } | null = null;
+// The list and detail memos live in ./cache.ts, where the bracket's own writer (advance.ts)
+// can invalidate them too.
+const invalidate = invalidateTournament;
 
 // ---------------------------------------------------------------- helpers
 
@@ -143,12 +120,12 @@ export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): 
         preHandler: [ipRateLimit(ctx, Limits.TournamentsIp)],
     }, async (req, reply) => {
         const now = Date.now();
-        let payload = listCache && now - listCache.at < CACHE_TTL_MS ? listCache.payload : null;
+        let payload = readListCache(now);
 
         if (payload === null) {
             const rows = await store.listTournaments(ctx.db, LIST_LIMIT);
             payload = { tournaments: rows.map(listView) };
-            listCache = { at: now, payload };
+            writeListCache(payload, now);
         }
 
         // The caller's own drafts, which the public list hides on purpose. A separate cheap
@@ -266,7 +243,15 @@ export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): 
             // and the tournament still has to remember who it accepted — the same reason
             // lobbies.roster_at_start is a snapshot.
             const roster = await teams.listMembers(ctx.db, tid);
-            memberIds = roster.map((m) => m.user_id).slice(0, rosterSizeFor(t.format));
+            // The captain may say WHO plays - a team carries up to six members and the format
+            // fields two or three. Without a choice (every launcher older than it) the first
+            // members play, captain first, exactly as before.
+            const requested = Array.isArray(body.member_ids)
+                ? body.member_ids.filter((x): x is string => typeof x === 'string')
+                : null;
+            const lineup = chooseRegisteredLineup(roster.map((m) => m.user_id), requested, t.format);
+            if (lineup.refusal) throw Errors.RosterInvalid(lineup.refusal);
+            memberIds = lineup.memberIds;
         } else if (t.team_source === 'adhoc') {
             memberIds = Array.isArray(body.member_ids)
                 ? body.member_ids.filter((x): x is string => typeof x === 'string')
@@ -316,7 +301,7 @@ export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): 
         }, memberIds);
         invalidate(id);
 
-        return { entrant_id: entrantId, status, roster_size: rosterSizeFor(t.format) };
+        return { entrant_id: entrantId, status, roster_size: rosterSizeFor(t.format), members: memberIds };
     });
 
     app.post('/tournaments/:id/entrants/:eid/withdraw', {
@@ -382,14 +367,17 @@ export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): 
         const rounds = t.bracket_size ? Math.log2(t.bracket_size) : roundsFor(entrants.length);
 
         // The server composes the title. The client displays it and never proposes one:
-        // a room name is the one string in this feature that everybody sees.
+        // a room name is the one string in this feature that everybody sees. Longer than an
+        // ordinary room's, and the entrants' names are never the part that is cut — see
+        // roomTitle.ts for the final that read "… · Gommiusta".
         const label = m.round >= rounds ? 'Final' : `R${m.round}`;
-        const title = `${t.name} · ${label} · ${nameOf(m.entrant1Id)} · ${nameOf(m.entrant2Id)}`
-            .slice(0, NAME_MAX);
+        const title = composeTournamentRoomTitle(
+            t.name, label, nameOf(m.entrant1Id), nameOf(m.entrant2Id));
 
         const seats = rosterSizeFor(t.format) * 2;
         const created = await createLobby(ctx, userId, {
             title,
+            titleMax: TOURNAMENT_ROOM_TITLE_MAX,
             modId: t.mod_id,
             modCombinedHash: hash,
             maxPlayers: seats,
@@ -509,6 +497,13 @@ export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): 
         const eid = paramId(req, 'eid');
         const e = await store.getEntrant(ctx.db, eid);
         if (!e || e.tournament_id !== id) throw Errors.NotFound('Entrant');
+        // Once the bracket exists an entrant is in a slot; taking him out is a
+        // disqualification, which hands his matches on. A rejection would leave the slot
+        // pointing at somebody no longer in the tournament.
+        const tr = await store.getTournament(ctx.db, id);
+        if (tr && (tr.status === 'running' || tr.status === 'finished')) {
+            throw Errors.Conflict('The bracket has already been drawn; disqualify instead.');
+        }
 
         await withdraw(ctx, id, eid, e.status, 'rejected');
         invalidate(id);
@@ -541,17 +536,22 @@ export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): 
         const ids = Array.isArray(body.entrant_ids)
             ? body.entrant_ids.filter((x): x is string => typeof x === 'string')
             : [];
-        if (ids.length !== rosterSizeFor(t.format)) {
-            throw Errors.BadRequest(`a ${t.format} side needs exactly ${rosterSizeFor(t.format)} entrants`);
-        }
-
         const all = await store.listEntrants(ctx.db, id);
         const picked = ids.map((eid) => all.find((e) => e.id === eid));
-        if (picked.some((e) => !e)) throw Errors.NotFound('Entrant');
-        if (picked.some((e) => e!.kind !== 'solo')) {
-            throw Errors.BadRequest('one of those is already a team');
+        switch (mergeRefusal(t.format, ids, picked)) {
+            case 'wrong_count':
+                throw Errors.BadRequest(`a ${t.format} side needs exactly ${rosterSizeFor(t.format)} entrants`);
+            case 'duplicate_entrant':
+                throw Errors.BadRequest('an entrant is listed twice');
+            case 'unknown_entrant':
+                throw Errors.NotFound('Entrant');
+            case 'not_solo':
+                throw Errors.BadRequest('one of those is already a team');
+            // Withdrawn, rejected or ALREADY MERGED: without this a merged player could be
+            // folded into a second team and end up on both sides of the bracket.
+            case 'not_available':
+                throw Errors.EntrantNotAvailable();
         }
-        if (new Set(ids).size !== ids.length) throw Errors.BadRequest('an entrant is listed twice');
 
         // Everyone who was in the merged entrants becomes the new roster. Reading it from
         // the frozen rows rather than from the captains means a solo entrant that was
@@ -562,22 +562,42 @@ export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): 
             throw Errors.RosterInvalid('wrong_size');
         }
 
-        // The merged side inherits a place only if the pieces held one. Counting how many
-        // were confirmed and claiming exactly one seat back keeps `confirmed_count` honest:
-        // three confirmed solos becoming one team frees two places for the waitlist.
+        // The merged side inherits a place only if the pieces held one, and it KEEPS one of
+        // theirs: three confirmed solos becoming one team give back two places and keep the
+        // third, which keeps `confirmed_count` honest. It used to give all three back and claim
+        // one again — but `claimSeat` only works while registration is open, and closing the
+        // list is exactly when an organiser forms the teams, so every team formed then landed
+        // on the waitlist and could never play.
         const confirmed = picked.filter((e) => e!.status === 'confirmed').length;
         const captain = picked[0]!.captain_user_id;
         const name = typeof body.display_name === 'string' && body.display_name.trim()
             ? body.display_name.trim().slice(0, NAME_MAX)
             : picked.map((e) => e!.display_name).join(' + ').slice(0, NAME_MAX);
 
+        // CLAIM every piece, and put back the ones already claimed if any claim fails: two
+        // merges racing for the same player must not both win him. The read above cannot
+        // settle that - every handler awaits in between.
+        const claimed: { id: string; was: EntrantStatus }[] = [];
         for (const e of picked) {
-            await store.setEntrantStatus(ctx.db, e!.id, 'withdrawn',
+            const ok = await store.setEntrantStatus(ctx.db, e!.id, 'withdrawn',
                 ['pending', 'confirmed', 'waitlist']);
+            if (!ok) {
+                for (const c of claimed) await store.setEntrantStatus(ctx.db, c.id, c.was, ['withdrawn']);
+                throw Errors.EntrantNotAvailable();
+            }
+            claimed.push({ id: e!.id, was: e!.status });
         }
-        for (let i = 0; i < confirmed; i++) await store.releaseSeat(ctx.db, id);
-
-        const seat = confirmed > 0 ? await store.claimSeat(ctx.db, id) : false;
+        // With the pieces out of the way, the line-up must still be one nobody else in this
+        // tournament holds - the same rule every registration passes.
+        const others = await store.playersAlreadyEntered(ctx.db, id);
+        const lineupRefusal = validateRoster({ format: t.format, memberIds, alreadyEntered: others });
+        if (lineupRefusal) {
+            for (const c of claimed) await store.setEntrantStatus(ctx.db, c.id, c.was, ['withdrawn']);
+            if (lineupRefusal === 'already_entered') throw Errors.AlreadyEntered();
+            throw Errors.RosterInvalid(lineupRefusal);
+        }
+        const { release, keeps: seat } = mergedSeat(confirmed);
+        for (let i = 0; i < release; i++) await store.releaseSeat(ctx.db, id);
         const entrantId = uuid();
         await store.insertEntrant(ctx.db, {
             id: entrantId, tournamentId: id, kind: 'team', teamId: null,
@@ -605,6 +625,10 @@ export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): 
             memberIds: rosters.get(e.id) ?? [],
             registeredAt: e.registered_at,
         }));
+        // A draft tournament whose teams were never formed seats one player in a room built
+        // for four or six, which can never start. Refused here and again at start.
+        const incomplete = incompleteRosters(t.format, seedable);
+        if (incomplete.length > 0) throw Errors.RosterIncomplete(incomplete, rosterSizeFor(t.format));
 
         const body = (req.body ?? {}) as { order?: unknown };
         let seeds;
@@ -640,6 +664,10 @@ export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): 
         // anything that is not an HttpError into a nameless 500. So everything it would
         // throw about is checked here first, where the client gets a reason.
         if (entrants.length < 2) throw Errors.Conflict('At least two entrants are needed.');
+        const startRosters = await store.loadRosters(ctx.db, id);
+        const incomplete = incompleteRosters(t.format,
+            entrants.map((e) => ({ entrantId: e.id, memberIds: startRosters.get(e.id) ?? [] })));
+        if (incomplete.length > 0) throw Errors.RosterIncomplete(incomplete, rosterSizeFor(t.format));
         const seeds = entrants.map((e) => e.seed);
         if (seeds.some((s) => s === null)) throw Errors.Conflict('Seed the entrants first.');
         const sorted = [...seeds as number[]].sort((a, b) => a - b);
@@ -867,6 +895,9 @@ function listView(t: store.TournamentListRow): Record<string, unknown> {
         status: t.status,
         capacity: t.capacity,
         confirmed_count: t.confirmed_count,
+        // How many players each entrant fields. Its presence also tells a launcher this server
+        // understands a registered captain choosing WHO plays (`member_ids` on entry).
+        roster_size: rosterSizeFor(t.format),
         entrant_count: t.entrant_count ?? 0,
         pending_count: t.pending_count ?? 0,
         created_at: t.created_at,
@@ -971,6 +1002,24 @@ async function buildDetail(ctx: AppContext, id: string): Promise<unknown> {
         if (l) lobbies.set(m.id, { id: l.id, host_user_id: l.host_user_id, status: l.status });
     }
 
+    // Why a slot that WAS played has not moved: a team result the other side has not confirmed
+    // yet, a game played with other sides than the bracket's, one with no readable result, or
+    // one whose players are not the two line-ups. Without it a played match simply sat there
+    // undecided and nobody could tell whether to wait, replay or award it.
+    const rosterIds = new Map<string, string[]>(
+        [...rosters].map(([eid, members]) => [eid, members.map((m) => m.user_id)]));
+    const pendingReports = new Map<string, { state: string; match_id: string }>();
+    if (t.status === 'running') {
+        for (const m of bracket) {
+            if (m.status !== 'pending' || !m.entrant1Id || !m.entrant2Id) continue;
+            const reported = await store.latestReportForSlot(ctx.db, m.id);
+            if (!reported) continue;
+            const verdict = await reportVerdictFor(ctx, reported, t.format, m, rosterIds);
+            if (!verdict || verdict.kind === 'advance') continue;
+            pendingReports.set(m.id, { state: verdict.reason, match_id: reported });
+        }
+    }
+
     return {
         id: t.id,
         name: t.name,
@@ -990,6 +1039,7 @@ async function buildDetail(ctx: AppContext, id: string): Promise<unknown> {
         confirmed_count: t.confirmed_count,
         bracket_size: t.bracket_size,
         rounds_total: t.bracket_size ? Math.log2(t.bracket_size) : null,
+        roster_size: rosterSizeFor(t.format),
         winner_entrant_id: t.winner_entrant_id,
         created_at: t.created_at,
         entrants: entrants.map((e) => ({
@@ -1019,6 +1069,9 @@ async function buildDetail(ctx: AppContext, id: string): Promise<unknown> {
             next_match_id: m.nextMatchId,
             next_slot: m.nextSlot,
             lobby: lobbies.get(m.id) ?? null,
+            // 'awaiting_confirmation' | 'teams_mismatch' | 'undecided' | 'lineups_do_not_match',
+            // or null. Additive: an older launcher ignores it.
+            pending_report: pendingReports.get(m.id) ?? null,
         })),
     };
 }

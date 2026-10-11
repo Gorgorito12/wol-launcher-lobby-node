@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import type { ReplayStorage } from './replays/presign';
+import { parseModSlots } from './lib/modIds';
 
 /**
  * Effective configuration. Mirrors the original Worker's <c>readConfig</c>
@@ -82,6 +83,14 @@ export interface Config {
     // server. Defaults to the WoL community role at index 0 (hardcoded in
     // loadConfig). The displayed text is each role's own name.
     discordPlayersRoleIds: string[];
+
+    // Which mods' rooms each webhook announces — a LIST aligned POSITIONALLY with
+    // discordWebhookUrls, like discordPlayersRoleIds: slot[i] filters webhook[i]. A
+    // slot is one mod id or several joined with `+`; an empty slot or `*` = every
+    // mod. A webhook with NO slot (one appended to DISCORD_WEBHOOK_URL later) shows
+    // every mod, so add new webhooks at the END. Unset = every webhook, every mod.
+    // Read through modsForWebhook + modIdInList (src/lib/modIds.ts), never raw.
+    discordWebhookModIds: string[][];
 
     // Mod ids whose matches are allowed to move ELO. Everything else is still
     // stored in the match history — it just doesn't score. Defaults to `*`: EVERY
@@ -293,6 +302,7 @@ export function loadConfig(): Config {
         // roleIdListEnv — empties/"none" are KEPT as positional placeholders (unlike
         // urlListEnv, which drops them), so the index alignment holds.
         discordPlayersRoleIds: roleIdListEnv('DISCORD_PLAYERS_ROLE_ID', ['1088344884882194563']),
+        discordWebhookModIds: parseModSlots(process.env.DISCORD_WEBHOOK_MOD_IDS),
 
         rankedModIds: idListEnv('RANKED_MOD_IDS', ['*']),
 

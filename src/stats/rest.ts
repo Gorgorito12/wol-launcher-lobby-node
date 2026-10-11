@@ -11,6 +11,7 @@ import { normaliseSqliteTimestamp, sqliteTimestampToMs } from '../lib/time';
 import { forCommunity, highlightsFor, monthOf, previousMonth, type Highlights } from './highlights';
 import { maybePostMonthlyHighlights } from './highlightsAnnounce';
 import { currentStreaks } from './currentStreaks';
+import { TOURNAMENT_REF_COLUMNS, TOURNAMENT_REF_JOIN, withTournamentRef } from '../tournaments/matchRef';
 import type { AppContext } from '../context';
 
 /**
@@ -964,9 +965,11 @@ export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
                         m.created_at AS reported_at,
                         m.rated, m.unrated_reason,
                         l.competitive,
-                        m.replay_key, m.replay_uploaded_at, m.replay_size_bytes
+                        m.replay_key, m.replay_uploaded_at, m.replay_size_bytes,
+                        ${TOURNAMENT_REF_COLUMNS}
                    FROM matches m
                    LEFT JOIN lobbies l ON l.id = m.lobby_id
+                   ${TOURNAMENT_REF_JOIN}
                   ${mod ? 'WHERE m.mod_id = ?' : ''}
                   ORDER BY m.created_at DESC
                   LIMIT ?`,
@@ -981,7 +984,10 @@ export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
             // by match id.
             const replayNow = new Date();
             const recent_matches = (recentRows.results ?? []).map((m) => {
-                const { replay_key, replay_uploaded_at, replay_size_bytes, ...rest } = m as Record<string, unknown> & { id: string };
+                // `tournament` rides in `rest`: the bracket a game was played for, so the Rooms
+                // page can say "TOURNAMENT" instead of "COMPETITIVE" (src/tournaments/matchRef.ts).
+                const { replay_key, replay_uploaded_at, replay_size_bytes, ...rest } =
+                    withTournamentRef(m as Record<string, unknown> & { id: string });
                 return {
                     ...rest,
                     id: m.id,

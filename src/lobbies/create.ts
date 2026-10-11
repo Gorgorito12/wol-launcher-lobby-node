@@ -90,8 +90,18 @@ export function playingSeatsOf(maxPlayers: number, spectatorSlots: number): numb
     return maxPlayers - (spectatorSlots > 0 ? spectatorSlots : 0);
 }
 
+/** An ordinary room's title limit — what `POST /lobbies` and a rename have always allowed. */
+export const ORDINARY_TITLE_MAX = 80;
+
 export interface CreateLobbyInput {
     title: string;
+    /**
+     * The longest title this room may carry. Absent means the ordinary 80; only the
+     * tournament route passes more, because its title is composed by the SERVER from the
+     * tournament, the round and both entrants, and cutting it at 80 cut the second entrant's
+     * name (src/tournaments/roomTitle.ts).
+     */
+    titleMax?: number;
     modId: string;
     modCombinedHash: string;
     maxPlayers?: number;
@@ -160,7 +170,7 @@ export async function createLobby(
     if (!input.title || !input.modId || !input.modCombinedHash) {
         throw Errors.BadRequest('title, mod_id and mod_combined_hash are required');
     }
-    const title = input.title.trim().slice(0, 80);
+    const title = input.title.trim().slice(0, Math.max(3, input.titleMax ?? ORDINARY_TITLE_MAX));
     if (title.length < 3) throw Errors.BadRequest('title too short');
 
     const maxPlayers = Math.min(

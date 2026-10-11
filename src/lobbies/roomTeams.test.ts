@@ -4,7 +4,9 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseTeam, roomOdds, startRefusal, teamCapacity, teamsAtStart, validateTeamChange } from './roomTeams';
+import {
+    parseTeam, roomOdds, startRefusal, teamCapacity, teamsAtStart, teamsEnforcedFor, validateTeamChange,
+} from './roomTeams';
 
 const members = {
     host: { team: 1 as const, role: 'player' },
@@ -107,4 +109,60 @@ test('the teams frozen at Start, or null when the room did not use them', () => 
     assert.equal(teamsAtStart(2, true, [{ id: 'a', team: 1 }, { id: 'b', team: 2 }]), null);
     assert.equal(teamsAtStart(4, false, [{ id: 'a', team: 1 }, { id: 'b', team: 2 }]), null);
     assert.equal(teamsAtStart(4, true, [{ id: 'a', team: 1 }, { id: 'b', team: null }]), null);
+});
+
+// ---------------------------------------------------------------- tournament rooms
+
+const bracketSides = { host: 1 as const, ana: 1 as const, luis: 2 as const, pedro: 2 as const };
+const tournamentMembers = {
+    host: { team: 1 as const, role: 'player' },
+    ana: { team: 1 as const, role: 'player' },
+    luis: { team: 2 as const, role: 'player' },
+    pedro: { team: 2 as const, role: 'player' },
+};
+
+test('THE ONE THAT MATTERS: in a tournament room nobody leaves his entrant\'s side, not even moved by the host', () => {
+    const base = {
+        hostId: 'host', playingSeats: 4, members: tournamentMembers, inGame: false, lockedSides: bracketSides,
+    };
+    // Crossing to the other entrant's side, by himself or by the host.
+    assert.equal(validateTeamChange({ ...base, actorId: 'luis', targetId: 'luis', team: 1 }), 'tournament_side_locked');
+    assert.equal(validateTeamChange({ ...base, actorId: 'host', targetId: 'luis', team: 1 }), 'tournament_side_locked');
+    assert.equal(validateTeamChange({ ...base, actorId: 'host', targetId: 'host', team: 2 }), 'tournament_side_locked');
+    // Leaving the teams is no way out either: a player with no side cannot be counted.
+    assert.equal(validateTeamChange({ ...base, actorId: 'ana', targetId: 'ana', team: null }), 'tournament_side_locked');
+    // And somebody the bracket does not know has no side to take.
+    assert.equal(
+        validateTeamChange({
+            ...base, members: { ...tournamentMembers, ghost: { team: null, role: 'player' } },
+            actorId: 'host', targetId: 'ghost', team: 1,
+        }),
+        'tournament_side_locked');
+});
+
+test('the side the bracket gave is accepted, even when that side is "full" of its own entrant', () => {
+    const base = {
+        hostId: 'host', playingSeats: 4, members: tournamentMembers, inGame: false, lockedSides: bracketSides,
+    };
+    assert.equal(validateTeamChange({ ...base, actorId: 'luis', targetId: 'luis', team: 2 }), null);
+    assert.equal(validateTeamChange({ ...base, actorId: 'host', targetId: 'pedro', team: 2 }), null);
+});
+
+test('a room without a lock behaves exactly as before', () => {
+    const base = { hostId: 'host', playingSeats: 4, members, inGame: false };
+    for (const lockedSides of [undefined, null]) {
+        assert.equal(validateTeamChange({ ...base, lockedSides, actorId: 'luis', targetId: 'luis', team: 2 }), null);
+        assert.equal(validateTeamChange({ ...base, lockedSides, actorId: 'ana', targetId: 'ana', team: null }), null);
+    }
+});
+
+test('a tournament room freezes its teams even with an older launcher present', () => {
+    // An older launcher cannot pick a side, so an ordinary room with one in it skips the teams.
+    assert.equal(teamsEnforcedFor(false, false), false);
+    assert.equal(teamsEnforcedFor(false, true), true);
+    // A tournament room seated everybody itself, so its teams count regardless — which is what
+    // lets a recording whose sides differ be caught as `teams_mismatch`.
+    assert.equal(teamsEnforcedFor(true, false), true);
+    const players = Object.entries(bracketSides).map(([id, team]) => ({ id, team }));
+    assert.deepEqual(teamsAtStart(4, teamsEnforcedFor(true, false), players), bracketSides);
 });

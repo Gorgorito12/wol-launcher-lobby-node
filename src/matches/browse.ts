@@ -3,6 +3,7 @@ import { HttpError } from '../lib/errors';
 import { ipRateLimit, Limits } from '../middleware/rateLimit';
 import { replayView } from '../replays/rules';
 import { attachParticipants } from './rest';
+import { TOURNAMENT_REF_COLUMNS, TOURNAMENT_REF_JOIN, withTournamentRef } from '../tournaments/matchRef';
 import type { AppContext } from '../context';
 
 /**
@@ -186,9 +187,11 @@ export function browseSql(f: BrowseFilters): { sql: string; params: unknown[] } 
                      m.created_at AS reported_at,
                      m.rated, m.unrated_reason,
                      l.competitive,
-                     m.replay_key, m.replay_uploaded_at, m.replay_size_bytes
+                     m.replay_key, m.replay_uploaded_at, m.replay_size_bytes,
+                     ${TOURNAMENT_REF_COLUMNS}
                 FROM matches m
                 LEFT JOIN lobbies l ON l.id = m.lobby_id
+                ${TOURNAMENT_REF_JOIN}
                ${where.sql}
                ORDER BY m.created_at ${dir}, m.id ${dir}
                LIMIT ?`,
@@ -223,7 +226,8 @@ export function registerMatchesBrowse(app: FastifyInstance, ctx: AppContext): vo
         // from both. Booleans are coerced for the reason given in /matches/history, and the
         // object key never leaves the server.
         const items = shown.map((m) => {
-            const { replay_key, replay_uploaded_at, replay_size_bytes, ...rest } = m;
+            // `tournament` rides in `rest` — see src/tournaments/matchRef.ts.
+            const { replay_key, replay_uploaded_at, replay_size_bytes, ...rest } = withTournamentRef(m);
             return {
                 ...rest,
                 id: m.id,

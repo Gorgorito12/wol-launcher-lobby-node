@@ -335,6 +335,49 @@ export async function isEntrantMember(
     return !!row;
 }
 
+/**
+ * Which side of a tournament room every entrant member plays on: entrant 1 is Team 1, entrant 2
+ * is Team 2. The same join as {@link isEntrantMember}, over the FROZEN rosters, so the side a
+ * player is seated on and the door that let him in can never disagree.
+ */
+export const TOURNAMENT_SIDES_SQL =
+    `SELECT m.user_id,
+            CASE WHEN m.entrant_id = tm.entrant1_id THEN 1 ELSE 2 END AS side
+       FROM tournament_matches tm
+       JOIN tournament_entrant_members m
+         ON m.entrant_id = tm.entrant1_id OR m.entrant_id = tm.entrant2_id
+      WHERE tm.id = ?`;
+
+export async function entrantSidesForMatch(
+    db: Db,
+    tournamentMatchId: string,
+): Promise<Record<string, 1 | 2>> {
+    const r = await db.prepare(TOURNAMENT_SIDES_SQL)
+        .bind(tournamentMatchId).all<{ user_id: string; side: number }>();
+    const out: Record<string, 1 | 2> = {};
+    for (const row of r.results ?? []) out[row.user_id] = row.side === 1 ? 1 : 2;
+    return out;
+}
+
+/**
+ * The latest match reported from a room of this bracket slot — what the tournament detail
+ * reads to say why a played slot has not moved yet (`pending_report`).
+ */
+export async function latestReportForSlot(
+    db: Db,
+    tournamentMatchId: string,
+): Promise<string | null> {
+    const row = await db.prepare(
+        `SELECT m.id
+           FROM matches m
+           JOIN lobbies l ON l.id = m.lobby_id
+          WHERE l.tournament_match_id = ?
+          ORDER BY m.created_at DESC, m.rowid DESC
+          LIMIT 1`,
+    ).bind(tournamentMatchId).first<{ id: string }>();
+    return row?.id ?? null;
+}
+
 /** Every open room bound to any slot of this tournament — what cancelling has to close. */
 export async function openLobbiesForTournament(db: Db, tournamentId: string): Promise<string[]> {
     const r = await db.prepare(

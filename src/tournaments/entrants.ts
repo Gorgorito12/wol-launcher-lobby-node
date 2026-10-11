@@ -54,7 +54,9 @@ export type RosterRefusal =
     /** Already in another entrant of this same tournament. */
     | 'already_entered'
     /** Banned, or otherwise not allowed to play. */
-    | 'member_not_eligible';
+    | 'member_not_eligible'
+    /** A registered team's captain named somebody who is not in that team. */
+    | 'not_team_member';
 
 export interface RosterInput {
     format: TournamentFormat;
@@ -92,6 +94,92 @@ export function validateRoster(input: RosterInput): RosterRefusal | null {
         if (alreadyEntered.has(id)) return 'already_entered';
     }
     return null;
+}
+
+/**
+ * Who plays for a REGISTERED team: the captain's choice when he made one, otherwise the first
+ * members in the team's own order (captain first, then earliest joined) — which is what every
+ * launcher older than the choice gets, unchanged.
+ *
+ * A team may carry up to six members, so the choice is the only way a captain with reserves
+ * decides who takes the field. Only membership is checked here; the size, duplicates and
+ * "already in this tournament" are `validateRoster`'s, and "the captain plays" is the route's.
+ */
+export function chooseRegisteredLineup(
+    teamMemberIds: readonly string[],
+    requested: readonly string[] | null,
+    format: TournamentFormat,
+): { memberIds: string[]; refusal: Extract<RosterRefusal, 'not_team_member'> | null } {
+    if (requested === null) {
+        return { memberIds: teamMemberIds.slice(0, rosterSizeFor(format)), refusal: null };
+    }
+    const team = new Set(teamMemberIds);
+    if (!requested.every((id) => team.has(id))) {
+        return { memberIds: [], refusal: 'not_team_member' };
+    }
+    return { memberIds: [...requested], refusal: null };
+}
+
+/**
+ * The entrants that cannot take a seat in a bracket of this format: their frozen line-up is
+ * not the format's size.
+ *
+ * It is a draft tournament's normal state until the owner forms the teams — everybody signs
+ * up alone — and drawing a bracket from it puts one player into a room that needs four or six,
+ * which can never start. Seeding and starting refuse while this is not empty.
+ */
+export function incompleteRosters(
+    format: TournamentFormat,
+    entrants: readonly { entrantId: string; memberIds: readonly string[] }[],
+): string[] {
+    const size = rosterSizeFor(format);
+    return entrants.filter((e) => e.memberIds.length !== size).map((e) => e.entrantId);
+}
+
+export type MergeRefusal =
+    /** Not exactly one side's worth of entrants. */
+    | 'wrong_count'
+    /** The same entrant listed twice. */
+    | 'duplicate_entrant'
+    /** No such entrant in this tournament. */
+    | 'unknown_entrant'
+    /** Already a team. */
+    | 'not_solo'
+    /** No longer holds a place — withdrawn, rejected, or already merged into a team. */
+    | 'not_available';
+
+/**
+ * Whether these solo entrants may be folded into one team (draft mode), and if not, why.
+ *
+ * `not_available` is the one that was missing: a solo entrant already merged is `withdrawn`
+ * but still `solo`, so without it the same player could be merged into a second team and
+ * would then be on both sides of the bracket.
+ */
+export function mergeRefusal(
+    format: TournamentFormat,
+    ids: readonly string[],
+    picked: readonly ({ kind: 'solo' | 'team'; status: EntrantStatus } | undefined)[],
+): MergeRefusal | null {
+    if (ids.length !== rosterSizeFor(format)) return 'wrong_count';
+    if (new Set(ids).size !== ids.length) return 'duplicate_entrant';
+    if (picked.some((e) => !e)) return 'unknown_entrant';
+    if (picked.some((e) => e!.kind !== 'solo')) return 'not_solo';
+    if (picked.some((e) => !occupiesTournament(e!.status))) return 'not_available';
+    return null;
+}
+
+/**
+ * The seats a draft merge gives back and whether the new team keeps one, from how many of its
+ * pieces held a confirmed place.
+ *
+ * The team KEEPS one of its pieces' seats rather than giving them all back and claiming one
+ * again: a claim only succeeds while registration is open, and closing the list is exactly
+ * when an organiser forms the teams — so the old way put every team formed then on the
+ * waitlist, where it could never play.
+ */
+export function mergedSeat(confirmedPieces: number): { release: number; keeps: boolean } {
+    const n = Math.max(0, Math.floor(confirmedPieces));
+    return { release: Math.max(0, n - 1), keeps: n > 0 };
 }
 
 // ---------------------------------------------------------------- seeding

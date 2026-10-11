@@ -11,10 +11,12 @@ import { isInPlacement } from '../elo/placement';
 import { ladderRanks } from '../stats/rest';
 import { normalizeBadgeMode } from '../users/badgeMode';
 import { recordIpHash } from '../lib/ipHash';
+import { ORDINARY_TITLE_MAX } from './create';
 import {
-    parseTeam, roomOdds, startRefusal, teamsAtStart, validateTeamChange,
+    parseTeam, roomOdds, startRefusal, teamsAtStart, teamsEnforcedFor, validateTeamChange,
     type RoomOdds, type TeamNo,
 } from './roomTeams';
+import { entrantSidesForMatch } from '../tournaments/store';
 import type { AppContext } from '../context';
 
 /**
@@ -267,7 +269,17 @@ class LobbyRoom {
      * The room's shape, read once from the lobby row: how many PLAYING seats it has (which says
      * whether it has teams), and whether it is competitive. Null until the first hello.
      */
-    private info: { playingSeats: number; competitive: boolean } | null = null;
+    private info: {
+        playingSeats: number;
+        competitive: boolean;
+        /** The bracket slot this room plays out, or null for an ordinary room. */
+        tournamentMatchId: string | null;
+        /**
+         * A tournament room's sides, from the bracket's frozen rosters (entrant 1 → Team 1).
+         * Null for an ordinary room. When set, the server seats everybody and nobody moves.
+         */
+        sides: Record<string, TeamNo> | null;
+    } | null = null;
     /** The IP hash each socket arrived with, recorded once its hello proves who it is. */
     private pendingIp = new Map<WebSocket, string | null>();
 
@@ -510,8 +522,17 @@ class LobbyRoom {
         const ladderRankTeam = (await ladderRanks(ctx, [userId], 'team')).get(userId);
         const badgeMode = normalizeBadgeMode(member.badge_mode);
         const role = member.role === 'spectator' ? 'spectator' : 'player';
-        const team = role === 'spectator' ? null : (parseTeam(member.team) ?? null);
         await this.loadInfo(ctx);
+        // In a tournament room the side is not a choice: it is the player's entrant, and the
+        // server seats him there whatever the row said (and writes it down, so a reconnect or
+        // a restart finds the same answer).
+        const lockedSide = role === 'spectator' ? null : (this.info?.sides?.[userId] ?? null);
+        const team = role === 'spectator' ? null : (lockedSide ?? parseTeam(member.team) ?? null);
+        if (lockedSide !== null && parseTeam(member.team) !== lockedSide) {
+            void ctx.db.prepare(
+                `UPDATE lobby_members SET team = ? WHERE lobby_id = ? AND user_id = ?`,
+            ).bind(lockedSide, this.lobbyId, userId).run().catch(() => { /* best-effort */ });
+        }
 
         // What this launcher understands. Absent on every launcher older than room teams.
         const features = new Set<string>(
@@ -562,6 +583,10 @@ class LobbyRoom {
             chat: this.chatRing,
             // The odds as they stand; a launcher older than room teams ignores the key.
             odds: this.currentOdds(),
+            // A tournament room: the sides are the entrants and nobody may change them. The
+            // launcher locks its team picker on THIS, never on merely being a tournament room,
+            // so a newer launcher against an older server still lets players pick.
+            ...(this.info?.sides ? { teams_locked: true } : {}),
         });
         const m = this.members[userId]!;
         this.broadcast({
@@ -593,12 +618,27 @@ class LobbyRoom {
         if (this.info) return;
         try {
             const row = await ctx.db.prepare(
-                `SELECT max_players, spectator_slots, competitive FROM lobbies WHERE id = ?`,
-            ).bind(this.lobbyId).first<{ max_players: number; spectator_slots: number | null; competitive: number }>();
+                `SELECT max_players, spectator_slots, competitive, tournament_match_id
+                   FROM lobbies WHERE id = ?`,
+            ).bind(this.lobbyId).first<{
+                max_players: number;
+                spectator_slots: number | null;
+                competitive: number;
+                tournament_match_id: string | null;
+            }>();
             if (row) {
+                const tournamentMatchId = row.tournament_match_id ?? null;
+                // Both reads, or neither: a tournament room cached without its sides would
+                // behave like an ordinary one for the rest of its life. A failure here is
+                // retried by the next hello, because `info` stays null.
+                const sides = tournamentMatchId
+                    ? await entrantSidesForMatch(ctx.db, tournamentMatchId)
+                    : null;
                 this.info = {
                     playingSeats: Math.max(0, (row.max_players | 0) - (row.spectator_slots ?? 0)),
                     competitive: row.competitive === 1,
+                    tournamentMatchId,
+                    sides: sides && Object.keys(sides).length > 0 ? sides : null,
                 };
             }
         } catch {
@@ -662,9 +702,12 @@ class LobbyRoom {
             playingSeats: this.info?.playingSeats ?? 0,
             members: this.members,
             inGame: this.startedAtMs !== null,
+            lockedSides: this.info?.sides ?? null,
         });
         if (err) {
-            this.sendError(ws, err, `Team change refused: ${err}`);
+            this.sendError(ws, err, err === 'tournament_side_locked'
+                ? 'In a tournament room every player plays on the side of his own team.'
+                : `Team change refused: ${err}`);
             return;
         }
         const target = this.members[targetId]!;
@@ -875,7 +918,7 @@ class LobbyRoom {
         await this.loadInfo(ctx);
         const players = this.playersInRoom();
         const playingSeats = this.info?.playingSeats ?? 0;
-        const teamsEnforced = this.everyoneUnderstandsTeams();
+        const teamsEnforced = teamsEnforcedFor(!!this.info?.sides, this.everyoneUnderstandsTeams());
         const refusal = startRefusal({
             competitive: this.info?.competitive ?? false,
             playingSeats,
@@ -1170,7 +1213,17 @@ class LobbyRoom {
             return;
         }
 
-        const title = String(frame.title ?? '').trim().slice(0, 80);
+        // A tournament room's title is composed by the server from the bracket — tournament,
+        // round, both entrants — and is how the two sides recognise their room. The host is
+        // one of those sides, so a rename would let one of them relabel the other's match.
+        await this.loadInfo(ctx);
+        if (this.info?.tournamentMatchId) {
+            this.sendError(ws, 'tournament_room_title',
+                'A tournament room keeps the name the tournament gave it.');
+            return;
+        }
+
+        const title = String(frame.title ?? '').trim().slice(0, ORDINARY_TITLE_MAX);
         if (title.length < 3) {
             this.sendError(ws, 'bad_title', 'title too short');
             return;

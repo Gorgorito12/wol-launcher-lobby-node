@@ -27,6 +27,8 @@ import { parseRoomTeams, sidesFromParticipants, sidesFromRoomTeams, teamsMismatc
 import { recordIpHash, requestIpHash } from '../lib/ipHash';
 import { normalizeBadgeMode } from '../users/badgeMode';
 import { replayView } from '../replays/rules';
+import { TOURNAMENT_REF_COLUMNS, TOURNAMENT_REF_JOIN, withTournamentRef } from '../tournaments/matchRef';
+import { teamEvidenceForMatch, type GameFingerprint } from './teamEvidence';
 import type { AppContext } from '../context';
 
 interface ReportMatchBody {
@@ -319,11 +321,6 @@ async function applyConfirmedCivs(
     }
 }
 
-/** The match's own fingerprint, to compare a confirmation against. */
-interface GameFingerprint {
-    seed: number | null;
-    hostTime: number | null;
-}
 
 /**
  * Tie a lobby's stored confirmations to a match and write down whether they agree.
@@ -434,10 +431,12 @@ async function tieConfirmations(
 /**
  * Advance the bracket this match belongs to, and tell the two sides.
  *
- * Called from THREE places, because a match can be decided at three different moments:
- * the host's report, a late 1v1 reading, and a team match's other side finally agreeing.
- * The third is the one that is easy to forget and the one without which no team
- * tournament would ever finish a round.
+ * Called wherever a match can be decided: the host's report, the late 1v1 paths (a reading,
+ * an abandonment), a team match released by the other side's reading, and the tail of
+ * `POST /matches/confirm`. Every call is safe to repeat. What decides whether the slot
+ * MOVES is src/tournaments/reportVerdict.ts: a team match moves only once the OTHER side has
+ * corroborated it, never on the host's report alone and never when it was played with other
+ * sides than the room's.
  *
  * Never throws. By the time it runs the match is stored and rated, so a bracket that
  * fails to move must not cost the report — the owner can award the match by hand, and the
@@ -799,57 +798,8 @@ async function maybeUpgradeFromConfirmation(
     }
 }
 
-/**
- * Whether a team match has the reading from the OTHER side that lets it rate.
- *
- * <p>The I/O half of {@link teamEvidenceMet}. It recomputes `agreement` and `same_game`
- * in memory with exactly the rules `tieConfirmations` writes to the row, rather than
- * reading the stored columns — <b>because at report time they are not written yet</b>.
- * The player who just lost usually leaves first, so their confirmation routinely lands
- * before the match row exists, and `tieConfirmations` only runs once it does. Reading
- * the columns here would therefore report "no evidence" for precisely the ordering that
- * is most common.</p>
- *
- * <p>The stored columns remain the durable record; this is the same question asked a few
- * milliseconds earlier.</p>
- */
-async function teamEvidenceForMatch(
-    ctx: AppContext,
-    lobbyId: string | null,
-    participants: readonly { user_id: string; team: number; result: number }[],
-    reporterUserId: string,
-    fingerprint: GameFingerprint,
-): Promise<boolean> {
-    if (!lobbyId) return false;
-
-    const teams = new Map(participants.map((p) => [p.user_id, p.team | 0] as [string, number]));
-    const reported = new Map(participants.map((p) => [p.user_id, p.result] as [string, number]));
-
-    const rows = await ctx.db.prepare(
-        `SELECT user_id, result, game_seed FROM match_confirmations WHERE lobby_id = ?`,
-    ).bind(lobbyId).all<{ user_id: string; result: number; game_seed: number | null }>();
-
-    const confirmations = (rows.results ?? []).map((r) => {
-        const reportedResult = reported.get(r.user_id);
-        return {
-            userId: r.user_id,
-            agreement: reportedResult === undefined
-                ? 'not_reported'
-                : compareReadings(reportedResult, r.result),
-            // Seed alone, the same rule tieConfirmations uses — both machines must
-            // generate the same map, so they must share it.
-            sameGame: fingerprint.seed === null || r.game_seed === null
-                ? 'unknown'
-                : String(fingerprint.seed === r.game_seed),
-        };
-    });
-
-    return teamEvidenceMet({
-        teams,
-        reporterTeam: teams.get(reporterUserId) ?? null,
-        confirmations,
-    });
-}
+// teamEvidenceForMatch — "has the other side corroborated this team match?" — lives in
+// ./teamEvidence.ts, because the bracket asks the same question (tournaments/advance.ts).
 
 /**
  * Rate a team match that was stored waiting for the opposing side's reading, now that
@@ -956,9 +906,9 @@ async function maybeRateAwaitingTeamMatch(
             extra: extras.top,
         });
 
-        // THE ONE THAT MAKES TEAM TOURNAMENTS WORK. A team match is never rated on the
-        // reporter's word: it sits `awaiting_confirmation` until the other side agrees, and
-        // this is where that agreement lands. Without this call no team bracket ever moves.
+        // Where most team brackets move. A team match is never rated — and its bracket never
+        // advances — on the reporter's word: it sits `awaiting_confirmation` until the other
+        // side agrees, and this is where that agreement lands (src/tournaments/reportVerdict.ts).
         await maybeAdvanceTournament(ctx, log, matchId);
     } catch (err) {
         // Back to waiting. The results are untouched by design, so only the rating state
@@ -2357,6 +2307,13 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
             // missing at report time — the fingerprint that its anti-farm brake demands,
             // which the host never has when the host is the one who walked out.
             await maybeDecideByAbandonLater(ctx, req.log, body.lobby_id, match.id);
+
+            // The bracket, once every path above has had its say. A team match the ladder
+            // refused for some other reason (a duplicate recording, a mod outside the ranked
+            // list) never waited 'awaiting_confirmation', so nothing above would move its
+            // bracket when the other side's reading lands — this does. Idempotent through
+            // claimMatchResult, so the slot a path above already moved is a no-op here.
+            await maybeAdvanceTournament(ctx, req.log, match.id);
         }
 
         return reply.send({ ok: true, matched: !!match });
@@ -2393,8 +2350,7 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
                     COALESCE(m.rating_mode, 'default') AS rating_mode,
                     m.elo_factor, m.farm_streak, m.room_teams AS room_teams_json,
                     m.tournament_match_id,
-                    t.id AS tournament_id, t.name AS tournament_name,
-                    tm.round AS tournament_round, t.bracket_size AS tournament_bracket_size,
+                    ${TOURNAMENT_REF_COLUMNS},
                     l.competitive,
                     mp.team, mp.civ, mp.score, mp.result,
                     mp.rating_before, mp.rating_after,
@@ -2402,8 +2358,7 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
              FROM match_participants mp
              JOIN matches m ON m.id = mp.match_id
              LEFT JOIN lobbies l ON l.id = m.lobby_id
-             LEFT JOIN tournament_matches tm ON tm.id = m.tournament_match_id
-             LEFT JOIN tournaments t ON t.id = tm.tournament_id
+             ${TOURNAMENT_REF_JOIN}
              WHERE mp.user_id = ?
              ORDER BY m.started_at DESC
              LIMIT 50`,
@@ -2422,9 +2377,8 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
         const now = new Date();
         const matches: Array<Record<string, unknown> & { id: string }> = (rows.results ?? []).map((m) => {
             const {
-                room_teams_json, tournament_id, tournament_name, tournament_round,
-                tournament_bracket_size, replay_key, replay_uploaded_at, replay_size_bytes, ...rest
-            } = m as Record<string, unknown> & { id: string };
+                room_teams_json, replay_key, replay_uploaded_at, replay_size_bytes, ...rest
+            } = withTournamentRef(m as Record<string, unknown> & { id: string });
             return {
                 ...rest,
                 id: m.id,
@@ -2441,17 +2395,10 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
                 // Same coercion and the same NULL rule, for the same two reasons. A match whose
                 // lobby row is gone is "we don't know what kind of room this was", never "casual".
                 competitive: m.competitive == null ? null : Boolean(m.competitive),
-                // The bracket this game was played for (the History shows "{tournament} · {round}"
-                // instead of the map, and never an anti-farm percentage on it). Null otherwise.
-                tournament: tournament_id
-                    ? {
-                        id: tournament_id,
-                        name: tournament_name,
-                        round: tournament_round ?? null,
-                        rounds_total: typeof tournament_bracket_size === 'number' && tournament_bracket_size > 1
-                            ? Math.round(Math.log2(tournament_bracket_size)) : null,
-                    }
-                    : null,
+                // `tournament` (in `rest`) is the bracket this game was played for — the History
+                // shows "{tournament} · {round}" instead of the map, and never an anti-farm
+                // percentage on it. Null otherwise. Built by withTournamentRef, the same helper
+                // the two community lists use (src/tournaments/matchRef.ts).
                 // The teams the room froze at Start, as lists of user ids (Team 1 first). The
                 // in-game sides are added below from the participants, for a team match only.
                 room_teams: sidesFromRoomTeams(parseRoomTeams(room_teams_json as string | null)),
