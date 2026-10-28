@@ -11,6 +11,7 @@ import { normaliseSqliteTimestamp, sqliteTimestampToMs } from '../lib/time';
 import { forCommunity, highlightsFor, monthOf, previousMonth, type Highlights } from './highlights';
 import { maybePostMonthlyHighlights } from './highlightsAnnounce';
 import { currentStreaks } from './currentStreaks';
+import { ratingPeaks } from './ratingPeaks';
 import { TOURNAMENT_REF_COLUMNS, TOURNAMENT_REF_JOIN, withTournamentRef } from '../tournaments/matchRef';
 import type { AppContext } from '../context';
 
@@ -637,6 +638,9 @@ async function ladder(
     const now = Date.now();
     // The 🔥 pill (design 55a): the current win streak of everybody on the page, in one query.
     const streaks = await currentStreaks(ctx, players.map((p) => p.id), mode, now);
+    // The PEAK column (2026-10-28): each player's peak by the profile's own rule, two queries for
+    // the page. Null where there is none; a launcher draws the column only when some row has one.
+    const peaks = await ratingPeaks(ctx, players.map((p) => p.id), mode);
 
     // The rank is decided HERE, by the same ordering that produced the list. A client filtering
     // its copy must not renumber.
@@ -664,6 +668,8 @@ async function ladder(
             inactive: isInactive(lastMs, now),
             last_rated_at: r.last_rated_at ? normaliseSqliteTimestamp(r.last_rated_at) : null,
             streak: streaks.get(r.id) ?? 0,
+            rating_peak: peaks.get(r.id)?.peak ?? null,
+            rating_peak_at: peaks.get(r.id)?.peakAt ?? null,
         };
     });
 }

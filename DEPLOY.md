@@ -324,8 +324,16 @@ that never resets. The rules, and where each one lives:
   sends no odds (`hidden_reason: 'placement'`). Decided by the CURRENT state, so finishing
   placement shows his old matches too. Keys are OMITTED, never null, where launchers read plain
   numbers. **Deploy the server only after the launcher release that handles it**: an older
-  launcher draws "0?" on other players' placement rows and shows no number elsewhere. Frame-level
+  launcher (up to 1.0.16f) draws "0?" on every placement row of the Ranking, his own included, and
+  shows no number elsewhere; `MIN_LAUNCHER_VERSION` does not prevent it (stats stay open). Frame-level
   check: `npx tsx scripts/test-placement-privacy.ts`.
+- **The ladder's PEAK column** (`src/stats/ratingPeaks.ts`, called from `ladder()`): every row of
+  `leaderboard` and `leaderboard_team` in `/stats/community` carries `rating_peak` and
+  `rating_peak_at` — the same figure and date as the peak on that player's profile, because it is
+  the profile's own `peakAndLow` over the same rated matches and unrevoked refunds (null where the
+  player has none). Two queries per page, inside the 60-s stats cache. Additive, so either order of
+  deploy is safe: an older launcher ignores the fields, and a newer one draws the column only when
+  some row has a peak. Check against a real database: `npx tsx scripts/test-rating-peaks.ts`.
 - **Teams, team against team**: each player is rated with his team's mean rating against the
   other team's mean and combined deviation (root mean square); his own deviation decides how far
   he moves.
