@@ -10,6 +10,7 @@ import { isEntrantMember } from '../tournaments/store';
 import { DEFAULT_RATING, DEFAULT_RD } from '../elo/glicko2';
 import { effectiveRatings, type EffectiveRating } from '../elo/ladder';
 import { isInPlacement } from '../elo/placement';
+import { publicRatingsFor } from '../elo/placementPrivacy';
 import { recordIpHash, requestIpHash } from '../lib/ipHash';
 import { ladderRanks } from '../stats/rest';
 import { normalizeBadgeMode } from '../users/badgeMode';
@@ -193,7 +194,11 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
                 // and hide Join from anyone who is not one of the two entrants.
                 tournament_match_id: r.tournament_match_id ?? null,
                 created_at: r.created_at,
-                host: {
+                // A host still being PLACED on a ladder is listed without that ladder's rating:
+                // this body is one cached answer for every reader, so nobody but him may get it,
+                // and he takes his own from his standing (src/elo/placementPrivacy.ts). Omitted,
+                // never null — the progress (`games_played`, `in_placement`) still says why.
+                host: publicRatingsFor(r.host_user_id, {
                     id: r.host_user_id,
                     discord_username: r.host_login,
                     display_name: r.host_name,
@@ -224,14 +229,15 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
                     // Which badge the host shows where the room does not decide it.
                     badge_mode: normalizeBadgeMode(r.host_badge_mode),
                     // Rated matches on each ladder, and whether the host is still being placed:
-                    // the launcher writes a placement rating with a "?". Omitted on failure.
+                    // the launcher writes "in placement 3/10" where the rating would be (and his
+                    // own launcher, its own number with a "?"). Omitted on failure.
                     games_played: hostSolo ? (hostSolo.get(r.host_user_id)?.games_played ?? 0) : undefined,
                     games_played_team: hostTeam ? (hostTeam.get(r.host_user_id)?.games_played ?? 0) : undefined,
                     in_placement: hostSolo
                         ? isInPlacement(hostSolo.get(r.host_user_id)?.games_played ?? 0, 'default') : undefined,
                     in_placement_team: hostTeam
                         ? isInPlacement(hostTeam.get(r.host_user_id)?.games_played ?? 0, 'team') : undefined,
-                },
+                }),
             })),
         });
     });

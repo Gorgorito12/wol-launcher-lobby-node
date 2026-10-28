@@ -4,8 +4,11 @@ import { uuid } from '../lib/ids';
 import { requireAuth } from '../middleware/auth';
 import { ipRateLimit, Limits } from '../middleware/rateLimit';
 import { type ParticipantOutcome, type RatingMode } from '../elo/glicko2';
-import { rateStoredMatch, type PlayerChange, type RatedMatch } from '../elo/ladder';
+import { effectiveRatings, rateStoredMatch, type PlayerChange, type RatedMatch } from '../elo/ladder';
 import { placementRequired } from '../elo/placement';
+import {
+    historyRowFor, participantsFor, resultParticipantsFor, standingShownTo, type CurrentGames,
+} from '../elo/placementPrivacy';
 import { isNewAccountShort } from '../elo/newAccount';
 import { checkPairAlerts } from '../elo/alerts';
 import { ratabilityReason, isRankedMod, compareReadings, canUpgradeFromConfirmation, WIN_AT, LOSS_AT,
@@ -1085,10 +1088,17 @@ async function abandonVerdict(
  *
  * ONE extra query for the whole page, never one per match: fifty ids go into a single
  * IN and the rows are grouped here.
+ *
+ * <p><b>`viewerId` decides whose numbers are shown.</b> A participant still being PLACED on the
+ * match's ladder reaches nobody but himself with his before/after, and every participant carries
+ * his current placement progress so the launcher can say so (src/elo/placementPrivacy.ts). Null
+ * — the default — is a payload shared by everyone, such as the cached `recent_matches`, and hides
+ * him from all.</p>
  */
 export async function attachParticipants(
     ctx: AppContext,
     matches: Array<Record<string, unknown> & { id: string }>,
+    viewerId: string | null = null,
 ): Promise<void> {
     if (matches.length === 0) return;
 
@@ -1096,8 +1106,10 @@ export async function attachParticipants(
     const parts = await ctx.db.prepare(
         `SELECT mp.match_id, mp.user_id, mp.team, mp.civ, mp.home_city, mp.result,
                 mp.rating_before, mp.rating_after,
+                COALESCE(m.rating_mode, 'default') AS rating_mode,
                 u.discord_username, u.display_name, u.avatar_url
          FROM match_participants mp
+         JOIN matches m ON m.id = mp.match_id
          -- INNER, and unlike the two LEFT JOINs on elo_ratings elsewhere in this codebase
          -- that is right here: match_participants.user_id is a FK to users(id) ON DELETE
          -- CASCADE, so a participant cannot outlive its user. A LEFT could only add a
@@ -1118,18 +1130,22 @@ export async function attachParticipants(
         result: number;
         rating_before: number | null;
         rating_after: number | null;
+        rating_mode: string;
         discord_username: string;
         display_name: string;
         avatar_url: string | null;
     }>();
 
-    const byMatch = new Map<string, unknown[]>();
+    const games = await currentGames(ctx, (parts.results ?? []).map((p) => p.user_id));
+
+    const byMatch = new Map<string, { mode: RatingMode; list: Array<{ user_id: string } & Record<string, unknown>> }>();
     for (const p of parts.results ?? []) {
-        let list = byMatch.get(p.match_id);
-        if (!list) {
-            list = [];
-            byMatch.set(p.match_id, list);
+        let entry = byMatch.get(p.match_id);
+        if (!entry) {
+            entry = { mode: p.rating_mode === 'team' ? 'team' : 'default', list: [] };
+            byMatch.set(p.match_id, entry);
         }
+        const list = entry.list;
         // Same shape the rooms list already uses for a lobby host, so the launcher parses
         // one convention rather than a third one invented here.
         list.push({
@@ -1152,7 +1168,30 @@ export async function attachParticipants(
         });
     }
 
-    for (const m of matches) m.participants = byMatch.get(m.id) ?? [];
+    for (const m of matches) {
+        const entry = byMatch.get(m.id);
+        m.participants = entry ? participantsFor(entry.list, entry.mode, viewerId, games) : [];
+    }
+}
+
+/**
+ * Rated matches each of these players has on each ladder RIGHT NOW — the "current state" the
+ * placement-privacy rule reads (src/elo/placementPrivacy.ts). Through the same helper the engine
+ * reads, so a player with no row is the unplayed default, 0. A database error is NOT swallowed:
+ * guessing "nobody is placing" would publish exactly the numbers this exists to withhold.
+ */
+export async function currentGames(ctx: AppContext, userIds: readonly string[]): Promise<CurrentGames> {
+    const unique = [...new Set(userIds)];
+    const out = new Map<string, { default: number; team: number }>();
+    if (unique.length === 0) return out;
+    const [solo, team] = await Promise.all([
+        effectiveRatings(ctx.db, unique, 'default'),
+        effectiveRatings(ctx.db, unique, 'team'),
+    ]);
+    for (const id of unique) {
+        out.set(id, { default: solo.get(id)?.games_played ?? 0, team: team.get(id)?.games_played ?? 0 });
+    }
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -2066,7 +2105,9 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
         // host in the response. The per-participant RESULT is the load-bearing part
         // and not just the ratings — the guest has no recording of their own, so
         // without it their end-of-match card could only say "no result" even when
-        // they had won.
+        // they had won. Each copy passes through resultParticipantsFor for its
+        // recipient: a player this match did not finish placing keeps his rating to
+        // himself (src/elo/placementPrivacy.ts).
         const participantsPayload = body.participants.map((p) => {
             const d = diff.get(p.user_id);
             return {
@@ -2131,7 +2172,11 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
             // polls of the match history to discover whether they had won. The `ws`
             // library queues the close frame behind data already queued on the same
             // sender, so this arrives first.
-            ctx.rooms.publish(body.lobby_id, {
+            //
+            // One frame PER RECIPIENT: a participant this match did not finish placing reaches
+            // the others without his rating (src/elo/placementPrivacy.ts) — his result and his
+            // progress stay — while he sees his own.
+            const reported = {
                 ...extras.top,
                 type: 'match_reported',
                 match_id: matchId,
@@ -2147,8 +2192,11 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
                         room_teams: sidesFromRoomTeams(parseRoomTeams(teamsAtStart)),
                     }
                     : {}),
-                participants: participantsPayload,
-            });
+            };
+            ctx.rooms.publishPerUser(body.lobby_id, (recipientId) => ({
+                ...reported,
+                participants: resultParticipantsFor(participantsPayload, recipientId),
+            }));
 
             ctx.rooms.close(body.lobby_id, 4007, 'match_reported');
             finalizeRoom(body.lobby_id);
@@ -2170,7 +2218,8 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
                     room_teams: sidesFromRoomTeams(parseRoomTeams(teamsAtStart)),
                 }
                 : {}),
-            rating_changes: participantsPayload,
+            // As the reporting host may see them: the same rule as the room's frame above.
+            rating_changes: resultParticipantsFor(participantsPayload, userId),
         });
     });
 
@@ -2375,11 +2424,16 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
         // no answer, and "we don't know" is not "it did not count" — flattening it would make
         // every old match claim it was unrated.
         const now = new Date();
+        // Whoever is reading, from the token the launcher always sends when signed in. This is a
+        // public route, so it may be nobody — and then a player still being placed shows nobody
+        // his numbers (src/elo/placementPrivacy.ts), the subject of this history included.
+        const viewerId = req.userId ?? null;
+        const subjectGames = await currentGames(ctx, [userId]);
         const matches: Array<Record<string, unknown> & { id: string }> = (rows.results ?? []).map((m) => {
             const {
                 room_teams_json, replay_key, replay_uploaded_at, replay_size_bytes, ...rest
             } = withTournamentRef(m as Record<string, unknown> & { id: string });
-            return {
+            return historyRowFor({
                 ...rest,
                 id: m.id,
                 rated: m.rated == null ? null : Boolean(m.rated),
@@ -2402,9 +2456,9 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
                 // The teams the room froze at Start, as lists of user ids (Team 1 first). The
                 // in-game sides are added below from the participants, for a team match only.
                 room_teams: sidesFromRoomTeams(parseRoomTeams(room_teams_json as string | null)),
-            };
+            }, userId, m.rating_mode === 'team' ? 'team' : 'default', viewerId, subjectGames);
         });
-        await attachParticipants(ctx, matches);
+        await attachParticipants(ctx, matches, viewerId);
 
         // The in-game sides, read from the stored teams, for 4- and 6-player matches. The card
         // that says "didn't count: teams didn't match" names both line-ups.
@@ -2443,9 +2497,13 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
         // authenticated as that player. Everybody else gets the public standing.
         const self = req.userId === userId;
 
+        // A ladder this player is still being PLACED on goes to anybody else without its number —
+        // rating, deviation and volatility, flat and under `ladders` alike — while he gets all of
+        // it (src/elo/placementPrivacy.ts). Omitted rather than null: every launcher reads the
+        // flat pair as plain numbers, and asks only for its own standing.
         const [solo, team] = await Promise.all([
-            standingFor(ctx, userId, 'default', now, { self }),
-            standingFor(ctx, userId, 'team', now, { self }),
+            standingFor(ctx, userId, 'default', now, { self }).then((s) => standingShownTo(s, 'default', self)),
+            standingFor(ctx, userId, 'team', now, { self }).then((s) => standingShownTo(s, 'team', self)),
         ]);
 
         // Decided games of every kind, all time: the pair launchers already shipped read. A result

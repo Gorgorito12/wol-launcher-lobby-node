@@ -8,6 +8,7 @@ import { verifyCrash, normaliseRecordingOutcome, isNtstatusFailure } from '../el
 import { DEFAULT_RATING, DEFAULT_RD } from '../elo/glicko2';
 import { effectiveRatings } from '../elo/ladder';
 import { isInPlacement } from '../elo/placement';
+import { membersFor, publicRatingsFor } from '../elo/placementPrivacy';
 import { ladderRanks } from '../stats/rest';
 import { normalizeBadgeMode } from '../users/badgeMode';
 import { recordIpHash } from '../lib/ipHash';
@@ -196,8 +197,11 @@ interface MemberEntry {
     badgeMode?: string;
     /**
      * Rated matches on each ladder, and whether the member is still being PLACED on it (fewer
-     * than 10 in 1v1 / 5 in teams). The launcher writes a placement rating with a "?" ("1534?").
-     * A snapshot at join, like the rating beside it; absent when the lookup failed.
+     * than 10 in 1v1 / 5 in teams). While he is, that ladder's rating above goes to HIM only —
+     * every frame that carries the roster out of this room passes it through
+     * src/elo/placementPrivacy.ts — and the others see "in placement 3/10"; he sees his own
+     * number with a "?" ("1534?"). A snapshot at join, like the rating beside it; absent when
+     * the lookup failed. The live roster always keeps every rating: the odds need them.
      */
     gamesPlayed?: number;
     gamesPlayedTeam?: number;
@@ -579,7 +583,10 @@ class LobbyRoom {
             type: 'room_state',
             lobby_id: this.lobbyId,
             host_user_id: this.hostUserId,
-            members: this.members,
+            // As THIS recipient may see them: a member still being placed on a ladder reaches
+            // nobody else with that ladder's number (src/elo/placementPrivacy.ts). A copy — the
+            // live roster keeps every rating, since the odds and the next recipient need them.
+            members: membersFor(this.members, userId),
             chat: this.chatRing,
             // The odds as they stand; a launcher older than room teams ignores the key.
             odds: this.currentOdds(),
@@ -589,7 +596,10 @@ class LobbyRoom {
             ...(this.info?.sides ? { teams_locked: true } : {}),
         });
         const m = this.members[userId]!;
-        this.broadcast({
+        // Everybody BUT the member who joined receives this, so a ladder he is still being placed
+        // on goes without its number (src/elo/placementPrivacy.ts). His own room_state above
+        // carried it.
+        this.broadcast(publicRatingsFor(userId, {
             type: 'member_joined',
             user_id: userId,
             discord_username: login,
@@ -607,7 +617,7 @@ class LobbyRoom {
             in_placement_team: m.inPlacementTeam,
             role,
             team,
-        }, ws);
+        }), ws);
         this.broadcastOdds(ws);
     }
 
@@ -1425,6 +1435,20 @@ class LobbyRoom {
         this.broadcast(frame, null);
     }
 
+    /**
+     * Like {@link publish}, but each member gets the frame built FOR HIM. The match report needs
+     * it: a player still being placed must not reach the others with his rating
+     * (src/elo/placementPrivacy.ts), while he still sees his own. One serialisation per socket —
+     * a room holds a handful — and no idle kick: the room is closed right after anyway.
+     */
+    publishPerUser(build: (userId: string) => object): void {
+        for (const [ws, attached] of this.attached) {
+            if (ws.readyState !== 1 /* OPEN */) continue;
+            try { ws.send(JSON.stringify(build(attached.userId))); }
+            catch { this.attached.delete(ws); }
+        }
+    }
+
     private send(ws: WebSocket, frame: object): void {
         try { ws.send(JSON.stringify(frame)); }
         catch { /* socket dying */ }
@@ -1471,6 +1495,11 @@ export class LobbyRoomRegistry {
      */
     publish(lobbyId: string, frame: object): void {
         this.rooms.get(lobbyId)?.publish(frame);
+    }
+
+    /** {@link LobbyRoom.publishPerUser}, if the room is still around. */
+    publishPerUser(lobbyId: string, build: (userId: string) => object): void {
+        this.rooms.get(lobbyId)?.publishPerUser(build);
     }
 
     close(lobbyId: string, code = 4006, reason = 'lobby_closed'): void {

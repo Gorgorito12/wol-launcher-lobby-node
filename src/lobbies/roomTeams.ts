@@ -24,6 +24,7 @@
  * <p>Pure; LobbyRoom does the I/O and the broadcasts.</p>
  */
 import { winProbability } from '../elo/glicko2';
+import { anyPlacing } from '../elo/placementPrivacy';
 
 export type TeamNo = 1 | 2;
 
@@ -134,6 +135,9 @@ export interface OddsPlayer {
     rd?: number;
     ratingTeam?: number;
     rdTeam?: number;
+    /** Still being placed on the 1v1 / team ladder (src/elo/placement.ts); absent when unknown. */
+    inPlacement?: boolean;
+    inPlacementTeam?: boolean;
 }
 
 export interface RoomOdds {
@@ -142,11 +146,22 @@ export interface RoomOdds {
     teams: { '1': number; '2': number } | null;
     /** 1v1 rooms: each player's chance; null until both seats are taken. */
     players: Record<string, number> | null;
+    /**
+     * Why odds that would otherwise exist are not sent: `'placement'` — a player in the room is
+     * still being placed on its ladder, and the odds would give his hidden rating back
+     * (src/elo/placementPrivacy.ts). Absent whenever the odds are simply not computable yet (an
+     * empty seat or team), so a launcher can tell "nothing to show yet" from "not shown on
+     * purpose". A launcher older than the key just sees no odds, as it would for an empty seat.
+     */
+    hidden_reason?: 'placement';
 }
 
 /**
  * The win probability a room shows, from Glicko (src/elo/glicko2.ts, winProbability). A player
  * whose rating is unknown is left out rather than counted as 1500: the odds would be invented.
+ *
+ * <p>Odds that exist are withheld when anybody in the room is still being placed on its ladder:
+ * with two ratings on screen, the percentage solves for the third.</p>
  */
 export function roomOdds(playingSeats: number, players: readonly OddsPlayer[]): RoomOdds {
     if (teamCapacity(playingSeats) > 0) {
@@ -154,6 +169,9 @@ export function roomOdds(playingSeats: number, players: readonly OddsPlayer[]): 
             .filter((p) => p.team === t && p.ratingTeam !== undefined && p.rdTeam !== undefined)
             .map((p) => ({ rating: p.ratingTeam!, rd: p.rdTeam! }));
         const p = winProbability(side(1), side(2));
+        if (p && anyPlacing(players, 'team')) {
+            return { mode: 'team', teams: null, players: null, hidden_reason: 'placement' };
+        }
         return { mode: 'team', teams: p ? { '1': p.a, '2': p.b } : null, players: null };
     }
     const rated = players.filter((p) => p.rating !== undefined && p.rd !== undefined);
@@ -162,6 +180,9 @@ export function roomOdds(playingSeats: number, players: readonly OddsPlayer[]): 
     }
     const [a, b] = rated as [OddsPlayer, OddsPlayer];
     const p = winProbability([{ rating: a.rating!, rd: a.rd! }], [{ rating: b.rating!, rd: b.rd! }]);
+    if (p && anyPlacing(players, 'default')) {
+        return { mode: 'default', teams: null, players: null, hidden_reason: 'placement' };
+    }
     return { mode: 'default', teams: null, players: p ? { [a.id]: p.a, [b.id]: p.b } : null };
 }
 

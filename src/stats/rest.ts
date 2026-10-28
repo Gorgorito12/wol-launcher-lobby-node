@@ -671,31 +671,34 @@ async function ladder(
 /**
  * The players still being PLACED on a ladder (at least one rated match, fewer than required),
  * most matches first, then by name. Never their results — another player sees only the progress.
+ *
+ * <p><b>And never their rating.</b> Everybody listed here is placing, and a placing rating goes to
+ * its owner only (src/elo/placementPrivacy.ts); this payload is one memoised answer for every
+ * reader, so the number goes to nobody and the launcher draws its own row from its own standing.
+ * Omitted, not null: the progress is the whole row now. A launcher older than this reads the
+ * missing number as 0 on other players' rows — which is why the server ships after it.</p>
  */
 async function placementLadder(ctx: AppContext, mode: 'default' | 'team', limit: number) {
     const rows = await ctx.db.prepare(
         `SELECT u.id AS user_id, u.discord_username, u.display_name, u.avatar_url,
-                e.rating, e.rd, e.volatility, e.games_played, e.last_rated_at
+                e.games_played, e.last_rated_at
            FROM player_ratings e
            JOIN users u ON u.id = e.user_id
           WHERE e.mode = ? AND u.is_banned = 0
             AND e.games_played > 0 AND e.games_played < ?`,
     ).bind(...ladderBinds(mode)).all<{
         user_id: string; discord_username: string; display_name: string; avatar_url: string | null;
-        rating: number; rd: number; volatility: number; games_played: number; last_rated_at: string | null;
+        games_played: number; last_rated_at: string | null;
     }>();
     const now = Date.now();
     const required = placementRequired(mode);
     const streaks = await currentStreaks(ctx, (rows.results ?? []).map((r) => r.user_id), mode, now);
     const list = (rows.results ?? []).map((r) => {
-        const lastMs = sqliteTimestampToMs(r.last_rated_at);
         return {
             user_id: r.user_id,
             discord_username: r.discord_username,
             display_name: r.display_name,
             avatar_url: r.avatar_url,
-            rating: r.rating,
-            rd: lastMs === null ? r.rd : decayRd(r.rd, r.volatility, now - lastMs),
             placement_played: r.games_played,
             placement_required: required,
             last_rated_at: r.last_rated_at ? normaliseSqliteTimestamp(r.last_rated_at) : null,
@@ -1001,8 +1004,10 @@ export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
                 };
             });
             // The same helper the history endpoint uses, so "who played" is assembled one way
-            // in this codebase: one query for the whole page, never one per match.
-            await attachParticipants(ctx, recent_matches);
+            // in this codebase: one query for the whole page, never one per match. No viewer:
+            // this payload is shared by every reader for a minute, so a player still being
+            // placed shows his rating changes to nobody here (src/elo/placementPrivacy.ts).
+            await attachParticipants(ctx, recent_matches, null);
 
             // 2v2 against 3v3. Nothing stores a format, so it is derived by counting participants
             // and sides per match - the same shape /matches/history derives player_count from. It

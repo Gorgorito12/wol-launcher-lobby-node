@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { fetch } from 'undici';
 import { Errors } from '../lib/errors';
 import { mintSession } from '../lib/jwt';
+import { sessionResponse } from './session';
 import { uuid } from '../lib/ids';
 import { ipRateLimit, Limits } from '../middleware/rateLimit';
 import type { AppContext } from '../context';
@@ -307,19 +308,13 @@ export function registerDiscordAuth(app: FastifyInstance, ctx: AppContext): void
                        last_seen_at = datetime('now')`,
                 ).bind(userId, '0', username, 'Dev User'),
             ]);
-            const { token, expiresAt } = await mintSession(userId, username, cfg.jwtSigningKey);
-            return reply.send({
-                status: 'ok',
-                token,
-                expires_at: expiresAt,
-                user: {
-                    id: userId,
-                    discord_username: username,
-                    display_name: 'Dev User',
-                    avatar_url: null,
-                },
-                config: serverConfigPayload(cfg),
-            });
+            const minted = await mintSession(userId, username, cfg.jwtSigningKey);
+            return reply.send(sessionResponse(minted, {
+                id: userId,
+                discordUsername: username,
+                displayName: 'Dev User',
+                avatarUrl: null,
+            }, cfg));
         }
 
         const body = (req.body ?? {}) as { poll_handle?: string };
@@ -340,34 +335,17 @@ export function registerDiscordAuth(app: FastifyInstance, ctx: AppContext): void
         // Burn the entry: single-use.
         await ctx.kv.delete(`discord:auth-result:${body.poll_handle}`);
 
-        const { token, expiresAt } = await mintSession(result.userId, result.discordUsername, cfg.jwtSigningKey);
-        return reply.send({
-            status: 'ok',
-            token,
-            expires_at: expiresAt,
-            user: {
-                id: result.userId,
-                discord_username: result.discordUsername,
-                display_name: result.displayName,
-                avatar_url: result.avatarUrl,
-            },
-            config: serverConfigPayload(cfg),
-        });
+        // The sign-in itself: no previous session, so the 90-day window starts now (sat = now).
+        const minted = await mintSession(result.userId, result.discordUsername, cfg.jwtSigningKey);
+        // Built by the same function as a renewal (POST /auth/refresh): the launcher parses both
+        // with one type, so the two bodies must not be able to drift apart.
+        return reply.send(sessionResponse(minted, {
+            id: result.userId,
+            discordUsername: result.discordUsername,
+            displayName: result.displayName,
+            avatarUrl: result.avatarUrl,
+        }, cfg));
     });
-}
-
-function serverConfigPayload(cfg: {
-    maxConcurrentUsers: number;
-    maxActiveGames: number;
-    lobbyMaxPlayers: number;
-    chatMsgsPerMin: number;
-}) {
-    return {
-        max_concurrent_users: cfg.maxConcurrentUsers,
-        max_active_games: cfg.maxActiveGames,
-        lobby_max_players: cfg.lobbyMaxPlayers,
-        chat_msgs_per_min: cfg.chatMsgsPerMin,
-    };
 }
 
 /** Minimal HTML page for the /callback success/error responses. */

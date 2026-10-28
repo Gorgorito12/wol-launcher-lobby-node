@@ -104,6 +104,45 @@ test('the odds: per player in a 1v1, per team in a team room, null until both si
     assert.equal(roomOdds(4, [{ id: 'a', team: 1, ratingTeam: 1500, rdTeam: 100 }]).teams, null);
 });
 
+test('THE ONE THAT MATTERS: no odds while a player is being placed — they would give his rating back', () => {
+    // 1v1: Pedro is 3 matches into placement. With Ana's 1610 on screen, 31 % solves for his 1380.
+    const one = roomOdds(2, [
+        { id: 'ana', rating: 1610, rd: 80, inPlacement: false },
+        { id: 'pedro', rating: 1380, rd: 210, inPlacement: true },
+    ]);
+    assert.equal(one.players, null);
+    assert.equal(one.teams, null);
+    assert.equal(one.hidden_reason, 'placement');
+    assert.ok(!JSON.stringify(one).includes('1380'));
+
+    // Teams: one member placing on the TEAM ladder hides both sides.
+    const teams = roomOdds(4, [
+        { id: 'a', team: 1, ratingTeam: 1500, rdTeam: 100, inPlacementTeam: false },
+        { id: 'b', team: 1, ratingTeam: 1550, rdTeam: 100, inPlacementTeam: true },
+        { id: 'c', team: 2, ratingTeam: 1500, rdTeam: 100, inPlacementTeam: false },
+        { id: 'd', team: 2, ratingTeam: 1500, rdTeam: 100, inPlacementTeam: false },
+    ]);
+    assert.equal(teams.teams, null);
+    assert.equal(teams.hidden_reason, 'placement');
+});
+
+test('the odds are hidden only on purpose: an empty seat is "nothing yet", never "placement"', () => {
+    const waiting = roomOdds(2, [{ id: 'pedro', rating: 1380, rd: 210, inPlacement: true }]);
+    assert.equal(waiting.players, null);
+    assert.equal(waiting.hidden_reason, undefined);
+    const emptyTeam = roomOdds(4, [{ id: 'b', team: 1, ratingTeam: 1550, rdTeam: 100, inPlacementTeam: true }]);
+    assert.equal(emptyTeam.hidden_reason, undefined);
+});
+
+test('placing on the OTHER ladder does not hide a room\'s odds', () => {
+    const one = roomOdds(2, [
+        { id: 'ana', rating: 1610, rd: 80, inPlacement: false, inPlacementTeam: true },
+        { id: 'luis', rating: 1550, rd: 90, inPlacement: false, inPlacementTeam: true },
+    ]);
+    assert.ok(one.players);
+    assert.equal(one.hidden_reason, undefined);
+});
+
 test('the teams frozen at Start, or null when the room did not use them', () => {
     assert.deepEqual(teamsAtStart(4, true, [{ id: 'a', team: 1 }, { id: 'b', team: 2 }]), { a: 1, b: 2 });
     assert.equal(teamsAtStart(2, true, [{ id: 'a', team: 1 }, { id: 'b', team: 2 }]), null);

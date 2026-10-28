@@ -5,6 +5,7 @@ import { isBanned } from '../middleware/auth';
 import { DEFAULT_RATING, DEFAULT_RD } from '../elo/glicko2';
 import { effectiveRatings } from '../elo/ladder';
 import { isInPlacement } from '../elo/placement';
+import { presenceFor } from '../elo/placementPrivacy';
 import type { AppContext } from '../context';
 import { ladderRanks } from '../stats/rest';
 import { badgeModes, type BadgeMode } from '../users/badgeMode';
@@ -663,8 +664,8 @@ export class GlobalChatRoom {
         // modes, keyed apart.
         const ratingTeamByUser = new Map<string, number>();
         const rdTeamByUser = new Map<string, number>();
-        // Rated matches on each ladder, so the launcher can mark a placement rating with a "?"
-        // and tell a never-played 1500 from an earned one.
+        // Rated matches on each ladder, so the launcher can write "in placement 3/10" where a
+        // placing player's number used to be, and tell a never-played 1500 from an earned one.
         const gamesByUser = new Map<string, number>();
         const gamesTeamByUser = new Map<string, number>();
         try {
@@ -726,7 +727,10 @@ export class GlobalChatRoom {
             inPlacement?: boolean; inPlacementTeam?: boolean;
         }[] = [];
         for (const a of this.attached.values()) {
-            out.push({
+            // A player still being PLACED is listed without that ladder's number: presence is ONE
+            // payload for everybody, so it goes to nobody, and his own launcher takes it from his
+            // standing (src/elo/placementPrivacy.ts). The progress beside it stays.
+            out.push(presenceFor({
                 userId: a.userId,
                 login: a.login,
                 avatarUrl: a.avatarUrl,
@@ -746,7 +750,7 @@ export class GlobalChatRoom {
                     ? isInPlacement(gamesByUser.get(a.userId) ?? 0, 'default') : undefined,
                 inPlacementTeam: ratingsKnown
                     ? isInPlacement(gamesTeamByUser.get(a.userId) ?? 0, 'team') : undefined,
-            });
+            }));
         }
         return out;
     }

@@ -5,7 +5,8 @@
  * in 1v1, five in teams, against anyone, counting the ones already played before this rule
  * existed — place him. Until then he is NOT ranked: he has no position and no badge, and the
  * ladder lists him at the end of the same table with his progress. The rating still moves from
- * his very first match; placement is about where he is SHOWN, not about how he is rated.</p>
+ * his very first match; placement is about where he is SHOWN, not about how he is rated — and
+ * WHO sees it: until placement ends that number goes to him only (src/elo/placementPrivacy.ts).</p>
  *
  * <p><b>Inactivity.</b> Thirty days without a rated match on a ladder marks a player inactive on
  * it. He KEEPS his place: the flag is a label, not a sanction, and it goes with his next rated

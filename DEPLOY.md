@@ -87,6 +87,43 @@ curl http://127.0.0.1:8080/health
 > Back `.env` up before editing it (`sudo cp .env .env.bak.$(date +%F)`): `sed -i` and `nano`
 > keep no copy, and a key that is lost cannot be recovered from anywhere else.
 
+### Sessions renew themselves (`POST /auth/refresh`)
+
+A session token still lasts **7 days** (`SESSION_TTL_SECONDS`, `src/lib/jwt.ts`). Until this route,
+nothing renewed it, so every player who stayed signed in was signed out 7 days after his last Discord
+sign-in — usually noticed at the next reconnect, and a deploy reconnects everybody at once, which
+looked like a mass logout. Now the launcher trades a token with **under three days left** for a fresh
+one (`src/auth/session.ts`):
+
+- `POST /auth/refresh` with `Authorization: Bearer <token>` and no body answers **200** with the same
+  body as a completed sign-in (`token`, `expires_at`, `user`, `config`). The new token carries the
+  player's current Discord name and the time of his ORIGINAL sign-in (claim `sat`).
+- **401** for no token / expired / another key / garbage (a dead token is never revived), **403
+  `user_banned`** for a banned account.
+- **403 `session_too_old`** once the Discord sign-in is **90 days** old (`SESSION_MAX_AGE_SECONDS`). Not
+  a 401 on purpose: the launcher signs out on a 401, and the token it holds still runs out its 7 days
+  — so a session lasts at most ~97 days, then the player signs in with Discord again. A token minted
+  before this existed has no `sat` and counts from its `iat`.
+- Rate limit `refresh-u`: 6 a minute, 60 a day per user. The launcher asks at most every 30 minutes
+  while a renewal is due, so honest use is one request every few days.
+- Launchers without the renewal client keep signing in every 7 days; nothing breaks for them.
+- **Nothing to configure.** Deploy is the usual update. Check it after the restart:
+
+```bash
+curl -s -X POST https://wol-lobby.duckdns.org/auth/refresh                 # -> 401 unauthorized
+curl -s -X POST https://wol-lobby.duckdns.org/auth/refresh      -H "Authorization: Bearer <a token from launcher-config.json>"        # -> 200 with a new token
+```
+
+**Why a session ended, from the journal.** A route that needs a user and answers 401 to a request that
+SENT a token logs `session token refused` with the reason: `expired` (the lifetime ran out),
+`bad_signature` on a token whose `exp` is still ahead (the signing key changed — see above),
+`malformed` or `bad_payload` (not a token at all). The client still gets the same `unauthorized` for
+every cause. The WebSocket hellos (`/global/ws`, the room socket) do not log their refusals yet.
+
+```bash
+journalctl -u wol-lobby --since "2 days ago" | grep -E "session token refused|session renewed|session renewal refused"
+```
+
 ## nginx + Let's Encrypt
 
 ```bash
@@ -278,6 +315,17 @@ that never resets. The rules, and where each one lives:
 - **Placement** (`src/elo/placement.ts`): 10 rated matches in 1v1, 5 in teams, against anyone,
   counting the ones already played. Until then a player is listed at the end of the table with
   his progress, with no position and no badge.
+- **A rating still being placed goes to its owner only** (`src/elo/placementPrivacy.ts`): every
+  payload that carries another player's number withholds it while he is placing on that ladder —
+  the rooms list's host, presence, `room_state` (built per recipient), `member_joined`, the
+  placement rows of `/stats/community`, `/matches/elo/:id` for anybody but him, the participants
+  of the history / `GET /matches` / `recent_matches`, and `match_reported` + the host's response
+  (one frame per recipient). The progress stays public. A room with anybody placing on its ladder
+  sends no odds (`hidden_reason: 'placement'`). Decided by the CURRENT state, so finishing
+  placement shows his old matches too. Keys are OMITTED, never null, where launchers read plain
+  numbers. **Deploy the server only after the launcher release that handles it**: an older
+  launcher draws "0?" on other players' placement rows and shows no number elsewhere. Frame-level
+  check: `npx tsx scripts/test-placement-privacy.ts`.
 - **Teams, team against team**: each player is rated with his team's mean rating against the
   other team's mean and combined deviation (root mean square); his own deviation decides how far
   he moves.

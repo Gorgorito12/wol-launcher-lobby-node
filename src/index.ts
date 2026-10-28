@@ -17,6 +17,7 @@ import { readAuth, requireAuth, safeRead } from './middleware/auth';
 import { circuitBreaker, readGlobalCount } from './middleware/circuitBreaker';
 import { ipRateLimit, Limits } from './middleware/rateLimit';
 import { registerDiscordAuth } from './auth/discord';
+import { registerSessionRefresh } from './auth/session';
 import { registerLobbiesRest } from './lobbies/rest';
 import { configure as configureDiscordAnnounce } from './lobbies/discordAnnounce';
 import { scheduleOrphanLobbySweep } from './lobbies/orphanSweep';
@@ -188,6 +189,8 @@ async function main(): Promise<void> {
     app.addHook('preHandler', circuitBreaker(ctx));
 
     registerDiscordAuth(app, ctx);
+    // POST /auth/refresh — renews the 7-day session token (src/auth/session.ts).
+    registerSessionRefresh(app, ctx);
     registerLobbiesRest(app, ctx);
     registerMatchesRest(app, ctx);
     registerMatchesBrowse(app, ctx);

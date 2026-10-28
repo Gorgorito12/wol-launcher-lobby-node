@@ -240,7 +240,9 @@ export function registerMatchesBrowse(app: FastifyInstance, ctx: AppContext): vo
                 }, now),
             };
         });
-        await attachParticipants(ctx, items);
+        // Whoever is reading (this route is public, so possibly nobody): a player still being
+        // placed shows his rating changes to himself only (src/elo/placementPrivacy.ts).
+        await attachParticipants(ctx, items, req.userId ?? null);
 
         const last = shown[shown.length - 1];
         const next_cursor = more && last

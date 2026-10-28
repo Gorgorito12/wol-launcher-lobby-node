@@ -139,6 +139,10 @@ export const Limits = {
     AuthDeviceIp:     { scope: 'authd',     keyKind: 'ip',   perMinute: 5,   perDay: 30   } as const,
     AuthPollIp:       { scope: 'authp',     keyKind: 'ip',   perMinute: 60,  perDay: 500  } as const,
     AuthIp:           { scope: 'auth',      keyKind: 'ip',   perMinute: 60,  perDay: 500  } as const,
+    // Renewing a session token (POST /auth/refresh). By USER, like every other write here: two
+    // players behind one Radmin NAT each renew their own. The launcher asks at most every 30
+    // minutes while a renewal is due, so honest use is a request every few days.
+    SessionRefreshUser: { scope: 'refresh-u', keyKind: 'user', perMinute: 6, perDay: 60 } as const,
     LobbyCreateIp:    { scope: 'lcreate',   keyKind: 'ip',   perMinute: 20,  perDay: 200  } as const,
     LobbyJoinIp:      { scope: 'ljoin',     keyKind: 'ip',   perMinute: 20,  perDay: 200  } as const,
     LobbyListIp:      { scope: 'llist',     keyKind: 'ip',   perMinute: 120, perDay: 15000 } as const,

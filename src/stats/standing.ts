@@ -8,7 +8,10 @@
  *
  * <p><b>`placement_results` is the player's own business.</b> The ladder shows OTHER players'
  * placement progress in grey with no wins or losses, and the server never sends another player's
- * results: the caller passes `self` only when the request is authenticated as that player.</p>
+ * results: the caller passes `self` only when the request is authenticated as that player. So is
+ * the RATING while he is being placed: this module still computes it, and the route passes the
+ * standing through src/elo/placementPrivacy.ts (`standingShownTo`), which withholds the number
+ * from anybody else until placement ends.</p>
  */
 import type { AppContext } from '../context';
 import { WIN_AT, LOSS_AT } from '../elo/ratability';

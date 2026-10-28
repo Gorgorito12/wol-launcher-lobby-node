@@ -71,6 +71,15 @@ export const Errors = {
         details,
     ),
     UserBanned:      () => new HttpError(403, 'user_banned',    'This account is banned from multiplayer.'),
+    // A renewal refused because the Discord sign-in is too old (src/lib/jwt.ts,
+    // SESSION_MAX_AGE_SECONDS). 403 and not 401 ON PURPOSE: a launcher signs out on a 401, and
+    // the token it holds is still valid — it should be allowed to run out its days, after which
+    // the ordinary 401 signs the player out. Launchers only log this; nobody reads the sentence.
+    SessionTooOld:   () => new HttpError(
+        403,
+        'session_too_old',
+        'This session can no longer be renewed — sign in with Discord again.',
+    ),
     // BOTH LANGUAGES, and this is the one error where that is not decoration.
     //
     // Everything else here is localised by the launcher from the CODE, so the sentence is a

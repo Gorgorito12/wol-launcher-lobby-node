@@ -1,6 +1,6 @@
 import type { FastifyReply, FastifyRequest, preHandlerHookHandler } from 'fastify';
 import { Errors } from '../lib/errors';
-import { verifyJwt } from '../lib/jwt';
+import { inspectJwt, sessionSignedInAt, type JwtRefusal } from '../lib/jwt';
 import { meetsMinimum } from '../lib/launcherVersion';
 import type { AppContext } from '../context';
 
@@ -10,6 +10,14 @@ declare module 'fastify' {
         userId?: string;
         discordUsername?: string;
         authenticated?: boolean;
+        /** When this session's Discord sign-in happened (Unix s) — see <c>sessionSignedInAt</c>. */
+        sessionSignedInAt?: number;
+        /**
+         * Set by <c>readAuth</c> when a Bearer token was SENT and refused. Logged only where a route
+         * that needs a user answers 401 (<c>refuseUnauthenticated</c>), never in <c>readAuth</c>: a
+         * launcher with a dead token polls public routes every few seconds.
+         */
+        authFailure?: { reason: JwtRefusal; sub?: string; exp?: number };
         /** Set by <c>readAuth</c> when the authenticated user is banned. */
         banned?: boolean;
         /** The launcher build that sent this request, from X-Launcher-Version. */
@@ -91,15 +99,42 @@ export function readAuth(ctx: AppContext): preHandlerHookHandler {
         const m = /^Bearer\s+(.+)$/i.exec(auth.trim());
         if (!m) return;
 
-        const payload = await verifyJwt(m[1]!, cfg.jwtSigningKey);
-        if (payload) {
+        const inspection = await inspectJwt(m[1]!, cfg.jwtSigningKey);
+        if (inspection.ok) {
+            const payload = inspection.payload;
             req.userId = payload.sub;
             req.discordUsername = payload.du;
             req.authenticated = true;
+            req.sessionSignedInAt = sessionSignedInAt(payload);
             req.banned = await isBanned(ctx, payload.sub);
             rememberLauncherVersion(ctx, payload.sub, req.launcherVersion ?? '');
+        } else {
+            // Still anonymous, exactly as before — public routes answer as they always did. The
+            // reason is kept for the one place it is worth a log line.
+            req.authFailure = { reason: inspection.reason, sub: inspection.sub, exp: inspection.exp };
         }
     };
+}
+
+/**
+ * Answer 401 to a request that needed a user — and, when it SENT a token, say in the server's log why
+ * that token was refused. The client still gets the same <c>unauthorized</c> for every cause, which
+ * keeps token probing blind; what changes is that an operator reading the journal can tell a lifetime
+ * that ran out (<c>expired</c>) from a signing key that changed (<c>bad_signature</c> on a token whose
+ * <c>exp</c> is still ahead) from a client sending garbage (<c>malformed</c>). Before this, every one of
+ * them was the same generic 401 in the request log.
+ */
+function refuseUnauthenticated(req: FastifyRequest): never {
+    const failure = req.authFailure;
+    if (failure) {
+        req.log.info({
+            reason: failure.reason,
+            sub: failure.sub,
+            exp: typeof failure.exp === 'number' ? new Date(failure.exp * 1000).toISOString() : undefined,
+            url: req.url,
+        }, 'session token refused');
+    }
+    throw Errors.Unauthorized();
 }
 
 /**
@@ -132,7 +167,7 @@ export async function isBanned(ctx: AppContext, userId: string): Promise<boolean
 /** Reject the request when no valid session was parsed by <c>readAuth</c>. */
 export function requireAuth(): preHandlerHookHandler {
     return async (req: FastifyRequest, _reply: FastifyReply): Promise<void> => {
-        if (!req.authenticated) throw Errors.Unauthorized();
+        if (!req.authenticated) refuseUnauthenticated(req);
         if (req.banned) throw Errors.UserBanned();
     };
 }
@@ -162,7 +197,7 @@ export function requireAuth(): preHandlerHookHandler {
  */
 export function requireTournamentOwner(ctx: AppContext): preHandlerHookHandler {
     return async (req: FastifyRequest, _reply: FastifyReply): Promise<void> => {
-        if (!req.authenticated) throw Errors.Unauthorized();
+        if (!req.authenticated) refuseUnauthenticated(req);
         if (req.banned) throw Errors.UserBanned();
 
         const id = (req.params as { id?: string }).id ?? '';
@@ -202,7 +237,7 @@ export function requireTournamentOwner(ctx: AppContext): preHandlerHookHandler {
  */
 export function requireTournamentManager(ctx: AppContext): preHandlerHookHandler {
     return async (req: FastifyRequest, _reply: FastifyReply): Promise<void> => {
-        if (!req.authenticated) throw Errors.Unauthorized();
+        if (!req.authenticated) refuseUnauthenticated(req);
         if (req.banned) throw Errors.UserBanned();
 
         const id = (req.params as { id?: string }).id ?? '';
