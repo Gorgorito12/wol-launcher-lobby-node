@@ -135,7 +135,13 @@ export function userRateLimit(ctx: AppContext, rule: RateLimitRule): preHandlerH
  * for end users. If you tune one, tune it here, not at the call site.
  */
 export const Limits = {
-    CatchAllIp:       { scope: 'all',       keyKind: 'ip',   perMinute: 120, perDay: 15000 } as const,
+    // The daily caps on the two below used to be 15 000, which is LESS than one launcher makes
+    // on its own: the Rooms tab polls /lobbies every 5 s (17 280 a day), plus the WebSocket and
+    // the stats. A player who left the launcher in the tray ran out in about 18 hours, and from
+    // then on every route — the lobby WebSocket included — answered 429 until 00:00 UTC. The
+    // per-minute caps are what stop a script; the daily one only has to clear a few machines
+    // behind one Radmin NAT / CGNAT running all day.
+    CatchAllIp:       { scope: 'all',       keyKind: 'ip',   perMinute: 120, perDay: 100000 } as const,
     AuthDeviceIp:     { scope: 'authd',     keyKind: 'ip',   perMinute: 5,   perDay: 30   } as const,
     AuthPollIp:       { scope: 'authp',     keyKind: 'ip',   perMinute: 60,  perDay: 500  } as const,
     AuthIp:           { scope: 'auth',      keyKind: 'ip',   perMinute: 60,  perDay: 500  } as const,
@@ -145,7 +151,7 @@ export const Limits = {
     SessionRefreshUser: { scope: 'refresh-u', keyKind: 'user', perMinute: 6, perDay: 60 } as const,
     LobbyCreateIp:    { scope: 'lcreate',   keyKind: 'ip',   perMinute: 20,  perDay: 200  } as const,
     LobbyJoinIp:      { scope: 'ljoin',     keyKind: 'ip',   perMinute: 20,  perDay: 200  } as const,
-    LobbyListIp:      { scope: 'llist',     keyKind: 'ip',   perMinute: 120, perDay: 15000 } as const,
+    LobbyListIp:      { scope: 'llist',     keyKind: 'ip',   perMinute: 120, perDay: 100000 } as const,
     ChatIp:           { scope: 'chat',      keyKind: 'ip',   perMinute: 30,  perDay: 500  } as const,
     StatsIp:          { scope: 'stats',     keyKind: 'ip',   perMinute: 20,  perDay: 500  } as const,
     // Public community stats (leaderboard + activity). Its OWN scope rather than a
