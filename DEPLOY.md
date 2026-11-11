@@ -1252,3 +1252,77 @@ SELECT t.id, t.name FROM tournaments t
                   AND (SELECT COUNT(*) FROM tournament_entrant_members m WHERE m.entrant_id = e.id)
                       <> CAST(substr(t.format, 1, 1) AS INTEGER));"
 ```
+
+## Ended tournaments: who sees them, deleting, faces and badges (2026-11-11)
+
+What changed (the code says why at each site; `src/tournaments/lifecycle.ts` holds the table):
+
+| Tournament                                | Who sees it            | Afterwards                          |
+|-------------------------------------------|------------------------|-------------------------------------|
+| Draft                                     | its owner              | untouched 7 days: **deleted**       |
+| Cancelled / abandoned, no game played     | its owner, 7 days      | **deleted**                         |
+| Cancelled / abandoned, games played       | everybody, 7 days      | off the list, kept in the database  |
+| Finished                                  | everybody, 30 days     | only who played, organised or helped |
+
+- **A tournament with a game played is never deleted** — not by its owner, not by the sweep.
+- **`POST /tournaments/:id/delete`** (owner only): a draft, cancelled or abandoned tournament
+  with no game. A live one has to be cancelled first.
+- **`GET /tournaments` carries `mine`** (signed in): the caller's own cancelled ones without
+  games, and old finished ones they took part in. Its presence is how a launcher knows this
+  server can delete. List rows and the detail carry `has_games`.
+- **The startup sweep deletes what is due** before it archives the stale live ones, so a
+  forgotten draft no longer becomes a public 'abandoned' row.
+- **The detail carries each player's `avatar_url`** (entrants, co-organisers, `owner_avatar_url`)
+  and their place on the tournament's ladder (`ladder_rank` for a 1v1, `ladder_rank_team` for a
+  2v2/3v3; nothing for a player still being placed).
+- **`lobbies_changed`** goes out on `/global/ws`, batched per second, whenever a room is created
+  (private ones too, with no data), closed, started, renamed, or gains or loses a player. An open
+  Rooms page asks `/lobbies` at once. **Every such change also drops the 3-s memo of `/lobbies`**
+  (`onLobbiesChanged`): without that the woken launchers read the answer from before the change.
+  Measured with two launchers against a local server: a quick match that met in 21 s now meets in
+  about 2.
+
+All additive: an older launcher ignores every new field and frame.
+
+**To remove the test tournaments now** (dry run first; `--force` only for one with games, whose
+games keep their ratings):
+
+```bash
+npm run admin -- tournament:list --all
+npm run admin -- tournament:delete <id>          # shows what it would do
+npm run admin -- tournament:delete <id> --apply
+```
+
+After a restart the sweep removes, on its own, every draft older than a week and every cancelled
+or abandoned tournament without games whose week is over.
+
+### Room announcements: Wars of Liberty only
+
+No code: each webhook's mod filter already exists (see "Each webhook in `DISCORD_WEBHOOK_URL`"
+above). In the VM's `.env`, one entry per webhook, in the same order:
+
+```bash
+DISCORD_WEBHOOK_MOD_IDS=wol          # one webhook
+DISCORD_WEBHOOK_MOD_IDS=wol,wol      # two webhooks
+sudo systemctl restart wol-lobby
+journalctl -u wol-lobby -n 50 | grep -i "webhook"   # startup says which mods each one announces
+```
+
+### Monthly highlights: a card, in English by default
+
+The monthly post is now ONE Discord card (embed) instead of plain text: gold bar, the month and
+its count, the biggest climber's picture, three podiums in a row (biggest climb, most matches,
+best streak), then most wins, best win rate and civilization of the month, and the biggest upset
+when there was one. A category with nobody is left out; a month with no rated match posts
+nothing, as before. Names are trimmed and their markdown escaped; there are still no mentions.
+
+`DISCORD_HIGHLIGHTS_LANG` now defaults to **`en`** (`es` and `both` still work; `both` is two
+cards in one message). See the card before it goes out:
+
+```bash
+npm run admin -- highlights:show 2026-10      # the numbers, the old text, and the card's JSON
+npm run admin -- highlights:post 2026-10      # dry run: prints the exact JSON it would post
+```
+
+Paste that JSON into any Discord embed viewer to see it. `--apply` posts; nothing is posted by
+the dry run.

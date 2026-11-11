@@ -20,7 +20,7 @@ import { fetch } from 'undici';
 import type { FastifyBaseLogger } from 'fastify';
 import type { AppContext } from '../context';
 import { sqliteTimestampToMs } from '../lib/time';
-import { highlightsFor, monthBounds, monthOf, previousMonth, renderDiscord } from './highlights';
+import { highlightsFor, monthBounds, monthOf, previousMonth, renderDiscordEmbed, type DiscordEmbed } from './highlights';
 
 const EPOCH_MIGRATION = '0029_monthly_highlights.sql';
 const LOCK_TTL_SECONDS = 10 * 60;
@@ -76,6 +76,20 @@ export async function maybePostMonthlyHighlights(
     }
 }
 
+/** The cards for the configured language: one, or two for 'both' (Spanish first). Pure. */
+export function highlightsEmbeds(
+    h: Parameters<typeof renderDiscordEmbed>[0],
+    lang: string,
+): DiscordEmbed[] {
+    const langs: Array<'es' | 'en'> = lang === 'both' ? ['es', 'en'] : [lang === 'es' ? 'es' : 'en'];
+    return langs.map((l) => renderDiscordEmbed(h, l)).filter((e): e is DiscordEmbed => e !== null);
+}
+
+/** The webhook body: the cards, and never a mention. */
+export function highlightsMessage(embeds: DiscordEmbed[]): { embeds: DiscordEmbed[]; allowed_mentions: { parse: [] } } {
+    return { embeds, allowed_mentions: { parse: [] } };
+}
+
 /**
  * Post one month's highlights to every highlights webhook, now, and mark the month posted. Shared
  * by the lazy trigger above and by `admin.ts highlights:post`. Returns whether the month is now
@@ -89,10 +103,8 @@ export async function postHighlights(
 ): Promise<boolean> {
     const urls = ctx.config.discordHighlightsWebhookUrls;
     const h = await highlightsFor(ctx, month, nowMs);
-    const langs: Array<'es' | 'en'> = ctx.config.discordHighlightsLang === 'both'
-        ? ['es', 'en'] : [ctx.config.discordHighlightsLang === 'en' ? 'en' : 'es'];
-    const text = langs.map((l) => renderDiscord(h, l)).filter((t): t is string => !!t).join('\n\n');
-    if (!text) {
+    const embeds = highlightsEmbeds(h, ctx.config.discordHighlightsLang);
+    if (embeds.length === 0) {
         // Nothing was played: nothing to say, and nothing to retry.
         await ctx.kv.put(`highlights:posted:${month}`, 'empty');
         return true;
@@ -103,8 +115,9 @@ export async function postHighlights(
             const resp = await fetch(url, {
                 method: 'POST',
                 headers: { 'content-type': 'application/json' },
-                // No pings, ever: the names come from players' own display names.
-                body: JSON.stringify({ content: text, allowed_mentions: { parse: [] } }),
+                // No pings, ever: the names come from players' own display names. A card per
+                // language ('both' is two cards in one message).
+                body: JSON.stringify(highlightsMessage(embeds)),
             });
             if (resp.ok) ok += 1;
             else log?.warn({ status: resp.status, month }, 'monthly highlights post failed');

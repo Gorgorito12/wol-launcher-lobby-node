@@ -10,6 +10,7 @@ import type { AppContext } from '../context';
 import { ladderRanks } from '../stats/rest';
 import { badgeModes, type BadgeMode } from '../users/badgeMode';
 import { MatchesChangedBatcher } from './matchesChanged';
+import { forgetLobbyLists, LobbiesChangedBatcher, setLobbiesChangedSink } from './lobbiesChanged';
 
 /**
  * Process-wide GLOBAL chat room — a single instance for the whole
@@ -34,7 +35,7 @@ import { MatchesChangedBatcher } from './matchesChanged';
  *   client → server : hello {token}, chat {body}, invite {target_user_id, lobby_id}, ping
  *   server → client, to everybody:
  *                     chat {line}, presence {online, onlineUsers}, lobby_created {lobby},
- *                     matches_changed {matchIds, userIds}
+ *                     matches_changed {matchIds, userIds}, lobbies_changed {}
  *   server → client, to the user concerned:
  *                     global_state {history, online, onlineUsers}, invite {from, lobbyId,
  *                     roomName, modId}, invite_sent {login}, match_rated {...},
@@ -272,6 +273,19 @@ export class GlobalChatRoom {
 
     /** Collects `matches_changed` notes for a second and sends them as one frame. */
     private readonly matchesChanged = new MatchesChangedBatcher((frame) => this.broadcast(frame, null));
+
+    /**
+     * `lobbies_changed`, batched per second: the rooms code calls `noteLobbiesChanged()` on every
+     * change a room list shows, and this room is the sink it lands in.
+     */
+    private readonly lobbiesChanged = new LobbiesChangedBatcher((frame) => {
+        forgetLobbyLists();
+        this.broadcast(frame, null);
+    });
+
+    constructor() {
+        setLobbiesChangedSink(() => this.lobbiesChanged.note());
+    }
 
     /**
      * Tell EVERY launcher that a match was stored or its result or rating changed, so the pages

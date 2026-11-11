@@ -30,6 +30,7 @@
 import { Errors } from '../lib/errors';
 import { shortId, sha256Hex } from '../lib/ids';
 import { announceLobbyCreated, finalizeRoom } from './discordAnnounce';
+import { noteLobbiesChanged } from '../global/lobbiesChanged';
 import { isRankedMod } from '../elo/ratability';
 import type { AppContext } from '../context';
 
@@ -237,6 +238,9 @@ export async function createLobby(
     // and to Discord (only if a webhook is configured). BOTH skip private rooms, and both
     // skip rooms created with `announce: false`. Best-effort: the Discord one is never
     // awaited so it can't add latency, and each swallows its own errors internally.
+    // The launchers' room lists, private rooms included (the frame carries nothing).
+    noteLobbiesChanged();
+
     if (isPrivate === 0 && input.announce !== false) {
         const host = await ctx.db.prepare(
             `SELECT display_name, discord_username, avatar_url FROM users WHERE id = ?`,
