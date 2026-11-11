@@ -2,7 +2,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { computeHighlights, forCommunity, HIGHLIGHT_LEADERS, monthBounds, monthOf, previousMonth, renderDiscord, type HighlightRow } from './highlights';
-import { dueMonth } from './highlightsAnnounce';
+import { dueMonth, highlightsEmbeds, highlightsMessage } from './highlightsAnnounce';
+import { embedName, HIGHLIGHTS_EMBED_COLOR, renderDiscordEmbed } from './highlights';
 
 const H = 60 * 60 * 1000;
 const D = 24 * H;
@@ -254,4 +255,76 @@ test('the community payload carries no top lists', () => {
     assert.equal('leaders' in pair.previous, false);
     assert.equal(pair.current.most_wins?.user_id, 'ana', 'the singular fields stay');
     assert.equal(forCommunity(null), null);
+});
+
+// ---------------------------------------------------------------- the Discord card (2026-11-11)
+
+/** A full month: Ana climbs (with a picture), Bea has the longest run, a civ and an upset exist. */
+function fullMonth() {
+    const b = monthBounds('2026-10');
+    const at = (day: number) => monthBounds('2026-10').startMs + day * D;
+    const rows: HighlightRow[] = [];
+    for (let i = 0; i < 12; i++) {
+        rows.push({ ...crow('ana', i + 1, 1, { before: 1600 + i * 15, civ: 'British', match: `a${i}` }),
+            atMs: at(i + 1), avatar_url: 'https://cdn.example/ana.png' });
+        rows.push({ ...crow('bea', i + 1, 0, { before: 1700, civ: 'British', match: `a${i}` }), atMs: at(i + 1) });
+    }
+    return computeHighlights(rows, b, b.endMs + 1);
+}
+
+test('THE ONE THAT MATTERS: the card, in English, with every category and no mention', () => {
+    const h = fullMonth();
+    const card = renderDiscordEmbed(h, 'en')!;
+    assert.equal(card.title, '🏆 October highlights');
+    assert.equal(card.description, '12 rated matches this month');
+    assert.equal(card.color, HIGHLIGHTS_EMBED_COLOR);
+    assert.equal(card.thumbnail?.url, 'https://cdn.example/ana.png');
+    const names = card.fields.map((f) => f.name);
+    assert.deepEqual(names.slice(0, 3), ['📈 Biggest climb', '⚔️ Most matches', '🔥 Best streak']);
+    assert.ok(card.fields.slice(0, 3).every((f) => f.inline));
+    assert.ok(card.fields[0]!.value.startsWith('🥇 Ana +'));
+    assert.ok(names.includes('🏰 Civilization of the month'));
+    const upset = card.fields.find((f) => f.name === '⚡ Biggest upset')!;
+    assert.equal(upset.inline, false);
+    assert.match(upset.value, /^Ana beat Bea from \d+ ELO below · 1v1$/);
+    assert.equal(card.footer.text, 'AoE3 Mod Launcher · Ranking tab');
+
+    const body = highlightsMessage(highlightsEmbeds(h, 'en'));
+    assert.deepEqual(body.allowed_mentions, { parse: [] });
+    assert.equal(body.embeds.length, 1);
+    assert.equal('content' in body, false, 'the card, not the old plain text');
+});
+
+test('a podium shows the players there are, and an empty category is left out', () => {
+    const b = monthBounds('2026-09');
+    const rows: HighlightRow[] = [];
+    for (let i = 0; i < 5; i++) rows.push(row('ana', 'default', i + 1, 1, 1600 + i * 10, 1610 + i * 10, 20 + i));
+    const card = renderDiscordEmbed(computeHighlights(rows, b, b.endMs + 1), 'en')!;
+    const climb = card.fields.find((f) => f.name === '📈 Biggest climb')!;
+    // A 1v1 entry carries no ladder tag, and the number never leaves the name (no-break space).
+    assert.equal(climb.value, '🥇 Ana\u00a0+50');
+    assert.equal(card.fields.some((f) => f.name === '⚡ Biggest upset'), false);
+    assert.equal(card.fields.some((f) => f.name === '🎯 Best win rate'), false, '5 matches is under the 10 the rate needs');
+    assert.equal(card.thumbnail, undefined, 'no picture, no thumbnail');
+});
+
+test('an empty month posts no card; both languages are two cards, Spanish first', () => {
+    const b = monthBounds('2026-09');
+    const empty = computeHighlights([], b, b.endMs + 1);
+    assert.equal(renderDiscordEmbed(empty, 'en'), null);
+    assert.deepEqual(highlightsEmbeds(empty, 'both'), []);
+    const both = highlightsEmbeds(fullMonth(), 'both');
+    assert.equal(both.length, 2);
+    assert.equal(both[0]!.title, '🏆 Destacados de octubre');
+    assert.equal(both[1]!.title, '🏆 October highlights');
+});
+
+test('a name cannot format the card or break its limits', () => {
+    // String.raw: what Discord receives is a backslash before each mark.
+    assert.equal(embedName('_cool_*guy*'), String.raw`\_cool\_\*guy\*`);
+    assert.equal(embedName(String.raw`a\b`), String.raw`a\\b`);
+    const long = embedName('x'.repeat(80));
+    assert.equal(long.length, 32);
+    assert.ok(long.endsWith('…'));
+    for (const f of renderDiscordEmbed(fullMonth(), 'es')!.fields) assert.ok(f.value.length <= 1024);
 });

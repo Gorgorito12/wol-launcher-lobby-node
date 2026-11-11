@@ -16,6 +16,7 @@ import { recordIpHash, requestIpHash } from '../lib/ipHash';
 import { ladderRanks } from '../stats/rest';
 import { normalizeBadgeMode } from '../users/badgeMode';
 import type { AppContext } from '../context';
+import { onLobbiesChanged } from '../global/lobbiesChanged';
 
 /**
  * The "one active lobby" guard: is this player a member of some OTHER room that is still
@@ -128,6 +129,16 @@ export const LOBBY_LIST_SQL =
 const LOBBY_LIST_TTL_MS = 3_000;
 let lobbyListCache: { at: number; payload: unknown } | null = null;
 let lobbyListInFlight: Promise<unknown> | null = null;
+/**
+ * Bumped whenever a room changes (lobbies_changed). A build started before the change is neither
+ * cached nor handed to a request that arrived after it: that answer may not hold the new room.
+ */
+let lobbyListGeneration = 0;
+let lobbyListInFlightGeneration = -1;
+onLobbiesChanged(() => {
+    lobbyListCache = null;
+    lobbyListGeneration++;
+});
 
 /** The public room list, exactly as GET /lobbies has always answered it. */
 async function buildLobbyList(ctx: AppContext): Promise<unknown> {
@@ -292,13 +303,16 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
 
         // Somebody else is already building the list: wait for theirs instead of running the
         // same five queries again on the one synchronous thread.
-        if (!lobbyListInFlight) {
-            lobbyListInFlight = buildLobbyList(ctx)
+        if (!lobbyListInFlight || lobbyListInFlightGeneration !== lobbyListGeneration) {
+            const generation = lobbyListGeneration;
+            const build: Promise<unknown> = buildLobbyList(ctx)
                 .then((payload) => {
-                    lobbyListCache = { at: Date.now(), payload };
+                    if (generation === lobbyListGeneration) lobbyListCache = { at: Date.now(), payload };
                     return payload;
                 })
-                .finally(() => { lobbyListInFlight = null; });
+                .finally(() => { if (lobbyListInFlight === build) lobbyListInFlight = null; });
+            lobbyListInFlight = build;
+            lobbyListInFlightGeneration = generation;
         }
         const payload = await lobbyListInFlight;
         reply.header('Cache-Control', 'public, max-age=5');

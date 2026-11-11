@@ -55,7 +55,7 @@ import { KvStore } from '../src/kv';
 import type { AppContext } from '../src/context';
 import { standingFor } from '../src/stats/standing';
 import { highlightsFor, monthOf, previousMonth, renderDiscord } from '../src/stats/highlights';
-import { postHighlights } from '../src/stats/highlightsAnnounce';
+import { highlightsEmbeds, highlightsMessage, postHighlights } from '../src/stats/highlightsAnnounce';
 import * as tourn from './adminTournaments';
 import { bareArgsOf, looksLikeDbPath } from './adminArgs';
 
@@ -1426,6 +1426,10 @@ async function cmdHighlightsShow(db: Db): Promise<void> {
         console.log(`\n--- Discord (${lang}) ---`);
         console.log(renderDiscord(h, lang) ?? '(nothing to post: no rated match that month)');
     }
+    // What is actually posted since 2026-11-11: the card, as JSON for an embed viewer.
+    const embeds = highlightsEmbeds(h, 'both');
+    console.log('\n--- Discord card (JSON) ---');
+    console.log(embeds.length > 0 ? JSON.stringify(highlightsMessage(embeds), null, 2) : '(nothing to post)');
 }
 
 /**
@@ -1449,8 +1453,10 @@ async function cmdHighlightsPost(dbPath: string): Promise<void> {
             return;
         }
         if (!APPLY) {
+            // The exact JSON that would be posted - paste it into an embed viewer to see the card.
             const h = await highlightsFor(ctx, month, Date.now());
-            console.log(renderDiscord(h, 'es') ?? '(nothing to post)');
+            const embeds = highlightsEmbeds(h, ctx.config.discordHighlightsLang);
+            console.log(embeds.length > 0 ? JSON.stringify(highlightsMessage(embeds), null, 2) : '(nothing to post)');
             console.log(`\nWould post to ${ctx.config.discordHighlightsWebhookUrls.length} webhook(s). Re-run with --apply.`);
             return;
         }
@@ -1832,6 +1838,7 @@ async function main(): Promise<void> {
             case 'tournament:cancel': return await tourn.cmdTournamentCancel(db, cli());
             case 'tournament:feature': return await tourn.cmdTournamentFeature(db, cli());
             case 'tournament:reap': return await tourn.cmdTournamentReap(db, cli());
+            case 'tournament:delete': return await tourn.cmdTournamentDelete(db, cli());
             case 'team:show': return await tourn.cmdTeamShow(db, cli());
             case 'team:disband': return await tourn.cmdTeamDisband(db, cli());
             case 'tournament:transfer':

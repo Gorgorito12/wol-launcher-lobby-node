@@ -14,7 +14,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { TOURNAMENT_LIST_WHERE, LIST_COLUMNS, MY_ENTRIES_SQL } from './store';
-import { aliveWhereClause, DRAFT_STALE_DAYS, LIVE_STALE_DAYS } from './lifecycle';
+import {
+    aliveWhereClause, DRAFT_STALE_DAYS, ENDED_PUBLIC_DAYS, FINISHED_PUBLIC_DAYS, LIVE_STALE_DAYS,
+} from './lifecycle';
 
 test('a list row names its owner with the shared naming rule', () => {
     assert.match(LIST_COLUMNS, /AS owner_name/);
@@ -57,11 +59,17 @@ test('both staleness horizons reach the list', () => {
     assert.ok(TOURNAMENT_LIST_WHERE.includes(String(LIVE_STALE_DAYS)));
 });
 
-test('a finished tournament is not filtered out by the list rule itself', () => {
-    // Terminal rows are alive-by-definition in `aliveWhereClause`, so the only thing
-    // keeping them out of a listing would be an explicit status filter — and there is
-    // none beyond the draft one. History stays visible.
+test('an ended tournament is listed only for its window', () => {
+    // Terminal rows are alive-by-definition in `aliveWhereClause`; what takes them off the list
+    // is the window of publicWhereClause (2026-11-11): a week for a cancelled one with a game,
+    // a month for a finished one. cleanup.test.ts runs the real query.
     assert.match(TOURNAMENT_LIST_WHERE, /status IN \('finished','cancelled','abandoned'\)/);
+    assert.ok(TOURNAMENT_LIST_WHERE.includes(String(ENDED_PUBLIC_DAYS)));
+    assert.ok(TOURNAMENT_LIST_WHERE.includes(String(FINISHED_PUBLIC_DAYS)));
+});
+
+test('a list row says whether a game was played, without a bound parameter', () => {
+    assert.match(LIST_COLUMNS, /AS has_games/);
 });
 
 // ---------------------------------------------------------------- what a row carries

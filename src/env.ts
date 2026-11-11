@@ -325,7 +325,8 @@ export function loadConfig(): Config {
             const rooms = urlListEnv('DISCORD_WEBHOOK_URL');
             return rooms.length > 0 ? [rooms[0]!] : [];
         })(),
-        discordHighlightsLang: strEnv('DISCORD_HIGHLIGHTS_LANG', 'es'),
+        // English by default (2026-11-11): the server's community is not only Spanish-speaking.
+        discordHighlightsLang: strEnv('DISCORD_HIGHLIGHTS_LANG', 'en'),
         highlightsPostWindowDays: intEnv('HIGHLIGHTS_POST_WINDOW_DAYS', 3),
     };
 

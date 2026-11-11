@@ -42,6 +42,7 @@ import { toSqliteText } from '../lib/time';
 import { placementRequired } from '../elo/placement';
 import { bestWinRunWithin } from '../elo/streaks';
 import type { RatingMode } from '../elo/glicko2';
+import { modLabel } from '../lobbies/discordAnnounce';
 
 /** Fewest post-placement rated matches in the month for "biggest climb". */
 export const HIGHLIGHT_MIN_MATCHES = 5;
@@ -475,4 +476,121 @@ export function renderDiscord(h: Highlights, lang: 'es' | 'en'): string | null {
         lines.push(`${plural(h.total_rated, 'rated match', 'rated matches')} this month. The full ranking is in the launcher, Ranking tab.`);
     }
     return lines.join('\n');
+}
+
+// ---------------------------------------------------------------- the Discord card
+
+/** A Discord embed, the part of its shape this server writes. */
+export interface DiscordEmbed {
+    title: string;
+    description: string;
+    color: number;
+    thumbnail?: { url: string };
+    fields: Array<{ name: string; value: string; inline: boolean }>;
+    footer: { text: string };
+}
+
+/** The launcher's gold, as Discord wants a colour: one integer. */
+export const HIGHLIGHTS_EMBED_COLOR = 0xd9a441;
+
+/** Discord's own limits, which a long display name must never break. */
+const EMBED_NAME_MAX = 32;
+const EMBED_FIELD_MAX = 1024;
+
+/**
+ * A player's name for the card: trimmed to {@link EMBED_NAME_MAX} and with Discord's markdown
+ * escaped, so `_x_` stays a name instead of becoming italics. The name is the player's own text.
+ */
+export function embedName(name: string): string {
+    const short = name.length > EMBED_NAME_MAX ? `${name.slice(0, EMBED_NAME_MAX - 1)}…` : name;
+    return short.replace(/([\\*_~`|>])/g, '\\$1');
+}
+
+const MEDALS = ['🥇', '🥈', '🥉'];
+
+/**
+ * A no-break space. Discord's inline columns are about 130 px wide, so a line breaks wherever it
+ * can: rendered, "51 %" left the % alone on the next line and "+118 · 1v1" split. The number stays
+ * with what it belongs to.
+ */
+const NBSP = '\u00a0';
+
+/** The ladder, only when it is the team one: a 1v1 entry says nothing, which saves the column. */
+function teamTag(mode: RatingMode, lang: 'es' | 'en'): string {
+    return mode === 'team' ? ` · ${modeName(mode, lang)}` : '';
+}
+
+/** Up to three lines, a medal each; null when nobody qualified. */
+function podium<T>(rows: readonly T[], line: (row: T) => string): string | null {
+    if (rows.length === 0) return null;
+    const text = rows.slice(0, 3).map((r, i) => `${MEDALS[i]} ${line(r)}`).join('\n');
+    return text.length > EMBED_FIELD_MAX ? `${text.slice(0, EMBED_FIELD_MAX - 1)}…` : text;
+}
+
+/** Both ladders' lists in one, best first, each entry keeping its ladder. */
+function bothLadders<T>(byMode: Record<RatingMode, T[]>, value: (x: T) => number): Array<[RatingMode, T]> {
+    return [
+        ...byMode.default.map((x) => ['default', x] as [RatingMode, T]),
+        ...byMode.team.map((x) => ['team', x] as [RatingMode, T]),
+    ].sort((a, b) => value(b[1]) - value(a[1]));
+}
+
+/**
+ * The monthly highlights as ONE Discord card (2026-11-11, the maintainer's choice of all three
+ * proposals together): gold bar, the month, the count, the biggest climber's picture, a row of
+ * three podiums (climb, matches, streak) and a row of the other highlights (most wins, best win
+ * rate, civilization of the month), then the biggest upset when there was one. Every mod counts,
+ * as the text version. A category with nobody is left out; null when the month had no rated
+ * match, as {@link renderDiscord}. Pure: what is posted is what the tests pin.
+ */
+export function renderDiscordEmbed(h: Highlights, lang: 'es' | 'en'): DiscordEmbed | null {
+    if (h.total_rated <= 0) return null;
+    const es = lang === 'es';
+    const L = h.leaders;
+    const fields: DiscordEmbed['fields'] = [];
+    const add = (name: string, value: string | null, inline = true) => {
+        if (value) fields.push({ name, value, inline });
+    };
+
+    const climbs = bothLadders(L.biggest_climb, (x) => x.points);
+    add(es ? '📈 Quién más subió' : '📈 Biggest climb',
+        podium(climbs, ([mode, c]) => `${embedName(c.display_name)}${NBSP}+${c.points}${teamTag(mode, lang)}`));
+    add(es ? '⚔️ Más partidas' : '⚔️ Most matches',
+        podium(L.most_matches, (m) => `${embedName(m.display_name)}${NBSP}·${NBSP}${m.matches}`));
+    add(es ? '🔥 Mejor racha' : '🔥 Best streak',
+        podium(bothLadders(L.best_streak, (x) => x.wins), ([mode, s]) => `${embedName(s.display_name)}${NBSP}·${NBSP}${s.wins}${teamTag(mode, lang)}`));
+
+    if (h.most_wins) {
+        add(es ? '🥇 Más victorias' : '🥇 Most wins', `${embedName(h.most_wins.display_name)}${NBSP}·${NBSP}${h.most_wins.wins}`);
+    }
+    if (h.best_win_rate) {
+        add(es ? '🎯 Mejor porcentaje' : '🎯 Best win rate',
+            `${embedName(h.best_win_rate.display_name)}${NBSP}·${NBSP}${h.best_win_rate.percent}${NBSP}%`);
+    }
+    if (h.top_civ) {
+        const c = h.top_civ;
+        add(es ? '🏰 Civilización del mes' : '🏰 Civilization of the month',
+            `${embedName(c.civ)} · ${plural(c.picks, es ? 'vez' : 'pick', es ? 'veces' : 'picks').replace(' ', NBSP)}\n${embedName(modLabel(c.mod_id))}`);
+    }
+    if (h.biggest_upset) {
+        const u = h.biggest_upset;
+        const side = (ps: PlayerRef[]) => ps.map((p) => embedName(p.display_name)).join(' + ');
+        add(es ? '⚡ Mayor sorpresa' : '⚡ Biggest upset',
+            es
+                ? `${side(u.winners)} venció a ${side(u.losers)}, ${u.gap} ELO por debajo · ${modeName(u.mode, lang)}`
+                : `${side(u.winners)} beat ${side(u.losers)} from ${u.gap} ELO below · ${modeName(u.mode, lang)}`,
+            false);
+    }
+
+    const climber = climbs[0]?.[1];
+    return {
+        title: es ? `🏆 Destacados de ${monthName(h.month, 'es')}` : `🏆 ${monthName(h.month, 'en')} highlights`,
+        description: es
+            ? `${plural(h.total_rated, 'partida puntuada', 'partidas puntuadas')} este mes`
+            : `${plural(h.total_rated, 'rated match', 'rated matches')} this month`,
+        color: HIGHLIGHTS_EMBED_COLOR,
+        ...(climber?.avatar_url ? { thumbnail: { url: climber.avatar_url } } : {}),
+        fields,
+        footer: { text: es ? 'AoE3 Mod Launcher · pestaña Clasificación' : 'AoE3 Mod Launcher · Ranking tab' },
+    };
 }

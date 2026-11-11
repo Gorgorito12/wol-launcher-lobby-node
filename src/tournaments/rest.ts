@@ -63,6 +63,8 @@ import { composeTournamentRoomTitle, TOURNAMENT_ROOM_TITLE_MAX } from './roomTit
 import {
     invalidateTournament, readDetailCache, readListCache, writeDetailCache, writeListCache,
 } from './cache';
+import { ladderRanks } from '../stats/rest';
+import { mayDelete } from './lifecycle';
 
 // ---------------------------------------------------------------- bounds
 
@@ -129,8 +131,13 @@ export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): 
         // "other tournaments", and the anonymous answer stays cacheable.
         const entries = req.userId ? await store.listMyEntries(ctx.db, req.userId) : [];
 
+        // The ended tournaments only the caller still sees: their own cancelled ones with no
+        // game (deletable), and finished ones past the public month they took part in. Its
+        // PRESENCE is also how a launcher knows this server can delete a tournament.
+        const ended = req.userId ? (await store.listMine(ctx.db, req.userId)).map(listView) : [];
+
         reply.header('Cache-Control', req.userId ? 'private, max-age=0' : 'public, max-age=60');
-        return { ...(payload as object), drafts: mine, my_entries: entries };
+        return { ...(payload as object), drafts: mine, my_entries: entries, mine: ended };
     });
 
     app.get('/tournaments/:id', {
@@ -848,6 +855,37 @@ export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): 
         return { ok: true };
     });
 
+    // Delete (2026-11-11): the owner's, and only a draft, cancelled or abandoned tournament with no
+    // game played - one with a game keeps its history. POST like every other action here. The
+    // read answers with the right reason; `deleteTournament` re-checks in the statement itself.
+    app.post('/tournaments/:id/delete', {
+        preHandler: [requireTournamentOwner(ctx), userRateLimit(ctx, Limits.TournamentWriteUser)],
+    }, async (req) => {
+        const id = paramId(req, 'id');
+        const t = await store.getTournament(ctx.db, id);
+        if (!t) throw Errors.NotFound('Tournament');
+        const played = await store.hasGames(ctx.db, id);
+        if (played) throw Errors.Conflict('A game of this tournament was played; it stays as history.');
+        if (!mayDelete({ status: t.status, played })) {
+            throw Errors.Conflict('Cancel this tournament before deleting it.');
+        }
+        // A cancelled or abandoned tournament's rooms are already closed; this is defensive.
+        for (const lobbyId of await store.openLobbiesForTournament(ctx.db, id)) {
+            await ctx.db.batch([
+                ctx.db.prepare(
+                    `UPDATE lobbies SET status='closed', closed_at=datetime('now') WHERE id = ?`,
+                ).bind(lobbyId),
+                ctx.db.prepare(`DELETE FROM lobby_members WHERE lobby_id = ?`).bind(lobbyId),
+            ]);
+            ctx.rooms.close(lobbyId);
+        }
+        if (!(await store.deleteTournament(ctx.db, id))) {
+            throw Errors.Conflict('This tournament can no longer be deleted.');
+        }
+        invalidate(id);
+        return { ok: true, deleted: true };
+    });
+
     app.post('/tournaments/:id/cancel', {
         preHandler: [requireTournamentOwner(ctx), userRateLimit(ctx, Limits.TournamentWriteUser)],
     }, async (req) => {
@@ -894,6 +932,8 @@ function listView(t: store.TournamentListRow): Record<string, unknown> {
         roster_size: rosterSizeFor(t.format),
         entrant_count: t.entrant_count ?? 0,
         pending_count: t.pending_count ?? 0,
+        // Additive. A launcher offers Delete only on one without games.
+        has_games: !!t.has_games,
         created_at: t.created_at,
         last_activity_at: t.last_activity_at,
     };
@@ -988,6 +1028,23 @@ async function buildDetail(ctx: AppContext, id: string): Promise<unknown> {
     const rosters = await store.loadRosterMembers(ctx.db, id);
     const bracket = await store.loadBracket(ctx.db, id);
     const managers = await store.listManagers(ctx.db, id);
+    const played = await store.hasGames(ctx.db, id);
+
+    // Every player's place on the tournament's ladder (1v1, or the team ladder for a 2v2/3v3), so
+    // the launcher can draw the same badge it draws everywhere else. 0 means not on the ladder yet
+    // (being placed): sent as nothing, so no badge gives away a placement number.
+    const teamLadder = t.format !== '1v1';
+    const everyone = [...rosters.values()].flat().map((m) => m.user_id);
+    const ranks = await ladderRanks(ctx, everyone, teamLadder ? 'team' : 'default');
+    const withRank = (m: store.RosterMember) => {
+        const rank = ranks.get(m.user_id) ?? 0;
+        return rank > 0
+            ? { ...m, [teamLadder ? 'ladder_rank_team' : 'ladder_rank']: rank }
+            : m;
+    };
+    const owner = await ctx.db.prepare(
+        `SELECT avatar_url FROM users WHERE id = ?`,
+    ).bind(t.owner_user_id).first<{ avatar_url: string | null }>();
 
     const lobbies = new Map<string, { id: string; host_user_id: string; status: string }>();
     for (const m of bracket) {
@@ -1020,6 +1077,8 @@ async function buildDetail(ctx: AppContext, id: string): Promise<unknown> {
         mod_id: t.mod_id,
         owner_user_id: t.owner_user_id,
         owner_name: await displayNameOf(ctx, t.owner_user_id),
+        owner_avatar_url: owner?.avatar_url ?? null,
+        has_games: played,
         // Both shapes, for the reason `member_ids` and `members` carry below: the ids
         // answer "may I run this", which is what every permission check asks, and the
         // names answer "who are they", which is the only thing a list can draw. A launcher
@@ -1051,7 +1110,7 @@ async function buildDetail(ctx: AppContext, id: string): Promise<unknown> {
             // team bracket with no error to explain why. Same reason `top_map` survived
             // the arrival of `top_maps`.
             member_ids: (rosters.get(e.id) ?? []).map((m) => m.user_id),
-            members: rosters.get(e.id) ?? [],
+            members: (rosters.get(e.id) ?? []).map(withRank),
         })),
         matches: bracket.map((m) => ({
             id: m.id,

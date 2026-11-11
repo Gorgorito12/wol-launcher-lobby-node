@@ -4,6 +4,7 @@ import { modIdInList, modsForWebhook } from '../lib/modIds';
 import type { FastifyBaseLogger } from 'fastify';
 import type { Config } from '../env';
 import type { Db } from '../db';
+import { noteLobbiesChanged } from '../global/lobbiesChanged';
 
 /**
  * Optional Discord channel announcements for lobbies, with LIVE updates.
@@ -461,6 +462,8 @@ export function notifyRoomChanged(
     lobbyId: string,
     change: { players?: number; status?: RoomStatus; title?: string },
 ): void {
+    // Every room, announced or not: the launchers' room list wants to know (lobbies_changed).
+    noteLobbiesChanged();
     void (async () => {
         const state = await ensureState(lobbyId);
         if (!state) return;
@@ -492,6 +495,7 @@ export function notifyRoomChanged(
  * embed reading "Open" forever.
  */
 export function finalizeRoom(lobbyId: string, status: RoomStatus = 'closed'): void {
+    noteLobbiesChanged();
     void (async () => {
         const state = await ensureState(lobbyId);
         if (!state) return;
