@@ -408,6 +408,7 @@ export interface TournamentListRow {
     name: string;
     mod_id: string;
     owner_user_id: string;
+    owner_name?: string | null;
     format: TournamentFormat;
     team_source: TeamSource;
     entry_mode: 'open' | 'approval';
@@ -423,6 +424,7 @@ export interface TournamentListRow {
 export const LIST_COLUMNS = `
     t.id, t.name, t.mod_id, t.owner_user_id, t.format, t.team_source, t.entry_mode,
     t.status, t.capacity, t.confirmed_count, t.created_at, t.last_activity_at,
+    (SELECT ${USER_DISPLAY_NAME_SQL} FROM users u WHERE u.id = t.owner_user_id) AS owner_name,
     (SELECT COUNT(*) FROM tournament_entrants e
       WHERE e.tournament_id = t.id
         AND e.status IN ('pending','confirmed','waitlist')) AS entrant_count,
@@ -462,6 +464,43 @@ export async function listOwnDrafts(db: Db, userId: string): Promise<TournamentL
           ORDER BY t.created_at DESC
           LIMIT 20`,
     ).bind(userId).all<TournamentListRow>();
+    return r.results ?? [];
+}
+
+/**
+ * What the list needs to know about one player: the tournaments they are still in, and whether a
+ * match of theirs is waiting. The list itself is one anonymous payload shared by everybody, which
+ * is why this is a query of its own and never part of the memo.
+ *
+ * `alert` is 'play' when both sides are known and no room exists, or the room is the player's own,
+ * and 'join' when the rival opened it. A room is the open lobby bound to that bracket slot, the
+ * same test the tournament detail draws.
+ */
+export const MY_ENTRIES_SQL =
+    `SELECT e.tournament_id,
+            (SELECT CASE WHEN l.id IS NOT NULL AND l.host_user_id <> ? THEN 'join' ELSE 'play' END
+               FROM tournament_matches tm
+               LEFT JOIN lobbies l ON l.tournament_match_id = tm.id AND l.status <> 'closed'
+              WHERE tm.tournament_id = e.tournament_id AND tm.status = 'pending'
+                AND (tm.entrant1_id = e.id OR tm.entrant2_id = e.id)
+                AND tm.entrant1_id IS NOT NULL AND tm.entrant2_id IS NOT NULL
+              ORDER BY tm.round
+              LIMIT 1) AS alert
+       FROM tournament_entrant_members m
+       JOIN tournament_entrants e ON e.id = m.entrant_id
+       JOIN tournaments t ON t.id = e.tournament_id
+      WHERE m.user_id = ?
+        AND e.status IN ('confirmed','pending','waitlist')
+        AND t.status IN ('registration','ready','running')
+        AND ${aliveWhereClause('t')}`;
+
+export interface MyEntryRow {
+    tournament_id: string;
+    alert: 'play' | 'join' | null;
+}
+
+export async function listMyEntries(db: Db, userId: string): Promise<MyEntryRow[]> {
+    const r = await db.prepare(MY_ENTRIES_SQL).bind(userId, userId).all<MyEntryRow>();
     return r.results ?? [];
 }
 

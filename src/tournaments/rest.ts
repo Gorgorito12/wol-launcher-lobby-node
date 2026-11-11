@@ -58,23 +58,13 @@ import { generateBracket, advance, disqualify, roundsFor, bracketSize } from './
 import * as store from './store';
 import * as teams from '../teams/store';
 import { reportVerdictFor } from './advance';
+import { clampCapacity, MAX_CAPACITY } from './capacity';
 import { composeTournamentRoomTitle, TOURNAMENT_ROOM_TITLE_MAX } from './roomTitle';
 import {
     invalidateTournament, readDetailCache, readListCache, writeDetailCache, writeListCache,
 } from './cache';
 
 // ---------------------------------------------------------------- bounds
-
-/**
- * Slots a tournament may offer, counted in ENTRANTS.
- *
- * Sixteen is not arbitrary. A 16-entrant first round is eight simultaneous rooms, and
- * MAX_ACTIVE_GAMES is 16 for the whole server — so one tournament of this size already
- * takes half of it. Offering 32 would be offering a bracket the server cannot host.
- */
-const MIN_CAPACITY = 2;
-const MAX_CAPACITY = 16;
-const DEFAULT_CAPACITY = 8;
 
 /** Live tournaments one person may own at once. Stale ones do not count — see lifecycle.ts. */
 const MAX_OWNED_LIVE = 2;
@@ -91,11 +81,6 @@ const NAME_MIN = 3;
 const invalidate = invalidateTournament;
 
 // ---------------------------------------------------------------- helpers
-
-function clampCapacity(raw: unknown): number {
-    const n = typeof raw === 'number' && Number.isFinite(raw) ? Math.trunc(raw) : DEFAULT_CAPACITY;
-    return Math.min(MAX_CAPACITY, Math.max(MIN_CAPACITY, n));
-}
 
 /**
  * Validate an enum in the ROUTE, not by leaning on the schema.
@@ -124,7 +109,9 @@ export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): 
 
         if (payload === null) {
             const rows = await store.listTournaments(ctx.db, LIST_LIMIT);
-            payload = { tournaments: rows.map(listView) };
+            // max_capacity tells a launcher what it may offer, so a new limit needs no new launcher
+            // and a launcher against an older server, which sends none, keeps asking for 16.
+            payload = { tournaments: rows.map(listView), max_capacity: MAX_CAPACITY };
             writeListCache(payload, now);
         }
 
@@ -138,8 +125,12 @@ export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): 
             ? (await store.listOwnDrafts(ctx.db, req.userId)).map(listView)
             : [];
 
-        reply.header('Cache-Control', mine.length ? 'private, max-age=0' : 'public, max-age=60');
-        return { ...(payload as object), drafts: mine };
+        // Same split for what the caller is playing: a launcher without it files everything under
+        // "other tournaments", and the anonymous answer stays cacheable.
+        const entries = req.userId ? await store.listMyEntries(ctx.db, req.userId) : [];
+
+        reply.header('Cache-Control', req.userId ? 'private, max-age=0' : 'public, max-age=60');
+        return { ...(payload as object), drafts: mine, my_entries: entries };
     });
 
     app.get('/tournaments/:id', {
@@ -889,11 +880,14 @@ function listView(t: store.TournamentListRow): Record<string, unknown> {
         name: t.name,
         mod_id: t.mod_id,
         owner_user_id: t.owner_user_id,
+        // Additive: a list row can then say whose tournament it is without a second request.
+        owner_name: t.owner_name ?? null,
         format: t.format,
         team_source: t.team_source,
         entry_mode: t.entry_mode,
         status: t.status,
         capacity: t.capacity,
+        max_capacity: MAX_CAPACITY,
         confirmed_count: t.confirmed_count,
         // How many players each entrant fields. Its presence also tells a launcher this server
         // understands a registered captain choosing WHO plays (`member_ids` on entry).
@@ -1025,6 +1019,7 @@ async function buildDetail(ctx: AppContext, id: string): Promise<unknown> {
         name: t.name,
         mod_id: t.mod_id,
         owner_user_id: t.owner_user_id,
+        owner_name: await displayNameOf(ctx, t.owner_user_id),
         // Both shapes, for the reason `member_ids` and `members` carry below: the ids
         // answer "may I run this", which is what every permission check asks, and the
         // names answer "who are they", which is the only thing a list can draw. A launcher
@@ -1036,6 +1031,7 @@ async function buildDetail(ctx: AppContext, id: string): Promise<unknown> {
         entry_mode: t.entry_mode,
         status: t.status,
         capacity: t.capacity,
+        max_capacity: MAX_CAPACITY,
         confirmed_count: t.confirmed_count,
         bracket_size: t.bracket_size,
         rounds_total: t.bracket_size ? Math.log2(t.bracket_size) : null,

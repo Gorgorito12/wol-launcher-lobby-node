@@ -223,6 +223,32 @@ sudo systemctl status wol-lobby --no-pager   # → active (running)
 curl http://127.0.0.1:8080/health            # → {"ok":true, ...}
 ```
 
+### The launcher redesign (design_base_launcher_2): what this server adds, and the order
+
+Code only: no dependency, no migration (`started_at` is migration 0021, already applied), no
+nginx edit. Every field is added beside the old ones and the one new route answers 404 on an
+older server, so **deploy the server first**; launchers already in players' hands ignore all of it.
+
+1. **The server.** It brings:
+   - `GET /lobbies/radmin` (signed-in only, `Limits.HostRadminUser`): each public room host's
+     Radmin address, for the rooms list's per-host ping. Without it the launcher draws no PING
+     column at all.
+   - `started_at` on an in-game room ("In game · 14 min") and `tournament_id` on the room of a
+     bracket match (its header).
+   - `my_entries` in `GET /tournaments` for a signed-in caller ("your turn" in the list), and
+     `max_capacity` and `owner_name` on tournaments.
+   - `sent_invites` in `GET /teams/mine` (My teams' invitations a captain sent).
+   - Tournaments of 32 and 64 places (`src/tournaments/capacity.ts`).
+2. **Before the first tournament of 32 or 64**, raise `MAX_ACTIVE_GAMES`: their first rounds open
+   16 and 32 rooms at once (see "How many rooms the server allows").
+3. **Then the launcher.** Against an older server it hides what needs the new data: no PING
+   column, 16 places at most, no sent-invitations block, the plain header in a bracket room.
+
+One thing to watch: an older launcher shown a tournament of 32 or 64 places created from a new
+one. Its bracket is laid out from the matches it receives, so it should draw, but nobody has
+looked at one past 16 places. Until most players have updated, keep such tournaments for a group
+that has.
+
 Most launcher-feature backends are **code-only** changes: no new deps, no
 migration, no nginx edit — `git pull` + `systemctl restart` is the whole
 deploy. The `matches_changed` frame is one: whenever a match is stored or its result,
@@ -862,6 +888,8 @@ recording afterwards. `ratabilityReason` answers `not_competitive` for the rest.
 sudo -u wol-lobby ./node_modules/.bin/tsx scripts/admin.ts match:show <matchId>
 #   room mode  casual (never scores)      <- there is your answer
 ```
+
+**A tournament can now take 32 or 64 entrants** (`src/tournaments/capacity.ts`). Their first rounds are 16 and 32 rooms, so before running one raise `MAX_ACTIVE_GAMES`: a room that finds the server full gets the 409 and can try again when a match ends, and until then other players cannot open rooms either.
 
 ### Walking out counts as a loss
 

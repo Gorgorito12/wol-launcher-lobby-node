@@ -217,6 +217,9 @@ export const Limits = {
     UserSearchUser:   { scope: 'usearch-u', keyKind: 'user', perMinute: 30,  perDay: 600  } as const,
     LobbyCreateUser:  { scope: 'lcreate-u', keyKind: 'user', perMinute: 10,  perDay: 100  } as const,
     LobbyJoinUser:    { scope: 'ljoin-u',   keyKind: 'user', perMinute: 50,  perDay: 200  } as const,
+    // The rooms list's per-host ping (GET /lobbies/radmin). A launcher asks every 10 s, only while
+    // the Rooms page is in front, so a day of that is 8 640; the cap leaves room for two copies.
+    HostRadminUser:   { scope: 'lradmin-u', keyKind: 'user', perMinute: 12,  perDay: 20000 } as const,
     ReportUser:       { scope: 'report-u',  keyKind: 'user', perMinute: 5,   perDay: 20   } as const,
     // The badge-mode switch in the profile. A user setting clicked by hand, by USER like the
     // writes above; generous per minute because somebody trying the three options clicks

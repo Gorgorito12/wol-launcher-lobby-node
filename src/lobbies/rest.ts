@@ -6,6 +6,7 @@ import { chargeIpQuota, ipRateLimit, userRateLimit, Limits } from '../middleware
 import { finalizeRoom } from './discordAnnounce';
 import { runFoundingHook } from '../matches/foundingHook';
 import { createLobby } from './create';
+import { HOST_RADMIN_SQL, hostRadminIps, type HostRadminRow } from './hostRadmin';
 import { isEntrantMember } from '../tournaments/store';
 import { DEFAULT_RATING, DEFAULT_RD } from '../elo/glicko2';
 import { effectiveRatings, type EffectiveRating } from '../elo/ladder';
@@ -53,6 +54,11 @@ interface LobbyRow {
     tournament_match_id: string | null;
 }
 
+/** The tournament a room's bracket slot belongs to, for a window that opens with no other way to
+ *  know it. Null on an ordinary room, and on a slot whose tournament is gone. */
+export const ROOM_TOURNAMENT_ID_SQL =
+    `(SELECT tm.tournament_id FROM tournament_matches tm WHERE tm.id = l.tournament_match_id)`;
+
 interface CreateLobbyBody {
     title: string;
     mod_id: string;
@@ -93,6 +99,7 @@ export const LOBBY_LIST_SQL =
     `SELECT l.id, l.host_user_id, l.title, l.mod_id, l.mod_combined_hash,
             l.max_players, l.spectator_slots, l.current_players, l.is_private,
             l.status, l.competitive, l.tournament_match_id,
+            ${ROOM_TOURNAMENT_ID_SQL} AS tournament_id,
             -- Counted rather than denormalised, unlike current_players. This is read
             -- once per row on a list capped at 100 and covered by lobby_members' own
             -- primary key; a second denormalised counter would be a second thing that
@@ -100,7 +107,7 @@ export const LOBBY_LIST_SQL =
             -- comment in LobbyRoom about never decrementing.
             (SELECT COUNT(*) FROM lobby_members m
               WHERE m.lobby_id = l.id AND m.role = 'spectator') AS spectators_present,
-            l.created_at, u.discord_username AS host_login, u.display_name AS host_name,
+            l.created_at, l.started_at, u.discord_username AS host_login, u.display_name AS host_name,
             u.avatar_url AS host_avatar,
             u.badge_mode AS host_badge_mode
      FROM lobbies l
@@ -140,7 +147,9 @@ async function buildLobbyList(ctx: AppContext): Promise<unknown> {
         status: 'open' | 'locked' | 'in_game';
         competitive: number;
         tournament_match_id: string | null;
+        tournament_id: string | null;
         created_at: string;
+        started_at: string | null;
         host_login: string;
         host_name: string;
         host_avatar: string | null;
@@ -194,7 +203,12 @@ async function buildLobbyList(ctx: AppContext): Promise<unknown> {
             // Null for an ordinary room. Lets the rooms table show a tournament chip
             // and hide Join from anyone who is not one of the two entrants.
             tournament_match_id: r.tournament_match_id ?? null,
+            // Additive, like every field here: an older launcher ignores it.
+            tournament_id: r.tournament_id ?? null,
             created_at: r.created_at,
+            // When the match under way began, for the row's "In game · 14 min". Only while it
+            // is under way: started_at is kept after a cancelled game (migration 0021).
+            started_at: r.status === 'in_game' ? (r.started_at ?? null) : null,
             // A host still being PLACED on a ladder is listed without that ladder's rating:
             // this body is one cached answer for every reader, so nobody but him may get it,
             // and he takes his own from his standing (src/elo/placementPrivacy.ts). Omitted,
@@ -249,6 +263,14 @@ async function buildLobbyList(ctx: AppContext): Promise<unknown> {
  * the launcher's <c>LobbyApiClient</c> can't tell which backend it's
  * talking to.
  */
+async function tournamentIdOf(ctx: AppContext, matchId: string | null): Promise<string | null> {
+    if (!matchId) return null;
+    const row = await ctx.db.prepare(
+        `SELECT tournament_id FROM tournament_matches WHERE id = ?`,
+    ).bind(matchId).first<{ tournament_id: string }>();
+    return row?.tournament_id ?? null;
+}
+
 export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void {
     // GET /lobbies — public list.
     //
@@ -281,6 +303,18 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
         const payload = await lobbyListInFlight;
         reply.header('Cache-Control', 'public, max-age=5');
         return payload;
+    });
+
+    // GET /lobbies/radmin — the Radmin address of each public room's host, for the rooms list's
+    // per-host ping. Separate from /lobbies on purpose: that body is one anonymous memo, and an
+    // address must only reach a signed-in player, who could read it anyway by joining the room.
+    // See ./hostRadmin.ts for every refusal.
+    app.get('/lobbies/radmin', {
+        preHandler: [requireAuth(), userRateLimit(ctx, Limits.HostRadminUser)],
+    }, async (_req, reply) => {
+        const rows = await ctx.db.prepare(HOST_RADMIN_SQL).bind().all<HostRadminRow>();
+        reply.header('Cache-Control', 'private, no-store');
+        return { hosts: hostRadminIps(rows.results ?? [], (id) => ctx.rooms.get(id)) };
     });
 
     // POST /lobbies — create.
@@ -349,6 +383,7 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
             status: lobby.status,
             competitive: lobby.competitive === 1,
             tournament_match_id: lobby.tournament_match_id ?? null,
+            tournament_id: await tournamentIdOf(ctx, lobby.tournament_match_id),
             host_user_id: lobby.host_user_id,
             members: (members.results ?? []).map((m) => ({
                 id: m.user_id,
