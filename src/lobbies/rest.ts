@@ -322,7 +322,19 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
         }
         const payload = await lobbyListInFlight;
         reply.header('Cache-Control', 'public, max-age=5');
+        return payload;
+    });
 
+    // GET /lobbies/radmin — the Radmin address of each public room's host, for the rooms list's
+    // per-host ping. Separate from /lobbies on purpose: that body is one anonymous memo, and an
+    // address must only reach a signed-in player, who could read it anyway by joining the room.
+    // See ./hostRadmin.ts for every refusal.
+    app.get('/lobbies/radmin', {
+        preHandler: [requireAuth(), userRateLimit(ctx, Limits.HostRadminUser)],
+    }, async (_req, reply) => {
+        const rows = await ctx.db.prepare(HOST_RADMIN_SQL).bind().all<HostRadminRow>();
+        reply.header('Cache-Control', 'private, no-store');
+        return { hosts: hostRadminIps(rows.results ?? [], (id) => ctx.rooms.get(id)) };
     });
 
     // POST /lobbies — create.
