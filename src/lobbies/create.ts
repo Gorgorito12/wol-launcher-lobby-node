@@ -127,6 +127,12 @@ export interface CreateLobbyInput {
      */
     tournamentMatchId?: string | null;
     /**
+     * The quick-match proposal this room plays out, or null. Only the Matchmaker passes it
+     * (src/matchmaking/store.ts). Like the tournament binding, it makes the join admit only
+     * the matched players.
+     */
+    matchmakingMatchId?: string | null;
+    /**
      * Whether to tell anybody. False for tournament rooms.
      *
      * It suppresses BOTH channels — the in-app `lobby_created` toast that every connected
@@ -159,6 +165,8 @@ export interface CreatedLobby {
     competitive: boolean;
     /** Null for an ordinary room. Additive: old launchers ignore it. */
     tournament_match_id: string | null;
+    /** Null for an ordinary room. Additive: old launchers ignore it. */
+    matchmaking: boolean;
 }
 
 export async function createLobby(
@@ -208,6 +216,7 @@ export async function createLobby(
     const passwordHash = input.password ? await sha256Hex(input.password) : null;
     const isPrivate = passwordHash ? 1 : 0;
     const tournamentMatchId = input.tournamentMatchId ?? null;
+    const matchmakingMatchId = input.matchmakingMatchId ?? null;
 
     await ctx.db.batch([
         ctx.db.prepare(
@@ -216,11 +225,13 @@ export async function createLobby(
             // record of who actually opened it, which is what the Discord embed names.
             `INSERT INTO lobbies (id, host_user_id, created_by, title, mod_id, mod_combined_hash,
                                   max_players, current_players, is_private, password_hash,
-                                  status, competitive, tournament_match_id, spectator_slots)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'open', ?, ?, ?)`,
+                                  status, competitive, tournament_match_id, spectator_slots,
+                                  matchmaking_match_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'open', ?, ?, ?, ?)`,
         ).bind(
             lobbyId, userId, userId, title, input.modId, input.modCombinedHash,
             maxPlayers, isPrivate, passwordHash, competitive, tournamentMatchId, spectatorSlots,
+            matchmakingMatchId,
         ),
         ctx.db.prepare(
             `INSERT INTO lobby_members (lobby_id, user_id, role) VALUES (?, ?, 'player')`,
@@ -279,6 +290,7 @@ export async function createLobby(
         status: 'open',
         competitive: competitive === 1,
         tournament_match_id: tournamentMatchId,
+        matchmaking: matchmakingMatchId !== null,
     };
 }
 

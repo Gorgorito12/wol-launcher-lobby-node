@@ -11,6 +11,7 @@ import { ladderRanks } from '../stats/rest';
 import { badgeModes, type BadgeMode } from '../users/badgeMode';
 import { MatchesChangedBatcher } from './matchesChanged';
 import { forgetLobbyLists, LobbiesChangedBatcher, setLobbiesChangedSink } from './lobbiesChanged';
+import type { Matchmaker, MmTransport } from '../matchmaking/Matchmaker';
 
 /**
  * Process-wide GLOBAL chat room — a single instance for the whole
@@ -63,6 +64,8 @@ interface AttachedSocket {
     /** Rolling-minute counter for room invites sent (separate rate limit). */
     inviteWindowStart: number;
     inviteCount: number;
+    /** What the launcher said it understands in its hello (`features`). */
+    features: Set<string>;
 }
 
 interface ChatLine {
@@ -77,7 +80,7 @@ interface ChatLine {
 const IDLE_KICK_AFTER_MS = 90 * 1000;
 const MAX_CHAT_LEN = 500;
 
-export class GlobalChatRoom {
+export class GlobalChatRoom implements MmTransport {
     private chatRing: ChatLine[] = [];
     private attached = new Map<WebSocket, AttachedSocket>();
     /** userId → epoch ms the auto-mute lifts. Keyed by user (not socket) so
@@ -93,6 +96,13 @@ export class GlobalChatRoom {
     /** Debounce timer for refreshPlayers() so a burst of lobby state changes
      * collapses into one presence rebroadcast. */
     private playersRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+
+    /** The quick-match queue, attached once at startup (index.ts). Its frames ride this socket. */
+    private matchmaker: Matchmaker | null = null;
+
+    attachMatchmaker(m: Matchmaker): void {
+        this.matchmaker = m;
+    }
 
     /** Live count of authenticated sockets — the presence number. */
     get onlineCount(): number {
@@ -124,6 +134,10 @@ export class GlobalChatRoom {
         ws.on('close', () => {
             const attached = this.attached.get(ws);
             this.attached.delete(ws);
+            // A socket REPLACED by a newer one for the same user is not the user going away.
+            if (attached && ![...this.attached.values()].some((a) => a.userId === attached.userId)) {
+                try { this.matchmaker?.socketGone(attached.userId); } catch { /* never break a close */ }
+            }
             // Only re-broadcast presence if this socket had actually
             // joined (passed hello) — an unauthenticated socket closing
             // never changed the count.
@@ -162,6 +176,14 @@ export class GlobalChatRoom {
                 break;
             case 'ping':
                 this.send(ws, { type: 'pong' });
+                break;
+            case 'mm_join':
+            case 'mm_leave':
+            case 'mm_ping':
+            case 'mm_accept':
+            case 'mm_decline':
+            case 'mm_challenge':
+                await this.handleMatchmaking(ws, attached, f);
                 break;
             default:
                 this.sendError(ws, 'unknown_type', `Unknown frame type: ${f.type}`);
@@ -236,6 +258,55 @@ export class GlobalChatRoom {
             modId: room.mod_id,
         });
         this.send(ws, { type: 'invite_sent', login: targetLogin });
+    }
+
+    private async handleMatchmaking(
+        ws: WebSocket,
+        attached: AttachedSocket,
+        f: { type: string } & Record<string, unknown>,
+    ): Promise<void> {
+        const mm = this.matchmaker;
+        if (!mm) {
+            this.send(ws, { type: 'mm_error', code: 'not_supported', message: 'Quick match queue is off.' });
+            return;
+        }
+        try {
+            switch (f.type) {
+                case 'mm_join': await mm.join(attached.userId, f); break;
+                case 'mm_leave': mm.leave(attached.userId, 'left'); break;
+                case 'mm_ping': mm.ping(attached.userId); break;
+                case 'mm_accept': await mm.accept(attached.userId, f); break;
+                case 'mm_decline': mm.decline(attached.userId, f); break;
+                case 'mm_challenge': await mm.challenge(attached.userId, f); break;
+            }
+        } catch {
+            this.send(ws, { type: 'mm_error', code: 'internal', message: 'Quick match failed on the server.' });
+        }
+    }
+
+    /** MmTransport: the user's one socket. */
+    sendTo(userId: string, frame: object): boolean {
+        for (const [ws, a] of this.attached) {
+            if (a.userId !== userId || ws.readyState !== 1) continue;
+            this.send(ws, frame);
+            return true;
+        }
+        return false;
+    }
+
+    /** MmTransport: every launcher that said it speaks quick match. */
+    broadcastFeature(frame: object): void {
+        const payload = JSON.stringify(frame);
+        for (const [ws, a] of this.attached) {
+            if (!a.features.has('matchmaking') || ws.readyState !== 1) continue;
+            try { ws.send(payload); } catch { /* socket dying */ }
+        }
+    }
+
+    /** Whether this user's launcher speaks quick match (for tests and the REST status). */
+    speaksMatchmaking(userId: string): boolean {
+        for (const a of this.attached.values()) if (a.userId === userId) return a.features.has('matchmaking');
+        return false;
     }
 
     /**
@@ -497,6 +568,11 @@ export class GlobalChatRoom {
             strikeWindowStart: now,
             inviteWindowStart: now,
             inviteCount: 0,
+            features: new Set(
+                Array.isArray(frame.features)
+                    ? (frame.features as unknown[]).filter((x): x is string => typeof x === 'string').slice(0, 32)
+                    : [],
+            ),
         });
 
         // Hand the joiner the recent history + current presence in one
@@ -508,6 +584,13 @@ export class GlobalChatRoom {
             onlineUsers: await this.onlineUsers(),
         });
         await this.broadcastPresence();
+        // A search survives a reconnect: tell him he is still queued, and who else is.
+        try {
+            this.matchmaker?.socketBack(userId);
+            if (this.matchmaker && this.speaksMatchmaking(userId)) {
+                this.send(ws, { type: 'mm_searchers_changed', searchers: this.matchmaker.searchers() });
+            }
+        } catch { /* never break a hello */ }
     }
 
     private handleChat(

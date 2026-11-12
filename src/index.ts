@@ -30,6 +30,9 @@ import { registerUsersRest } from './users/rest';
 import { sweepStaleTournaments } from './tournaments/sweep';
 import { maybePostMonthlyHighlights } from './stats/highlightsAnnounce';
 import { registerReplaysRest } from './replays/rest';
+import { Matchmaker } from './matchmaking/Matchmaker';
+import { dbStore } from './matchmaking/store';
+import { registerMatchmakingRest } from './matchmaking/rest';
 
 const SERVICE_VERSION = '0.1.0';
 
@@ -69,6 +72,12 @@ async function main(): Promise<void> {
     // The db is what lets it rehydrate an announcement posted by a PREVIOUS
     // process (see discordAnnounce's ensureState).
     configureDiscordAnnounce(config, app.log, db);
+
+    // The quick-match queue (src/matchmaking). Its frames ride the global socket; its log lines
+    // go to the server log so a match that never formed can be traced.
+    const matchmaker = new Matchmaker(dbStore(ctx), globalChat, undefined, (m) => app.log.info(m));
+    ctx.matchmaker = matchmaker;
+    globalChat.attachMatchmaker(matchmaker);
 
     // One line that says whether recordings can be kept, so a deploy that forgot the
     // REPLAY_S3_* variables is visible in the journal instead of only as 503s in the launcher.
@@ -199,6 +208,7 @@ async function main(): Promise<void> {
     registerTournamentsRest(app, ctx);
     registerTeamsRest(app, ctx);
     registerUsersRest(app, ctx);
+    registerMatchmakingRest(app, ctx);
 
     // /me — current user + ELO snapshot. Requires auth.
     //

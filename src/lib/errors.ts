@@ -111,6 +111,12 @@ export const Errors = {
         'tournament_not_participant',
         'This room belongs to a tournament match between two other players.',
     ),
+    // A room the quick-match queue opened admits only the two players it matched.
+    NotMatchParticipant: () => new HttpError(
+        403,
+        'not_match_participant',
+        'This room was opened for a quick match between two other players.',
+    ),
     TournamentClosed: () => new HttpError(
         409,
         'tournament_closed',
