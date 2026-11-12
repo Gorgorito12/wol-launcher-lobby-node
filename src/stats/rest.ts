@@ -26,7 +26,30 @@ import type { AppContext } from '../context';
  */
 
 /**
-n
+ * Rated matches needed to be RANKED on the 1v1 ladder: the end of placement (src/elo/placement.ts).
+ *
+ * <p>Kept under this name because the payload has always carried it as `min_decided`, and every
+ * launcher prints it in the ladder's empty state ("it takes N rated matches to enter"). With
+ * placement that sentence is finally true as written. The team ladder's requirement is
+ * `placement_required.team` (5).</p>
+ *
+ * <p>Its history, for whoever is tempted to move it: it went 3 → 5 → 1 → 5 → 1 while the ladder
+ * was ordered by `rating − 2·rd`, which sank a newcomer on its own. Ordered by rating, a newcomer
+ * with three lucky wins WOULD top the table, and placement is what stops that now: nobody is
+ * ranked until his rating has had ten matches to settle.</p>
+ */
+export const MIN_DECIDED = PLACEMENT_REQUIRED.default;
+
+/**
+ * The ladder is ordered by RATING, highest first — the number every player is shown.
+ *
+ * <p>It used to be `rating − 2·rd`, Glicko-2's conservative estimate, because a newcomer with a
+ * few lucky wins otherwise landed above the regulars, and the price was a rating column that did
+ * not descend. Placement removes the cause instead: nobody is ranked before ten rated matches
+ * (five in teams), so the table can simply be sorted by the number it prints.</p>
+ *
+ * <p>The `user_id` tiebreak is load-bearing: {@link ladderRanks} computes the same position in a
+ * second query, and two players on the same rating must come back in the same order from both.</p>
  */
 export const LADDER_ORDER_BY = 'e.rating DESC, e.user_id ASC';
 
@@ -552,7 +575,9 @@ interface TopMapRow { map_name: string; n: number }
  * same pair for launchers that read seasons, because there is now one season, forever. NULL
  * `rating_mode` means a row written before migration 0010, all of which were 1v1.</p>
  *
-
+ * <p>`rd` is grown to now (an inactive player's uncertainty keeps rising), and `inactive` says
+ * whether the player has gone thirty days without a rated match on this ladder. He keeps his
+ * place.</p>
  */
 async function ladder(
     ctx: AppContext,
@@ -737,6 +762,30 @@ export async function ladderSize(
 }
 
 /**
+ * A player's decided RATED matches on each ladder, all time. Key: the mode. What the legacy
+ * `season_wins`/`season_losses` fields carry now that there is a single, endless season.
+ */
+export async function ratedRecordFor(
+    ctx: AppContext,
+    userId: string,
+): Promise<Map<RatingMode, { wins: number; losses: number }>> {
+    const rows = await ctx.db.prepare(
+        `SELECT COALESCE(m.rating_mode, 'default') AS mode,
+                SUM(CASE WHEN p.result >= ? THEN 1 ELSE 0 END) AS wins,
+                SUM(CASE WHEN p.result <= ? THEN 1 ELSE 0 END) AS losses
+           FROM match_participants p JOIN matches m ON m.id = p.match_id
+          WHERE p.user_id = ? AND m.rated = 1
+          GROUP BY mode`,
+    ).bind(WIN_AT, LOSS_AT, userId).all<{ mode: string; wins: number | null; losses: number | null }>();
+    const out = new Map<RatingMode, { wins: number; losses: number }>();
+    for (const r of rows.results ?? []) {
+        out.set(r.mode === 'team' ? 'team' : 'default', { wins: r.wins ?? 0, losses: r.losses ?? 0 });
+    }
+    return out;
+}
+
+/** The app context, for the highlights memo (set once when the routes are registered). */
+let statsCtx: AppContext | null = null;
 
 export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
     statsCtx = ctx;
@@ -800,7 +849,22 @@ export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
             // of the multiplayer notes: the community strip is one endpoint, because the
             // request budget is per IP and shared behind a Radmin NAT — a second route would
             // cost double for a page nobody asked twice for.
-
+            // Ranked players only, by rating. The players still being PLACED ride the same payload
+            // in their own arrays, listed after the table by the launcher: an older launcher reads
+            // `rank` as a non-nullable int, so a placement row inside `leaderboard` would make it
+            // throw on the whole payload.
+            const [leaderboard, leaderboard_team, ranked_players, ranked_players_team,
+                leaderboard_placement, leaderboard_team_placement,
+                placement_players, placement_players_team] =
+                await Promise.all([
+                    ladder(ctx, 'default', limit),
+                    ladder(ctx, 'team', limit),
+                    ladderSize(ctx, 'default'),
+                    ladderSize(ctx, 'team'),
+                    placementLadder(ctx, 'default', MAX_LIMIT),
+                    placementLadder(ctx, 'team', MAX_LIMIT),
+                    placementSize(ctx, 'default'),
+                    placementSize(ctx, 'team'),
                 ]);
             // Without the top lists: every launcher asks for this payload once a minute, and only
             // the ranking's Highlights view needs them (GET /stats/highlights).
@@ -987,7 +1051,14 @@ export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
                 // reads these; a launcher older than them shows the rank alone.
                 ranked_players,
                 ranked_players_team,
-
+                // The players still being placed, most matches first, then by name. Never their
+                // results: other players see only their progress.
+                leaderboard_placement,
+                leaderboard_team_placement,
+                placement_players,
+                placement_players_team,
+                // This month so far, and the last one (design 55l). Null on failure.
+                monthly_highlights,
                 // Which mod this whole payload is about, echoed back. The launcher draws it beside
                 // the figures; without it a cached page and a fresh one are indistinguishable.
                 mod: mod,

@@ -41,7 +41,9 @@ export function normalizeBadgeMode(raw: unknown): BadgeMode {
  * <p>Built on {@link LADDER_WHERE}, never restating it: "may wear the team badge" and "is on the
  * team ladder" must be the SAME question, or the selector would unlock a badge the ladder then
  * draws as Discovery (or lock one it draws in colour). A team match only rates once both sides'
-
+ * readings agree; with placement, it means "has finished team placement" (5 rated team
+ * matches), which is exactly when the team badge stops reading as Discovery.</p>
+ *
  * <p>Binds: `'team'`, the team placement requirement, the user id.</p>
  *
  * <p><b>A function, not a constant, and that is load-bearing:</b> `stats/rest` → `matches/rest`
