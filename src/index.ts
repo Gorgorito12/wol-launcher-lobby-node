@@ -4,9 +4,10 @@ import { launcherVersionOf } from './middleware/auth.js';
 import cors from '@fastify/cors';
 import websocket from '@fastify/websocket';
 import { join } from 'node:path';
-import { mkdirSync } from 'node:fs';
 import { loadConfig } from './env';
 import { Db } from './db';
+import { effectiveRatings } from './elo/ladder';
+import { requestIpHash } from './lib/ipHash';
 import { KvStore } from './kv';
 import { LobbyRoomRegistry, attachGlobalChat } from './lobbies/LobbyRoom';
 import { GlobalChatRoom } from './global/GlobalChatRoom';
@@ -16,22 +17,27 @@ import { readAuth, requireAuth, safeRead } from './middleware/auth';
 import { circuitBreaker, readGlobalCount } from './middleware/circuitBreaker';
 import { ipRateLimit, Limits } from './middleware/rateLimit';
 import { registerDiscordAuth } from './auth/discord';
+import { registerSessionRefresh } from './auth/session';
 import { registerLobbiesRest } from './lobbies/rest';
 import { configure as configureDiscordAnnounce } from './lobbies/discordAnnounce';
 import { scheduleOrphanLobbySweep } from './lobbies/orphanSweep';
 import { registerMatchesRest } from './matches/rest';
+import { registerMatchesBrowse } from './matches/browse';
 import { registerStatsRest } from './stats/rest';
 import { registerTournamentsRest } from './tournaments/rest';
 import { registerTeamsRest } from './teams/rest';
 import { registerUsersRest } from './users/rest';
 import { sweepStaleTournaments } from './tournaments/sweep';
+import { maybePostMonthlyHighlights } from './stats/highlightsAnnounce';
 import { registerReplaysRest } from './replays/rest';
+import { Matchmaker } from './matchmaking/Matchmaker';
+import { dbStore } from './matchmaking/store';
+import { registerMatchmakingRest } from './matchmaking/rest';
 
 const SERVICE_VERSION = '0.1.0';
 
 async function main(): Promise<void> {
     const config = loadConfig();
-    mkdirSync(config.replaysDir, { recursive: true });
 
     // ----- Storage -----
     const db = new Db(config.dbPath);
@@ -58,7 +64,7 @@ async function main(): Promise<void> {
         // Trust the first hop's x-forwarded-for so rate limits attribute
         // to the real client behind nginx.
         trustProxy: true,
-        bodyLimit: 1 * 1024 * 1024, // 1 MB default; replays override per-route
+        bodyLimit: 1 * 1024 * 1024, // 1 MB; recordings never come through here (see src/replays/rest.ts)
     });
 
     // Share config + logger + db with the Discord room-announcement module so the
@@ -66,6 +72,20 @@ async function main(): Promise<void> {
     // The db is what lets it rehydrate an announcement posted by a PREVIOUS
     // process (see discordAnnounce's ensureState).
     configureDiscordAnnounce(config, app.log, db);
+
+    // The quick-match queue (src/matchmaking). Its frames ride the global socket; its log lines
+    // go to the server log so a match that never formed can be traced.
+    const matchmaker = new Matchmaker(dbStore(ctx), globalChat, undefined, (m) => app.log.info(m));
+    ctx.matchmaker = matchmaker;
+    globalChat.attachMatchmaker(matchmaker);
+
+    // One line that says whether recordings can be kept, so a deploy that forgot the
+    // REPLAY_S3_* variables is visible in the journal instead of only as 503s in the launcher.
+    if (config.replayStorage) {
+        app.log.info(`Replay storage: bucket ${config.replayStorage.bucket} (${config.replayStorage.region})`);
+    } else {
+        app.log.info('Replay storage: disabled (REPLAY_S3_* not set)');
+    }
 
     // CORS — open like the Worker. The launcher is the only intended
     // client, but leaving CORS open keeps a future status page on a
@@ -178,26 +198,31 @@ async function main(): Promise<void> {
     app.addHook('preHandler', circuitBreaker(ctx));
 
     registerDiscordAuth(app, ctx);
+    // POST /auth/refresh — renews the 7-day session token (src/auth/session.ts).
+    registerSessionRefresh(app, ctx);
     registerLobbiesRest(app, ctx);
     registerMatchesRest(app, ctx);
+    registerMatchesBrowse(app, ctx);
     registerReplaysRest(app, ctx);
     registerStatsRest(app, ctx);
     registerTournamentsRest(app, ctx);
     registerTeamsRest(app, ctx);
     registerUsersRest(app, ctx);
+    registerMatchmakingRest(app, ctx);
 
     // /me — current user + ELO snapshot. Requires auth.
+    //
+    // The 1v1 rating, through the same helper every other surface and the engine read.
     app.get('/me', { preHandler: [requireAuth()] }, async (req, _reply) => {
         const u = await db.prepare(
             `SELECT u.id, u.discord_username, u.display_name, u.avatar_url, u.created_at,
-                    u.badge_mode,
-                    e.rating, e.rd, e.games_played
+                    u.badge_mode
              FROM users u
-             LEFT JOIN elo_ratings e ON e.user_id = u.id AND e.mode = 'default'
              WHERE u.id = ?`,
-        ).bind(req.userId!).first();
+        ).bind(req.userId!).first<Record<string, unknown>>();
         if (!u) throw Errors.NotFound('User');
-        return u;
+        const elo = (await effectiveRatings(db, [req.userId!], 'default')).get(req.userId!);
+        return { ...u, rating: elo?.rating ?? null, rd: elo?.rd ?? null, games_played: elo?.games_played ?? 0 };
     });
 
     // ----- WebSocket: per-lobby room -----
@@ -228,7 +253,9 @@ async function main(): Promise<void> {
         }
 
         const room = rooms.getOrCreate(lobbyId, lobby.host_user_id);
-        room.handleConnection(socket, ctx);
+        // The address it came from, hashed, recorded by the room once the hello proves who
+        // this is (src/lib/ipHash.ts).
+        room.handleConnection(socket, ctx, { ipHash: requestIpHash(ctx, req) });
     });
 
     // ----- WebSocket: process-wide global chat -----
@@ -283,6 +310,9 @@ async function main(): Promise<void> {
     // only tidiness — the list and both creation caps already ignore stale rows, so this
     // just makes the stored status agree with what players already see.
     void sweepStaleTournaments(ctx, app.log);
+    // The monthly highlights may be due on Discord (the 1st, early): startup is one of the
+    // moments the lazy trigger looks, since the server has no timers.
+    void maybePostMonthlyHighlights(ctx, app.log);
 
     // ----- Graceful shutdown -----
     const shutdown = async (signal: string): Promise<void> => {

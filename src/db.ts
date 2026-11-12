@@ -133,6 +133,33 @@ export class Db {
         return { applied };
     }
 
+    /**
+     * Run `fn` inside ONE transaction (`BEGIN IMMEDIATE` … `COMMIT`, or `ROLLBACK` on a throw).
+     *
+     * <p>For the ladder replay: it deletes every rating and rebuilds them one match at a time, and
+     * another process (the server, while an operator runs `admin.ts … --apply`) must never read
+     * the half-built state. Under WAL a reader in another connection sees the snapshot from
+     * before `BEGIN` until `COMMIT`. A `batch()` inside it becomes a savepoint (better-sqlite3
+     * nests transactions that way).</p>
+     *
+     * <p>`fn` must do nothing genuinely asynchronous. Every call on this class resolves
+     * synchronously, so awaiting them yields only to the microtask queue and no other request
+     * handler can interleave its writes into this transaction. A real `await` on I/O inside it
+     * would break that. Nested calls run `fn` in the outer transaction.</p>
+     */
+    async transaction<T>(fn: () => Promise<T>): Promise<T> {
+        if (this.inner.inTransaction) return fn();
+        this.inner.exec('BEGIN IMMEDIATE');
+        try {
+            const out = await fn();
+            this.inner.exec('COMMIT');
+            return out;
+        } catch (err) {
+            if (this.inner.inTransaction) this.inner.exec('ROLLBACK');
+            throw err;
+        }
+    }
+
     /** Raw access for the KV layer and ad-hoc queries. Use sparingly. */
     raw(): Database.Database { return this.inner; }
 

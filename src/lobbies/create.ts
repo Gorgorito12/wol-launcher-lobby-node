@@ -7,8 +7,8 @@
  * A tournament match is played in an ordinary competitive room. The alternative to this
  * extraction was a second creation path in the tournaments route, and a second path is
  * how the two come to disagree: this one force-closes the host's previous room, checks
- * the server-wide budget, clamps `competitive` against the ranked-mod list AND the 2/4/6
- * size rule, pre-creates the in-memory room so the host's socket doesn't race, and
+ * the server-wide budget, clamps `competitive` against the ranked-mod list (every mod
+ * unless RANKED_MOD_IDS narrows it) AND the 2/4/6 size rule, pre-creates the in-memory room so the host's socket doesn't race, and
  * announces to two different channels. Any of those quietly missing from a tournament
  * room would be a bug nobody sees until a real match.
  *
@@ -30,6 +30,8 @@
 import { Errors } from '../lib/errors';
 import { shortId, sha256Hex } from '../lib/ids';
 import { announceLobbyCreated, finalizeRoom } from './discordAnnounce';
+import { noteLobbiesChanged } from '../global/lobbiesChanged';
+import { isRankedMod } from '../elo/ratability';
 import type { AppContext } from '../context';
 
 /**
@@ -89,8 +91,18 @@ export function playingSeatsOf(maxPlayers: number, spectatorSlots: number): numb
     return maxPlayers - (spectatorSlots > 0 ? spectatorSlots : 0);
 }
 
+/** An ordinary room's title limit — what `POST /lobbies` and a rename have always allowed. */
+export const ORDINARY_TITLE_MAX = 80;
+
 export interface CreateLobbyInput {
     title: string;
+    /**
+     * The longest title this room may carry. Absent means the ordinary 80; only the
+     * tournament route passes more, because its title is composed by the SERVER from the
+     * tournament, the round and both entrants, and cutting it at 80 cut the second entrant's
+     * name (src/tournaments/roomTitle.ts).
+     */
+    titleMax?: number;
     modId: string;
     modCombinedHash: string;
     maxPlayers?: number;
@@ -114,6 +126,12 @@ export interface CreateLobbyInput {
      * claim that whatever it just played was a tournament match.
      */
     tournamentMatchId?: string | null;
+    /**
+     * The quick-match proposal this room plays out, or null. Only the Matchmaker passes it
+     * (src/matchmaking/store.ts). Like the tournament binding, it makes the join admit only
+     * the matched players.
+     */
+    matchmakingMatchId?: string | null;
     /**
      * Whether to tell anybody. False for tournament rooms.
      *
@@ -147,6 +165,8 @@ export interface CreatedLobby {
     competitive: boolean;
     /** Null for an ordinary room. Additive: old launchers ignore it. */
     tournament_match_id: string | null;
+    /** Null for an ordinary room. Additive: old launchers ignore it. */
+    matchmaking: boolean;
 }
 
 export async function createLobby(
@@ -159,7 +179,7 @@ export async function createLobby(
     if (!input.title || !input.modId || !input.modCombinedHash) {
         throw Errors.BadRequest('title, mod_id and mod_combined_hash are required');
     }
-    const title = input.title.trim().slice(0, 80);
+    const title = input.title.trim().slice(0, Math.max(3, input.titleMax ?? ORDINARY_TITLE_MAX));
     if (title.length < 3) throw Errors.BadRequest('title too short');
 
     const maxPlayers = Math.min(
@@ -181,14 +201,14 @@ export async function createLobby(
 
     // Competitive is a PROMISE — only this room's matches score, and the launcher holds
     // the player to it (confirming Record Game, refusing to let the host leave before the
-    // result is in). A mod with no ladder cannot keep that promise, so the room is created
-    // casual instead of failing. The response echoes the EFFECTIVE value, which is how the
+    // result is in). Every mod shares the ladder unless the operator narrowed RANKED_MOD_IDS,
+    // and a mod outside that list cannot keep the promise, so the room is created casual
+    // instead of failing. The response echoes the EFFECTIVE value, which is how the
     // launcher explains the downgrade without holding a copy of the ranked-mod list —
     // that policy lives here and nowhere else.
     const askedCompetitive = input.askedCompetitive === true;
-    const modKey = input.modId.trim().toLowerCase();
     const competitive = askedCompetitive
-        && cfg.rankedModIds.some((m) => m === modKey)
+        && isRankedMod(cfg.rankedModIds, input.modId)
         && COMPETITIVE_SIZES.includes(playingSeats)
         ? 1 : 0;
 
@@ -196,6 +216,7 @@ export async function createLobby(
     const passwordHash = input.password ? await sha256Hex(input.password) : null;
     const isPrivate = passwordHash ? 1 : 0;
     const tournamentMatchId = input.tournamentMatchId ?? null;
+    const matchmakingMatchId = input.matchmakingMatchId ?? null;
 
     await ctx.db.batch([
         ctx.db.prepare(
@@ -204,11 +225,13 @@ export async function createLobby(
             // record of who actually opened it, which is what the Discord embed names.
             `INSERT INTO lobbies (id, host_user_id, created_by, title, mod_id, mod_combined_hash,
                                   max_players, current_players, is_private, password_hash,
-                                  status, competitive, tournament_match_id, spectator_slots)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'open', ?, ?, ?)`,
+                                  status, competitive, tournament_match_id, spectator_slots,
+                                  matchmaking_match_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'open', ?, ?, ?, ?)`,
         ).bind(
             lobbyId, userId, userId, title, input.modId, input.modCombinedHash,
             maxPlayers, isPrivate, passwordHash, competitive, tournamentMatchId, spectatorSlots,
+            matchmakingMatchId,
         ),
         ctx.db.prepare(
             `INSERT INTO lobby_members (lobby_id, user_id, role) VALUES (?, ?, 'player')`,
@@ -226,6 +249,9 @@ export async function createLobby(
     // and to Discord (only if a webhook is configured). BOTH skip private rooms, and both
     // skip rooms created with `announce: false`. Best-effort: the Discord one is never
     // awaited so it can't add latency, and each swallows its own errors internally.
+    // The launchers' room lists, private rooms included (the frame carries nothing).
+    noteLobbiesChanged();
+
     if (isPrivate === 0 && input.announce !== false) {
         const host = await ctx.db.prepare(
             `SELECT display_name, discord_username, avatar_url FROM users WHERE id = ?`,
@@ -264,6 +290,7 @@ export async function createLobby(
         status: 'open',
         competitive: competitive === 1,
         tournament_match_id: tournamentMatchId,
+        matchmaking: matchmakingMatchId !== null,
     };
 }
 

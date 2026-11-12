@@ -13,9 +13,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ratabilityReason, timingIsPlausible, isDecided, compareReadings,
-         canUpgradeFromConfirmation, matchShape, teamEvidenceMet,
+         canUpgradeFromConfirmation, matchShape, teamEvidenceMet, isRankedMod,
          MIN_DURATION_SECONDS } from './ratability';
 
+/** A NARROWED list on purpose: most cases below also prove that narrowing still works.
+ *  The default (`*`, every mod) has its own cases further down. */
 const RANKED = ['wol'];
 
 /** A clean, ranked, decided, COMPETITIVE 1v1 — the only shape that scores. */
@@ -40,8 +42,42 @@ test('a decided 1v1 on a ranked mod scores', () => {
     assert.equal(ratabilityReason(ok()), null);
 });
 
-test('a mod with no ladder never scores', () => {
+test('a mod outside a narrowed list never scores', () => {
     assert.equal(ratabilityReason(ok({ modId: 'improvement-mod' })), 'mod_not_ranked');
+});
+
+// THE DEFAULT. One shared ladder for every mod, including the base game and any mod the
+// catalog gains later. Before isRankedMod existed `*` was compared as a literal id and would
+// have ranked NOTHING — Wars of Liberty included — while looking like "rank everything".
+test('`*` ranks every mod, the base game and mods nobody has heard of yet', () => {
+    for (const mod of ['wol', 'improvement-mod', 'aoe3-tad', 'napoleonic-era', 'a-mod-added-next-year']) {
+        assert.equal(ratabilityReason(ok({ modId: mod, rankedModIds: ['*'] })), null, mod);
+    }
+});
+
+test('isRankedMod: `*` matches any real id, a list matches its own ids only', () => {
+    assert.equal(isRankedMod(['*'], 'improvement-mod'), true);
+    assert.equal(isRankedMod(['*'], 'aoe3-tad'), true);
+    assert.equal(isRankedMod(['wol'], ' WoL '), true);
+    assert.equal(isRankedMod(['wol', '*'], 'struggle-of-indonesia'), true);
+    assert.equal(isRankedMod(['wol'], 'improvement-mod'), false);
+});
+
+// The refusals: no list ranks nothing, and a report that names no mod is never ranked —
+// not even by `*`, which means "every mod", not "anything at all".
+test('isRankedMod: an empty list ranks nothing, and a missing mod id is never ranked', () => {
+    assert.equal(isRankedMod([], 'wol'), false);
+    assert.equal(isRankedMod(['*'], ''), false);
+    assert.equal(isRankedMod(['*'], '   '), false);
+    assert.equal(isRankedMod(['*'], null), false);
+    assert.equal(isRankedMod(['*'], undefined), false);
+});
+
+test('`*` does not bypass the other rules — a casual room on any mod still never scores', () => {
+    assert.equal(
+        ratabilityReason(ok({ modId: 'aoe3-tad', rankedModIds: ['*'], roomIsCompetitive: false })),
+        'not_competitive',
+    );
 });
 
 test('the mod id is matched case-insensitively', () => {
@@ -62,7 +98,7 @@ test('a report with no room still says so, rather than blaming competitiveness',
     );
 });
 
-test('an unranked mod outranks competitiveness — it is what you would have to change first', () => {
+test('a mod outside the list outranks competitiveness — it is what you would have to change first', () => {
     assert.equal(
         ratabilityReason(ok({ modId: 'improvement-mod', roomIsCompetitive: false })),
         'mod_not_ranked',

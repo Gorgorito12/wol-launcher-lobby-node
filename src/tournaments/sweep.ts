@@ -36,7 +36,7 @@ import type { FastifyBaseLogger } from 'fastify';
 import type { AppContext } from '../context';
 import { finalizeRoom } from '../lobbies/discordAnnounce';
 import { staleWhereClause } from './lifecycle';
-import { archiveStale, openLobbiesForTournament } from './store';
+import { archiveStale, deleteDue, openLobbiesForTournament } from './store';
 
 /**
  * Archive every stale tournament and close the rooms still bound to their matches.
@@ -49,6 +49,13 @@ export async function sweepStaleTournaments(
     log: FastifyBaseLogger,
 ): Promise<number> {
     try {
+        // First what is DUE FOR DELETION (2026-11-11): a draft untouched for a week, and a
+        // cancelled or abandoned tournament with no game played whose week is over. Never one
+        // with a game. Before archiving, so a stale draft is deleted rather than published as
+        // 'abandoned' - which used to make every forgotten draft a public row.
+        const deleted = await deleteDue(ctx.db);
+        if (deleted.length > 0) log.info({ tournaments: deleted.length }, 'deleted tournaments nobody played');
+
         // Collect the rooms BEFORE archiving. Afterwards the tournament is terminal and a
         // later reader would have no reason to go looking for its rooms.
         const doomed = await ctx.db.prepare(

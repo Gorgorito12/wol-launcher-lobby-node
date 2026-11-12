@@ -6,8 +6,18 @@ import { notifyRoomChanged, finalizeRoom } from './discordAnnounce';
 import { runFoundingHook } from '../matches/foundingHook';
 import { verifyCrash, normaliseRecordingOutcome, isNtstatusFailure } from '../elo/crashEvidence';
 import { DEFAULT_RATING, DEFAULT_RD } from '../elo/glicko2';
+import { effectiveRatings } from '../elo/ladder';
+import { isInPlacement } from '../elo/placement';
+import { membersFor, publicRatingsFor } from '../elo/placementPrivacy';
 import { ladderRanks } from '../stats/rest';
 import { normalizeBadgeMode } from '../users/badgeMode';
+import { recordIpHash } from '../lib/ipHash';
+import { ORDINARY_TITLE_MAX } from './create';
+import {
+    parseTeam, roomOdds, startRefusal, teamsAtStart, teamsEnforcedFor, validateTeamChange,
+    type RoomOdds, type TeamNo,
+} from './roomTeams';
+import { entrantSidesForMatch } from '../tournaments/store';
 import type { AppContext } from '../context';
 
 /**
@@ -43,25 +53,23 @@ export function attachGlobalChat(gc: { refreshPlayers(): void }): void {
  * number the client sent goes into `client_seconds`, which no verdict reads.</p>
  */
 /**
- * The hello's membership check, which also reads what the roster paints: the avatar, both
- * ladders' rating and deviation, and the badge preference (design handoff 51).
+ * The hello's membership check, which also reads the avatar and the badge preference (design
+ * handoff 51).
  *
- * <p><b>BOTH elo_ratings joins MUST stay LEFT.</b> A row here means "you are in this lobby", so
- * an inner join would throw everybody without a rating row out of the room with 4004
- * not_in_lobby — every player right after a ratings reset, and on the TEAM join every player
- * who has never played a rated team match, which today is nearly everyone. Exported so a test
- * can pin that.</p>
+ * <p><b>It carries NO rating join, and a test pins that.</b> A row here means "you are in this
+ * lobby", so anything joined into it decides who is let in. It used to LEFT JOIN the ratings
+ * table twice — LEFT because an inner join throws everybody without a rating row out with 4004.
+ * A join on a ratings table can only ever duplicate the member or, mis-bound, answer
+ * not_in_lobby for everyone. The ratings are read separately, through effectiveRatings, and a
+ * failure there costs a number on the roster, never the room.</p>
  *
  * <p>Binds: lobby id, user id.</p>
  */
 export const MEMBER_HELLO_SQL =
     `SELECT u.avatar_url AS avatar_url, u.badge_mode AS badge_mode,
-            e.rating AS rating, e.rd AS rd,
-            t.rating AS rating_team, t.rd AS rd_team
+            lm.role AS role, lm.team AS team
      FROM lobby_members lm
      JOIN users u ON u.id = lm.user_id
-     LEFT JOIN elo_ratings e ON e.user_id = lm.user_id AND e.mode = 'default'
-     LEFT JOIN elo_ratings t ON t.user_id = lm.user_id AND t.mode = 'team'
      WHERE lm.lobby_id = ? AND lm.user_id = ? LIMIT 1`;
 
 export const GAME_EXIT_INSERT_SQL =
@@ -116,6 +124,12 @@ interface AttachedSocket {
     /** Counts chat frames inside the current minute window for per-user throttling. */
     chatWindowStart: number;
     chatWindowCount: number;
+    /**
+     * What this launcher announced it understands in its hello (`features`). Only
+     * `room_teams` exists: a launcher that does not announce it cannot pick a team, so the
+     * room never demands one from it (src/lobbies/roomTeams.ts).
+     */
+    features: Set<string>;
 }
 
 interface MemberEntry {
@@ -181,6 +195,25 @@ interface MemberEntry {
      * 'highest' | '1v1' | 'team'. A snapshot at join, like everything else here.
      */
     badgeMode?: string;
+    /**
+     * Rated matches on each ladder, and whether the member is still being PLACED on it (fewer
+     * than 10 in 1v1 / 5 in teams). While he is, that ladder's rating above goes to HIM only —
+     * every frame that carries the roster out of this room passes it through
+     * src/elo/placementPrivacy.ts — and the others see "in placement 3/10"; he sees his own
+     * number with a "?" ("1534?"). A snapshot at join, like the rating beside it; absent when
+     * the lookup failed. The live roster always keeps every rating: the odds need them.
+     */
+    gamesPlayed?: number;
+    gamesPlayedTeam?: number;
+    inPlacement?: boolean;
+    inPlacementTeam?: boolean;
+    /** 'player' | 'spectator', from lobby_members. Spectators never have a team. */
+    role?: string;
+    /**
+     * Team 1 or 2 in a 2v2/3v3 room, or null while the member has not picked one. Chosen by the
+     * member, or set by the host (set_team / move_player); persisted in lobby_members.team.
+     */
+    team?: TeamNo | null;
 }
 
 interface ChatLine {
@@ -236,6 +269,23 @@ class LobbyRoom {
      * host), so this starts null and the first rename always goes through.
      */
     private lastTitle: string | null = null;
+    /**
+     * The room's shape, read once from the lobby row: how many PLAYING seats it has (which says
+     * whether it has teams), and whether it is competitive. Null until the first hello.
+     */
+    private info: {
+        playingSeats: number;
+        competitive: boolean;
+        /** The bracket slot this room plays out, or null for an ordinary room. */
+        tournamentMatchId: string | null;
+        /**
+         * A tournament room's sides, from the bracket's frozen rosters (entrant 1 → Team 1).
+         * Null for an ordinary room. When set, the server seats everybody and nobody moves.
+         */
+        sides: Record<string, TeamNo> | null;
+    } | null = null;
+    /** The IP hash each socket arrived with, recorded once its hello proves who it is. */
+    private pendingIp = new Map<WebSocket, string | null>();
 
     constructor(lobbyId: string, hostUserId: string) {
         this.lobbyId = lobbyId;
@@ -256,7 +306,8 @@ class LobbyRoom {
      * 'message'/'close'/'error', everything else flows through the
      * handler methods that the DO had.
      */
-    handleConnection(ws: WebSocket, ctx: AppContext): void {
+    handleConnection(ws: WebSocket, ctx: AppContext, opts: { ipHash?: string | null } = {}): void {
+        this.pendingIp.set(ws, opts.ipHash ?? null);
         ws.on('message', async (raw, _isBinary) => {
             let frame: unknown;
             try {
@@ -273,6 +324,7 @@ class LobbyRoom {
         });
 
         ws.on('close', () => {
+            this.pendingIp.delete(ws);
             const attached = this.attached.get(ws);
             this.attached.delete(ws);
             if (!attached) return;
@@ -281,6 +333,8 @@ class LobbyRoom {
                 delete this.members[attached.userId];
             }
             this.broadcast({ type: 'member_left', user_id: attached.userId }, ws);
+            // One player fewer changes the odds (and may empty a team).
+            this.broadcastOdds();
             // An abrupt close (crash / alt-F4 / dropped connection) never hits
             // REST /leave, so do the DB bookkeeping here that /leave normally
             // does — for ANYONE, not just the host: a leftover lobby_members row
@@ -293,6 +347,7 @@ class LobbyRoom {
 
         ws.on('error', () => {
             this.attached.delete(ws);
+            this.pendingIp.delete(ws);
         });
     }
 
@@ -342,6 +397,13 @@ class LobbyRoom {
                 break;
             case 'set_ingame_name':
                 this.handleSetInGameName(attached, f);
+                break;
+            case 'set_team':
+                await this.handleSetTeam(ws, ctx, attached, attached.userId, f.team);
+                break;
+            case 'move_player':
+                await this.handleSetTeam(
+                    ws, ctx, attached, typeof f.user_id === 'string' ? f.user_id : '', f.team);
                 break;
             case 'kick':
                 this.handleKick(ws, attached, f);
@@ -411,21 +473,14 @@ class LobbyRoom {
             return;
         }
 
-        // Verify membership AND fetch the avatar AND the rating in one query, so the
-        // roster can paint the member's real Discord photo and their ELO
-        // (room_state/member_joined) without a single extra round-trip.
-        //
-        // The elo_ratings join MUST stay a LEFT JOIN. This query is also the
-        // membership check — a row means "you are in this lobby" — so an inner join
-        // would throw out of the room, with 4004 not_in_lobby, everyone who has no
-        // rating row yet. Right after a ratings reset that is every single player.
+        // Verify membership AND fetch the avatar in one query. The ratings are NOT in it: this
+        // query is the membership check, and see MEMBER_HELLO_SQL for why nothing about ratings
+        // may decide who gets in.
         const member = await ctx.db.prepare(MEMBER_HELLO_SQL).bind(this.lobbyId, userId).first<{
             avatar_url: string | null;
             badge_mode: string | null;
-            rating: number | null;
-            rd: number | null;
-            rating_team: number | null;
-            rd_team: number | null;
+            role: string | null;
+            team: number | null;
         }>();
         if (!member) {
             this.sendError(ws, 'not_in_lobby', 'You are not a member of this lobby');
@@ -441,18 +496,53 @@ class LobbyRoom {
         ).bind(this.lobbyId, userId).run().catch(() => { /* best-effort */ });
 
         const avatarUrl = member.avatar_url ?? undefined;
-        // No row means unrated, and unrated IS the starting rating — see the note on
-        // Member.rating. One place covers both frames below, since room_state sends
-        // this.members as-is and member_joined reuses these two.
-        const rating = member.rating ?? DEFAULT_RATING;
-        const rd = member.rd ?? DEFAULT_RD;
+        // The ratings, through the same helper the engine reads (src/elo/ladder.ts): no row means
+        // unrated, which IS the starting 1500/500, and the deviation is grown to now. A failure
+        // leaves them undefined, so both frames omit them and the launcher shows no number: that
+        // costs a figure on the roster, never the room.
+        let rating: number | undefined;
+        let rd: number | undefined;
+        let ratingTeam: number | undefined;
+        let rdTeam: number | undefined;
+        let gamesPlayed: number | undefined;
+        let gamesPlayedTeam: number | undefined;
+        try {
+            const [solo, team] = await Promise.all([
+                effectiveRatings(ctx.db, [userId], 'default'),
+                effectiveRatings(ctx.db, [userId], 'team'),
+            ]);
+            rating = solo.get(userId)?.rating ?? DEFAULT_RATING;
+            rd = solo.get(userId)?.rd ?? DEFAULT_RD;
+            gamesPlayed = solo.get(userId)?.games_played ?? 0;
+            ratingTeam = team.get(userId)?.rating ?? DEFAULT_RATING;
+            rdTeam = team.get(userId)?.rd ?? DEFAULT_RD;
+            gamesPlayedTeam = team.get(userId)?.games_played ?? 0;
+        } catch {
+            // See above.
+        }
         // Never throws; undefined when it could not be worked out, so both frames omit it.
-        const ladderRank = (await ladderRanks(ctx, [userId])).get(userId);
-        // The team ladder (design handoff 51), defaulted and omitted the same way.
-        const ratingTeam = member.rating_team ?? DEFAULT_RATING;
-        const rdTeam = member.rd_team ?? DEFAULT_RD;
+        const ladderRank = (await ladderRanks(ctx, [userId], 'default')).get(userId);
+        // The team ladder (design handoff 51), omitted the same way.
         const ladderRankTeam = (await ladderRanks(ctx, [userId], 'team')).get(userId);
         const badgeMode = normalizeBadgeMode(member.badge_mode);
+        const role = member.role === 'spectator' ? 'spectator' : 'player';
+        await this.loadInfo(ctx);
+        // In a tournament room the side is not a choice: it is the player's entrant, and the
+        // server seats him there whatever the row said (and writes it down, so a reconnect or
+        // a restart finds the same answer).
+        const lockedSide = role === 'spectator' ? null : (this.info?.sides?.[userId] ?? null);
+        const team = role === 'spectator' ? null : (lockedSide ?? parseTeam(member.team) ?? null);
+        if (lockedSide !== null && parseTeam(member.team) !== lockedSide) {
+            void ctx.db.prepare(
+                `UPDATE lobby_members SET team = ? WHERE lobby_id = ? AND user_id = ?`,
+            ).bind(lockedSide, this.lobbyId, userId).run().catch(() => { /* best-effort */ });
+        }
+
+        // What this launcher understands. Absent on every launcher older than room teams.
+        const features = new Set<string>(
+            Array.isArray(frame.features)
+                ? (frame.features as unknown[]).filter((x): x is string => typeof x === 'string').slice(0, 16)
+                : []);
 
         const now = Date.now();
         this.attached.set(ws, {
@@ -461,7 +551,11 @@ class LobbyRoom {
             lastFrameAt: now,
             chatWindowStart: now,
             chatWindowCount: 0,
+            features,
         });
+        // Proven who it is: now the address it came from may be remembered (hashed; see ipHash).
+        void recordIpHash(ctx, this.lobbyId, userId, this.pendingIp.get(ws) ?? null);
+        this.pendingIp.delete(ws);
 
         const existing = this.members[userId];
         this.members[userId] = {
@@ -477,16 +571,35 @@ class LobbyRoom {
             rdTeam,
             ladderRankTeam,
             badgeMode,
+            gamesPlayed,
+            gamesPlayedTeam,
+            inPlacement: gamesPlayed === undefined ? undefined : isInPlacement(gamesPlayed, 'default'),
+            inPlacementTeam: gamesPlayedTeam === undefined ? undefined : isInPlacement(gamesPlayedTeam, 'team'),
+            role,
+            team,
         };
 
         this.send(ws, {
             type: 'room_state',
             lobby_id: this.lobbyId,
             host_user_id: this.hostUserId,
-            members: this.members,
+            // As THIS recipient may see them: a member still being placed on a ladder reaches
+            // nobody else with that ladder's number (src/elo/placementPrivacy.ts). A copy — the
+            // live roster keeps every rating, since the odds and the next recipient need them.
+            members: membersFor(this.members, userId),
             chat: this.chatRing,
+            // The odds as they stand; a launcher older than room teams ignores the key.
+            odds: this.currentOdds(),
+            // A tournament room: the sides are the entrants and nobody may change them. The
+            // launcher locks its team picker on THIS, never on merely being a tournament room,
+            // so a newer launcher against an older server still lets players pick.
+            ...(this.info?.sides ? { teams_locked: true } : {}),
         });
-        this.broadcast({
+        const m = this.members[userId]!;
+        // Everybody BUT the member who joined receives this, so a ladder he is still being placed
+        // on goes without its number (src/elo/placementPrivacy.ts). His own room_state above
+        // carried it.
+        this.broadcast(publicRatingsFor(userId, {
             type: 'member_joined',
             user_id: userId,
             discord_username: login,
@@ -498,7 +611,127 @@ class LobbyRoom {
             rd_team: rdTeam,
             ladder_rank_team: ladderRankTeam,
             badge_mode: badgeMode,
-        }, ws);
+            games_played: m.gamesPlayed,
+            games_played_team: m.gamesPlayedTeam,
+            in_placement: m.inPlacement,
+            in_placement_team: m.inPlacementTeam,
+            role,
+            team,
+        }), ws);
+        this.broadcastOdds(ws);
+    }
+
+    // ---------- room teams -----------------------------------------
+
+    /** Read the room's shape once. Best-effort: on failure the room simply has no teams. */
+    private async loadInfo(ctx: AppContext): Promise<void> {
+        if (this.info) return;
+        try {
+            const row = await ctx.db.prepare(
+                `SELECT max_players, spectator_slots, competitive, tournament_match_id
+                   FROM lobbies WHERE id = ?`,
+            ).bind(this.lobbyId).first<{
+                max_players: number;
+                spectator_slots: number | null;
+                competitive: number;
+                tournament_match_id: string | null;
+            }>();
+            if (row) {
+                const tournamentMatchId = row.tournament_match_id ?? null;
+                // Both reads, or neither: a tournament room cached without its sides would
+                // behave like an ordinary one for the rest of its life. A failure here is
+                // retried by the next hello, because `info` stays null.
+                const sides = tournamentMatchId
+                    ? await entrantSidesForMatch(ctx.db, tournamentMatchId)
+                    : null;
+                this.info = {
+                    playingSeats: Math.max(0, (row.max_players | 0) - (row.spectator_slots ?? 0)),
+                    competitive: row.competitive === 1,
+                    tournamentMatchId,
+                    sides: sides && Object.keys(sides).length > 0 ? sides : null,
+                };
+            }
+        } catch {
+            // best-effort
+        }
+    }
+
+    private playersInRoom(): Array<{ id: string } & MemberEntry> {
+        return Object.entries(this.members)
+            .filter(([, m]) => m.role !== 'spectator')
+            .map(([id, m]) => ({ id, ...m }));
+    }
+
+    /** The win probability the room shows (src/lobbies/roomTeams.ts). */
+    private currentOdds(): RoomOdds {
+        return roomOdds(this.info?.playingSeats ?? 0, this.playersInRoom());
+    }
+
+    /** Everyone hears the odds again; called whenever a player arrives, leaves or moves. */
+    private broadcastOdds(exclude: WebSocket | null = null): void {
+        this.broadcast({ type: 'room_odds', ...this.currentOdds() }, exclude);
+    }
+
+    /** Whether every PLAYER in the room is connected with a launcher that announced `room_teams`. */
+    private everyoneUnderstandsTeams(): boolean {
+        const players = this.playersInRoom().map((p) => p.id);
+        if (players.length === 0) return false;
+        const understands = new Set<string>();
+        for (const a of this.attached.values()) {
+            if (a.features.has('room_teams')) understands.add(a.userId);
+        }
+        return players.every((id) => understands.has(id));
+    }
+
+    /** Whether the HOST is connected with a launcher that announced `room_teams`. */
+    private hostUnderstandsTeams(): boolean {
+        for (const a of this.attached.values()) {
+            if (a.userId === this.hostUserId && a.features.has('room_teams')) return true;
+        }
+        return false;
+    }
+
+    /**
+     * `set_team` (a member's own side) and `move_player` (the host moves anybody). Validated by
+     * the pure rule, persisted in lobby_members.team, then broadcast with the new odds.
+     */
+    private async handleSetTeam(
+        ws: WebSocket,
+        ctx: AppContext,
+        attached: AttachedSocket,
+        targetId: string,
+        rawTeam: unknown,
+    ): Promise<void> {
+        await this.loadInfo(ctx);
+        const team = parseTeam(rawTeam);
+        const err = validateTeamChange({
+            actorId: attached.userId,
+            hostId: this.hostUserId,
+            targetId,
+            team,
+            playingSeats: this.info?.playingSeats ?? 0,
+            members: this.members,
+            inGame: this.startedAtMs !== null,
+            lockedSides: this.info?.sides ?? null,
+        });
+        if (err) {
+            this.sendError(ws, err, err === 'tournament_side_locked'
+                ? 'In a tournament room every player plays on the side of his own team.'
+                : `Team change refused: ${err}`);
+            return;
+        }
+        const target = this.members[targetId]!;
+        if (target.team === team) return;
+        target.team = team ?? null;
+        try {
+            await ctx.db.prepare(
+                `UPDATE lobby_members SET team = ? WHERE lobby_id = ? AND user_id = ?`,
+            ).bind(team ?? null, this.lobbyId, targetId).run();
+        } catch {
+            // The in-memory room is what the players see; a failed write only loses persistence.
+        }
+        this.broadcast({ type: 'member_team', user_id: targetId, team: team ?? null, by: attached.userId }, null);
+        this.broadcastOdds();
     }
 
     private async handleChat(
@@ -689,23 +922,49 @@ class LobbyRoom {
             this.sendError(ws, 'forbidden', 'Only the host can start the game');
             return;
         }
+        // A competitive room starts only when it is full and, with teams, when every player has
+        // a side and the sides are even — checked in that order, and the launcher shows the same
+        // reason before the button is even pressed. See roomTeams.startRefusal for who it binds.
+        await this.loadInfo(ctx);
+        const players = this.playersInRoom();
+        const playingSeats = this.info?.playingSeats ?? 0;
+        const teamsEnforced = teamsEnforcedFor(!!this.info?.sides, this.everyoneUnderstandsTeams());
+        const refusal = startRefusal({
+            competitive: this.info?.competitive ?? false,
+            playingSeats,
+            players: players.map((p) => ({ id: p.id, team: p.team })),
+            hostUnderstands: this.hostUnderstandsTeams(),
+            teamsEnforced,
+        });
+        if (refusal) {
+            const { code, ...details } = refusal;
+            this.sendError(ws, code, 'The room cannot start yet', details);
+            return;
+        }
+        const teams = teamsAtStart(playingSeats, teamsEnforced,
+            players.map((p) => ({ id: p.id, team: p.team })));
         // Freeze the roster here, because this is the moment the question
         // "who played this match" has an answer. It cannot be asked later: REST
         // /leave deletes the lobby_members row, and the first person to leave after
         // a game is usually the one who lost, so by the time the host reports the
         // result the loser may no longer look like a member at all.
         const rosterAtStart = JSON.stringify(Object.keys(this.members));
+        // The teams are frozen beside it, for the same reason: the report compares the recording's
+        // sides with what the room promised (teams_mismatch), and lobby_members may be gone by then.
         await ctx.db.prepare(
             `UPDATE lobbies SET status = 'in_game', started_at = datetime('now'),
-                                ended_at = NULL, roster_at_start = ?
+                                ended_at = NULL, roster_at_start = ?, teams_at_start = ?
              WHERE id = ?`,
-        ).bind(rosterAtStart, this.lobbyId).run();
+        ).bind(rosterAtStart, teams ? JSON.stringify(teams) : null, this.lobbyId).run();
         this.startedAtMs = Date.now();
         const startsAtMs = this.startedAtMs + LobbyRoom.COUNTDOWN_MS;
         this.broadcast({
             type: 'game_countdown',
             starts_at_ms: startsAtMs,
             duration_ms: LobbyRoom.COUNTDOWN_MS,
+            // The line-ups everyone must pick in the game, for the countdown's reminder. Null
+            // for a 1v1, or a room whose teams were not chosen here.
+            teams,
         }, null);
     }
 
@@ -964,7 +1223,17 @@ class LobbyRoom {
             return;
         }
 
-        const title = String(frame.title ?? '').trim().slice(0, 80);
+        // A tournament room's title is composed by the server from the bracket — tournament,
+        // round, both entrants — and is how the two sides recognise their room. The host is
+        // one of those sides, so a rename would let one of them relabel the other's match.
+        await this.loadInfo(ctx);
+        if (this.info?.tournamentMatchId) {
+            this.sendError(ws, 'tournament_room_title',
+                'A tournament room keeps the name the tournament gave it.');
+            return;
+        }
+
+        const title = String(frame.title ?? '').trim().slice(0, ORDINARY_TITLE_MAX);
         if (title.length < 3) {
             this.sendError(ws, 'bad_title', 'title too short');
             return;
@@ -1166,13 +1435,27 @@ class LobbyRoom {
         this.broadcast(frame, null);
     }
 
+    /**
+     * Like {@link publish}, but each member gets the frame built FOR HIM. The match report needs
+     * it: a player still being placed must not reach the others with his rating
+     * (src/elo/placementPrivacy.ts), while he still sees his own. One serialisation per socket —
+     * a room holds a handful — and no idle kick: the room is closed right after anyway.
+     */
+    publishPerUser(build: (userId: string) => object): void {
+        for (const [ws, attached] of this.attached) {
+            if (ws.readyState !== 1 /* OPEN */) continue;
+            try { ws.send(JSON.stringify(build(attached.userId))); }
+            catch { this.attached.delete(ws); }
+        }
+    }
+
     private send(ws: WebSocket, frame: object): void {
         try { ws.send(JSON.stringify(frame)); }
         catch { /* socket dying */ }
     }
 
-    private sendError(ws: WebSocket, code: string, message: string): void {
-        this.send(ws, { type: 'error', code, message });
+    private sendError(ws: WebSocket, code: string, message: string, details?: object): void {
+        this.send(ws, details ? { type: 'error', code, message, details } : { type: 'error', code, message });
     }
 }
 
@@ -1212,6 +1495,11 @@ export class LobbyRoomRegistry {
      */
     publish(lobbyId: string, frame: object): void {
         this.rooms.get(lobbyId)?.publish(frame);
+    }
+
+    /** {@link LobbyRoom.publishPerUser}, if the room is still around. */
+    publishPerUser(lobbyId: string, build: (userId: string) => object): void {
+        this.rooms.get(lobbyId)?.publishPerUser(build);
     }
 
     close(lobbyId: string, code = 4006, reason = 'lobby_closed'): void {

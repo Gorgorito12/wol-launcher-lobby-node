@@ -2,15 +2,21 @@ import type { FastifyInstance } from 'fastify';
 import { Errors } from '../lib/errors';
 import { sha256Hex, uuid } from '../lib/ids';
 import { requireAuth, requireLauncherVersion } from '../middleware/auth';
-import { ipRateLimit, userRateLimit, Limits } from '../middleware/rateLimit';
+import { chargeIpQuota, ipRateLimit, userRateLimit, Limits } from '../middleware/rateLimit';
 import { finalizeRoom } from './discordAnnounce';
 import { runFoundingHook } from '../matches/foundingHook';
 import { createLobby } from './create';
+import { HOST_RADMIN_SQL, hostRadminIps, type HostRadminRow } from './hostRadmin';
 import { isEntrantMember } from '../tournaments/store';
 import { DEFAULT_RATING, DEFAULT_RD } from '../elo/glicko2';
+import { effectiveRatings, type EffectiveRating } from '../elo/ladder';
+import { isInPlacement } from '../elo/placement';
+import { publicRatingsFor } from '../elo/placementPrivacy';
+import { recordIpHash, requestIpHash } from '../lib/ipHash';
 import { ladderRanks } from '../stats/rest';
 import { normalizeBadgeMode } from '../users/badgeMode';
 import type { AppContext } from '../context';
+import { onLobbiesChanged } from '../global/lobbiesChanged';
 
 /**
  * The "one active lobby" guard: is this player a member of some OTHER room that is still
@@ -47,7 +53,14 @@ interface LobbyRow {
     competitive: number;
     /** The bracket slot this room plays out, or null. Written only by the tournament route. */
     tournament_match_id: string | null;
+    /** The quick-match proposal this room plays out, or null. Written only by the Matchmaker. */
+    matchmaking_match_id: string | null;
 }
+
+/** The tournament a room's bracket slot belongs to, for a window that opens with no other way to
+ *  know it. Null on an ordinary room, and on a slot whose tournament is gone. */
+export const ROOM_TOURNAMENT_ID_SQL =
+    `(SELECT tm.tournament_id FROM tournament_matches tm WHERE tm.id = l.tournament_match_id)`;
 
 interface CreateLobbyBody {
     title: string;
@@ -81,136 +94,235 @@ interface JoinLobbyBody {
 }
 
 /**
+ * The public rooms list. Exported so a test can pin that it carries NO rating join: the hosts'
+ * ratings are read separately through effectiveRatings, which also grows each deviation to now —
+ * something no join could do.
+ */
+export const LOBBY_LIST_SQL =
+    `SELECT l.id, l.host_user_id, l.title, l.mod_id, l.mod_combined_hash,
+            l.max_players, l.spectator_slots, l.current_players, l.is_private,
+            l.status, l.competitive, l.tournament_match_id, l.matchmaking_match_id,
+            ${ROOM_TOURNAMENT_ID_SQL} AS tournament_id,
+            -- Counted rather than denormalised, unlike current_players. This is read
+            -- once per row on a list capped at 100 and covered by lobby_members' own
+            -- primary key; a second denormalised counter would be a second thing that
+            -- can drift out of step with the roster, and the first one already has a
+            -- comment in LobbyRoom about never decrementing.
+            (SELECT COUNT(*) FROM lobby_members m
+              WHERE m.lobby_id = l.id AND m.role = 'spectator') AS spectators_present,
+            l.created_at, l.started_at, u.discord_username AS host_login, u.display_name AS host_name,
+            u.avatar_url AS host_avatar,
+            u.badge_mode AS host_badge_mode
+     FROM lobbies l
+     JOIN users u ON u.id = l.host_user_id
+     -- No rating join: the hosts' ratings are read below through effectiveRatings. A host
+     -- with no rating row would need the join LEFT or his room would vanish.
+     WHERE l.status IN ('open', 'locked', 'in_game')
+     ORDER BY l.created_at DESC
+     LIMIT 100`;
+
+/**
+ * How long one answer to GET /lobbies is served to everybody. Short on purpose: there is no
+ * push for list changes, so a room somebody just opened appears in other launchers at most
+ * this much later than it used to (the response already said max-age=5). What it buys is that
+ * a server full of launchers polling every 5 s costs one set of queries per window instead of
+ * one per launcher, and that a cached answer costs nobody any quota.
+ */
+const LOBBY_LIST_TTL_MS = 3_000;
+let lobbyListCache: { at: number; payload: unknown } | null = null;
+let lobbyListInFlight: Promise<unknown> | null = null;
+/**
+ * Bumped whenever a room changes (lobbies_changed). A build started before the change is neither
+ * cached nor handed to a request that arrived after it: that answer may not hold the new room.
+ */
+let lobbyListGeneration = 0;
+let lobbyListInFlightGeneration = -1;
+onLobbiesChanged(() => {
+    lobbyListCache = null;
+    lobbyListGeneration++;
+});
+
+/** The public room list, exactly as GET /lobbies has always answered it. */
+async function buildLobbyList(ctx: AppContext): Promise<unknown> {
+    const rows = await ctx.db.prepare(
+        LOBBY_LIST_SQL,
+    ).bind().all<{
+        id: string;
+        host_user_id: string;
+        title: string;
+        mod_id: string;
+        mod_combined_hash: string;
+        max_players: number;
+        spectator_slots: number;
+        spectators_present: number;
+        current_players: number;
+        is_private: number;
+        status: 'open' | 'locked' | 'in_game';
+        competitive: number;
+        tournament_match_id: string | null;
+        matchmaking_match_id: string | null;
+        tournament_id: string | null;
+        created_at: string;
+        started_at: string | null;
+        host_login: string;
+        host_name: string;
+        host_avatar: string | null;
+        host_badge_mode: string | null;
+    }>();
+
+    // The hosts' ladder positions, for the rank badge the rooms row draws in place of the
+    // avatar. One query for the whole page, and absent (not 0) when it failed, so the
+    // launcher draws no badge rather than a wrong one.
+    const hostIds = (rows.results ?? []).map((r) => r.host_user_id);
+    const hostRanks = await ladderRanks(ctx, hostIds, 'default');
+    // The team ladder too (design handoff 51b): a 2v2/3v3 room's row wears the host's TEAM
+    // badge, and a casual room's row the badge the host chose.
+    const hostTeamRanks = await ladderRanks(ctx, hostIds, 'team');
+
+    // The hosts' ratings, through the same helper the engine reads, the deviation grown to
+    // now. A failure sends no rating at all (null), never somebody's 1500: the launcher
+    // reads null as "unknown".
+    let hostSolo: Map<string, EffectiveRating> | null = null;
+    let hostTeam: Map<string, EffectiveRating> | null = null;
+    try {
+        [hostSolo, hostTeam] = await Promise.all([
+            effectiveRatings(ctx.db, hostIds, 'default'),
+            effectiveRatings(ctx.db, hostIds, 'team'),
+        ]);
+    } catch {
+        hostSolo = null;
+        hostTeam = null;
+    }
+
+    return {
+        lobbies: (rows.results ?? []).map((r) => ({
+            id: r.id,
+            title: r.title,
+            mod_id: r.mod_id,
+            mod_combined_hash: r.mod_combined_hash,
+            max_players: r.max_players,
+            // Seats that are not players. The launcher subtracts this before reading a
+            // format off the size, so a 2v2 with a caster is five seats and still a 2v2.
+            spectator_slots: r.spectator_slots,
+            // How many of current_players are watching. The row subtracts it to learn
+            // how many PLAYING seats are taken, which is what decides whether its button
+            // offers a seat at the game or a seat beside it.
+            spectators_present: r.spectators_present,
+            current_players: r.current_players,
+            is_private: r.is_private === 1,
+            status: r.status,
+            // Before joining, not after: this is what tells a player their rating is
+            // on the line and that leaving the room will not be free.
+            competitive: r.competitive === 1,
+            // Null for an ordinary room. Lets the rooms table show a tournament chip
+            // and hide Join from anyone who is not one of the two entrants.
+            tournament_match_id: r.tournament_match_id ?? null,
+            // Additive, like every field here: an older launcher ignores it.
+            tournament_id: r.tournament_id ?? null,
+            // A room the queue opened for two matched players. The launcher shows the QUICK
+            // MATCH chip and no Join, since only those two may enter. Additive.
+            matchmaking: r.matchmaking_match_id != null,
+            created_at: r.created_at,
+            // When the match under way began, for the row's "In game · 14 min". Only while it
+            // is under way: started_at is kept after a cancelled game (migration 0021).
+            started_at: r.status === 'in_game' ? (r.started_at ?? null) : null,
+            // A host still being PLACED on a ladder is listed without that ladder's rating:
+            // this body is one cached answer for every reader, so nobody but him may get it,
+            // and he takes his own from his standing (src/elo/placementPrivacy.ts). Omitted,
+            // never null — the progress (`games_played`, `in_placement`) still says why.
+            host: publicRatingsFor(r.host_user_id, {
+                id: r.host_user_id,
+                discord_username: r.host_login,
+                display_name: r.host_name,
+                avatar_url: r.host_avatar,
+                // No row means UNRATED, and unrated is the starting rating — the
+                // server is the only side that can tell that apart from "I could not
+                // answer", because it ran the query. Sending null for it made the
+                // rooms list show no rating at all for everybody, since the ratings
+                // reset left nobody with a row.
+                //
+                // The comment here used to claim the launcher substituted this value
+                // itself. It does not: RatingDisplay.ShouldShow is `rating.HasValue`.
+                // Filling it in on the client would be wrong anyway — it cannot tell
+                // an unrated player from a server that did not send the field.
+                rating: hostSolo ? (hostSolo.get(r.host_user_id)?.rating ?? DEFAULT_RATING) : null,
+                // The deviation goes WITH it, and without it the rating is ambiguous: the
+                // client had no way to tell a 1500 nobody has played for from one somebody
+                // landed on, so both read the same. Same default as the rating, for the
+                // same reason — a player with no row is unrated, which is what the default means.
+                rd: hostSolo ? (hostSolo.get(r.host_user_id)?.rd ?? DEFAULT_RD) : null,
+                // Position on the 1v1 ladder; 0 = below the entry bar (MIN_DECIDED).
+                ladder_rank: hostRanks.get(r.host_user_id),
+                // The same three for the TEAM ladder, defaulted the same way: no row means
+                // unrated, which is what the defaults mean.
+                ladder_rank_team: hostTeamRanks.get(r.host_user_id),
+                rating_team: hostTeam ? (hostTeam.get(r.host_user_id)?.rating ?? DEFAULT_RATING) : null,
+                rd_team: hostTeam ? (hostTeam.get(r.host_user_id)?.rd ?? DEFAULT_RD) : null,
+                // Which badge the host shows where the room does not decide it.
+                badge_mode: normalizeBadgeMode(r.host_badge_mode),
+                // Rated matches on each ladder, and whether the host is still being placed:
+                // the launcher writes "in placement 3/10" where the rating would be (and his
+                // own launcher, its own number with a "?"). Omitted on failure.
+                games_played: hostSolo ? (hostSolo.get(r.host_user_id)?.games_played ?? 0) : undefined,
+                games_played_team: hostTeam ? (hostTeam.get(r.host_user_id)?.games_played ?? 0) : undefined,
+                in_placement: hostSolo
+                    ? isInPlacement(hostSolo.get(r.host_user_id)?.games_played ?? 0, 'default') : undefined,
+                in_placement_team: hostTeam
+                    ? isInPlacement(hostTeam.get(r.host_user_id)?.games_played ?? 0, 'team') : undefined,
+            }),
+        })),
+    };
+}
+
+/**
  * Mount /lobbies/* on the Fastify instance. Direct port of the original
  * Hono router with the same routes, same SQL, same response shapes —
  * the launcher's <c>LobbyApiClient</c> can't tell which backend it's
  * talking to.
  */
+async function tournamentIdOf(ctx: AppContext, matchId: string | null): Promise<string | null> {
+    if (!matchId) return null;
+    const row = await ctx.db.prepare(
+        `SELECT tournament_id FROM tournament_matches WHERE id = ?`,
+    ).bind(matchId).first<{ tournament_id: string }>();
+    return row?.tournament_id ?? null;
+}
+
 export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void {
     // GET /lobbies — public list.
-    app.get('/lobbies', {
-        preHandler: [ipRateLimit(ctx, Limits.LobbyListIp)],
-    }, async (_req, reply) => {
-        const rows = await ctx.db.prepare(
-            `SELECT l.id, l.host_user_id, l.title, l.mod_id, l.mod_combined_hash,
-                    l.max_players, l.spectator_slots, l.current_players, l.is_private,
-                    l.status, l.competitive, l.tournament_match_id,
-                    -- Counted rather than denormalised, unlike current_players. This is read
-                    -- once per row on a list capped at 100 and covered by lobby_members' own
-                    -- primary key; a second denormalised counter would be a second thing that
-                    -- can drift out of step with the roster, and the first one already has a
-                    -- comment in LobbyRoom about never decrementing.
-                    (SELECT COUNT(*) FROM lobby_members m
-                      WHERE m.lobby_id = l.id AND m.role = 'spectator') AS spectators_present,
-                    l.created_at, u.discord_username AS host_login, u.display_name AS host_name,
-                    u.avatar_url AS host_avatar, e.rating AS host_rating, e.rd AS host_rd,
-                    t.rating AS host_rating_team, t.rd AS host_rd_team,
-                    u.badge_mode AS host_badge_mode
-             FROM lobbies l
-             JOIN users u ON u.id = l.host_user_id
-             -- LEFT, and it has to stay LEFT. This is the rooms list: with an inner
-             -- join every room whose host has no rating row would VANISH from it, which
-             -- is a far worse bug than a missing number and a silent one. Same trap as
-             -- the membership query in LobbyRoom's hello.
-             LEFT JOIN elo_ratings e ON e.user_id = l.host_user_id AND e.mode = 'default'
-             -- The team ladder, LEFT for the same reason and more so: nobody has a team row
-             -- until their first rated team match.
-             LEFT JOIN elo_ratings t ON t.user_id = l.host_user_id AND t.mode = 'team'
-             WHERE l.status IN ('open', 'locked', 'in_game')
-             ORDER BY l.created_at DESC
-             LIMIT 100`,
-        ).bind().all<{
-            id: string;
-            host_user_id: string;
-            title: string;
-            mod_id: string;
-            mod_combined_hash: string;
-            max_players: number;
-            spectator_slots: number;
-            spectators_present: number;
-            current_players: number;
-            is_private: number;
-            status: 'open' | 'locked' | 'in_game';
-            competitive: number;
-            tournament_match_id: string | null;
-            created_at: string;
-            host_login: string;
-            host_name: string;
-            host_avatar: string | null;
-            host_rating: number | null;
-            host_rd: number | null;
-            host_rating_team: number | null;
-            host_rd_team: number | null;
-            host_badge_mode: string | null;
-        }>();
+    //
+    // NO ipRateLimit preHandler here, on purpose — same fix as /stats/community. Every open
+    // Rooms tab polls this every 5 s, which is 17 280 requests a day from ONE launcher left
+    // running, and the old preHandler charged every one of them against a 15 000/day cap: a
+    // player who kept the launcher in the tray overnight got 429 on the room list for the rest
+    // of the UTC day. The body is the same for every reader, so it is memoised for
+    // LOBBY_LIST_TTL_MS and only a request that actually runs the queries pays quota.
+    app.get('/lobbies', async (req, reply) => {
+        const now = Date.now();
+        if (lobbyListCache && now - lobbyListCache.at < LOBBY_LIST_TTL_MS) {
+            reply.header('Cache-Control', 'public, max-age=5');
+            return lobbyListCache.payload;
+        }
 
-        // The hosts' ladder positions, for the rank badge the rooms row draws in place of the
-        // avatar. One query for the whole page, and absent (not 0) when it failed, so the
-        // launcher draws no badge rather than a wrong one.
-        const hostIds = (rows.results ?? []).map((r) => r.host_user_id);
-        const hostRanks = await ladderRanks(ctx, hostIds);
-        // The team ladder too (design handoff 51b): a 2v2/3v3 room's row wears the host's TEAM
-        // badge, and a casual room's row the badge the host chose.
-        const hostTeamRanks = await ladderRanks(ctx, hostIds, 'team');
+        // Past here the request is going to hit the database, so now it pays.
+        await chargeIpQuota(ctx, req, reply, Limits.LobbyListIp);
 
+        // Somebody else is already building the list: wait for theirs instead of running the
+        // same five queries again on the one synchronous thread.
+        if (!lobbyListInFlight || lobbyListInFlightGeneration !== lobbyListGeneration) {
+            const generation = lobbyListGeneration;
+            const build: Promise<unknown> = buildLobbyList(ctx)
+                .then((payload) => {
+                    if (generation === lobbyListGeneration) lobbyListCache = { at: Date.now(), payload };
+                    return payload;
+                })
+                .finally(() => { if (lobbyListInFlight === build) lobbyListInFlight = null; });
+            lobbyListInFlight = build;
+            lobbyListInFlightGeneration = generation;
+        }
+        const payload = await lobbyListInFlight;
         reply.header('Cache-Control', 'public, max-age=5');
-        return reply.send({
-            lobbies: (rows.results ?? []).map((r) => ({
-                id: r.id,
-                title: r.title,
-                mod_id: r.mod_id,
-                mod_combined_hash: r.mod_combined_hash,
-                max_players: r.max_players,
-                // Seats that are not players. The launcher subtracts this before reading a
-                // format off the size, so a 2v2 with a caster is five seats and still a 2v2.
-                spectator_slots: r.spectator_slots,
-                // How many of current_players are watching. The row subtracts it to learn
-                // how many PLAYING seats are taken, which is what decides whether its button
-                // offers a seat at the game or a seat beside it.
-                spectators_present: r.spectators_present,
-                current_players: r.current_players,
-                is_private: r.is_private === 1,
-                status: r.status,
-                // Before joining, not after: this is what tells a player their rating is
-                // on the line and that leaving the room will not be free.
-                competitive: r.competitive === 1,
-                // Null for an ordinary room. Lets the rooms table show a tournament chip
-                // and hide Join from anyone who is not one of the two entrants.
-                tournament_match_id: r.tournament_match_id ?? null,
-                created_at: r.created_at,
-                host: {
-                    id: r.host_user_id,
-                    discord_username: r.host_login,
-                    display_name: r.host_name,
-                    avatar_url: r.host_avatar,
-                    // No row means UNRATED, and unrated is the starting rating — the
-                    // server is the only side that can tell that apart from "I could not
-                    // answer", because it ran the query. Sending null for it made the
-                    // rooms list show no rating at all for everybody, since the ratings
-                    // reset left nobody with a row.
-                    //
-                    // The comment here used to claim the launcher substituted this value
-                    // itself. It does not: RatingDisplay.ShouldShow is `rating.HasValue`.
-                    // Filling it in on the client would be wrong anyway — it cannot tell
-                    // an unrated player from a server that did not send the field.
-                    rating: r.host_rating ?? DEFAULT_RATING,
-                    // The deviation goes WITH it, and without it the rating is ambiguous: the
-                    // client had no way to tell a 1500 nobody has played for from one somebody
-                    // landed on, so both read the same. Same default as the rating, for the
-                    // same reason — a player with no row is unrated, which is what 350 means.
-                    rd: r.host_rd ?? DEFAULT_RD,
-                    // Position on the 1v1 ladder; 0 = still in placement (fewer than MIN_DECIDED rated matches).
-                    ladder_rank: hostRanks.get(r.host_user_id),
-                    // The same three for the TEAM ladder, defaulted the same way: no row means
-                    // unrated, which is what the defaults mean.
-                    ladder_rank_team: hostTeamRanks.get(r.host_user_id),
-                    rating_team: r.host_rating_team ?? DEFAULT_RATING,
-                    rd_team: r.host_rd_team ?? DEFAULT_RD,
-                    // Which badge the host shows where the room does not decide it.
-                    badge_mode: normalizeBadgeMode(r.host_badge_mode),
-                },
-            })),
-        });
+
     });
 
     // POST /lobbies — create.
@@ -227,6 +339,9 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
         // route can open a room by exactly these rules rather than growing a second copy
         // of them — see the header of ./create.ts for what "exactly these rules" covers.
         const body = (req.body ?? {}) as CreateLobbyBody;
+        // Opening a room by hand ends a quick-match search: one cannot wait in a room and in
+        // the queue at once, and the room is the thing he just chose.
+        ctx.matchmaker?.leave(req.userId!, 'in_room');
         const created = await createLobby(ctx, req.userId!, {
             title: body.title,
             modId: body.mod_id,
@@ -236,6 +351,7 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
             password: body.password,
             askedCompetitive: body.competitive,
         });
+        await recordIpHash(ctx, created.id, req.userId!, requestIpHash(ctx, req));
         return reply.code(201).send(created);
     });
 
@@ -250,7 +366,8 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
         if (!lobby || lobby.status === 'closed') throw Errors.NotFound('Lobby');
 
         const members = await ctx.db.prepare(
-            `SELECT lm.user_id, lm.is_ready, lm.role, u.discord_username, u.display_name, u.avatar_url
+            `SELECT lm.user_id, lm.is_ready, lm.role, lm.team,
+                    u.discord_username, u.display_name, u.avatar_url
              FROM lobby_members lm
              JOIN users u ON u.id = lm.user_id
              WHERE lm.lobby_id = ?
@@ -259,6 +376,7 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
             user_id: string;
             is_ready: number;
             role: 'player' | 'spectator';
+            team: number | null;
             discord_username: string;
             display_name: string;
             avatar_url: string | null;
@@ -276,6 +394,8 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
             status: lobby.status,
             competitive: lobby.competitive === 1,
             tournament_match_id: lobby.tournament_match_id ?? null,
+            tournament_id: await tournamentIdOf(ctx, lobby.tournament_match_id),
+            matchmaking: lobby.matchmaking_match_id != null,
             host_user_id: lobby.host_user_id,
             members: (members.results ?? []).map((m) => ({
                 id: m.user_id,
@@ -284,6 +404,8 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
                 avatar_url: m.avatar_url,
                 is_ready: m.is_ready === 1,
                 role: m.role,
+                // Team 1 or 2 in a 2v2/3v3 room; null while the member has not picked one.
+                team: m.team === 1 || m.team === 2 ? m.team : null,
             })),
         });
     });
@@ -317,6 +439,13 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
         if (lobby.tournament_match_id) {
             const mine = await isEntrantMember(ctx.db, lobby.tournament_match_id, userId);
             if (!mine) throw Errors.NotTournamentParticipant();
+        }
+        // A room the queue opened is for the two it matched, by the same rule.
+        if (lobby.matchmaking_match_id) {
+            const row = await ctx.db.prepare(
+                `SELECT 1 AS ok FROM matchmaking_match_players WHERE match_id = ? AND user_id = ?`,
+            ).bind(lobby.matchmaking_match_id, userId).first<{ ok: number }>();
+            if (!row) throw Errors.NotMatchParticipant();
         }
         // Seats fill by ROLE, not by total. A room of five with one watching seat has four
         // player seats and one observer seat, and they run out independently: checking only
@@ -375,9 +504,12 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
                 // back to watch must not keep the seat they gave up. is_ready is cleared for
                 // the same reason it always was - a returning member has not agreed to
                 // anything about the room as it now stands.
+                // The team is cleared too: a returning player picks his side again, and a seat
+                // he gave up must not keep counting for the side he left.
                 `INSERT INTO lobby_members (lobby_id, user_id, role)
                  VALUES (?, ?, ?)
-                 ON CONFLICT (lobby_id, user_id) DO UPDATE SET is_ready = 0, role = excluded.role`,
+                 ON CONFLICT (lobby_id, user_id) DO UPDATE SET is_ready = 0, role = excluded.role,
+                                                               team = NULL`,
             ).bind(lobbyId, userId, asSpectator ? 'spectator' : 'player'),
             ctx.db.prepare(
                 `UPDATE lobbies SET current_players = (
@@ -385,6 +517,12 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
                  ) WHERE id = ?`,
             ).bind(lobbyId, lobbyId),
         ]);
+
+        // Where they joined from, hashed (src/lib/ipHash.ts). Best-effort.
+        await recordIpHash(ctx, lobbyId, userId, requestIpHash(ctx, req));
+        // Entering somebody's room by hand ends a quick-match search — after the join landed,
+        // so a refused attempt does not cost the player his place in the queue.
+        if (!lobby.matchmaking_match_id) ctx.matchmaker?.leave(userId, 'in_room');
 
         const joinToken = uuid();
         await ctx.kv.put(

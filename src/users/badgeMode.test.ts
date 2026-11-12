@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { BADGE_MODES, teamBadgeEligibleSql, normalizeBadgeMode, parseBadgeMode } from "./badgeMode.js";
 import { LADDER_WHERE } from "../stats/rest.js";
 import { MEMBER_HELLO_SQL } from "../lobbies/LobbyRoom.js";
+import { LOBBY_LIST_SQL } from "../lobbies/rest.js";
 
 test("the endpoint accepts exactly the three modes", () => {
     assert.deepEqual([...BADGE_MODES], ["highest", "1v1", "team"]);
@@ -44,12 +45,27 @@ test("unlocking Teams asks the ladder's own question", () => {
     assert.ok(sql.includes(LADDER_WHERE), sql);
 });
 
-test("the hello's rating joins stay LEFT — it is the membership check", () => {
-    const left = MEMBER_HELLO_SQL.match(/LEFT JOIN elo_ratings/g) ?? [];
-    assert.equal(left.length, 2, MEMBER_HELLO_SQL);
-    assert.match(MEMBER_HELLO_SQL, /mode = 'default'/);
-    assert.match(MEMBER_HELLO_SQL, /mode = 'team'/);
-    // A bare JOIN would throw everyone without a team rating — nearly everyone — out of
-    // their room with 4004.
-    assert.equal(/(^|[^T])\s+JOIN elo_ratings/.test(MEMBER_HELLO_SQL.replace(/LEFT JOIN elo_ratings/g, "")), false);
+test("THE HELLO CARRIES NO RATING JOIN — it is the membership check", () => {
+    // A row here means "you are in this lobby". A join on a ratings table could only duplicate
+    // the member or, mis-bound, answer 4004 not_in_lobby for everyone. The ratings are read
+    // separately (effectiveRatings), and a failure there costs a number, never the room.
+    // It DOES read the member's role and team, which are lobby_members' own columns.
+    assert.doesNotMatch(MEMBER_HELLO_SQL, /elo_ratings|season_ratings|player_ratings/);
+    assert.match(MEMBER_HELLO_SQL, /FROM lobby_members lm/);
+    assert.match(MEMBER_HELLO_SQL, /lm\.lobby_id = \? AND lm\.user_id = \?/);
+    assert.match(MEMBER_HELLO_SQL, /lm\.team/);
+});
+
+test("the rooms list carries no rating join either", () => {
+    // Same reason as the hello: a host with no rating row would vanish from an inner join.
+    assert.doesNotMatch(LOBBY_LIST_SQL, /elo_ratings|season_ratings|player_ratings/);
+    assert.match(LOBBY_LIST_SQL, /FROM lobbies l/);
+});
+
+test("unlocking Teams asks the TEAM ladder: finished team placement", () => {
+    // Choosing the Teams badge is possible exactly when the team ladder ranks the player, i.e.
+    // after five rated team matches. Before that the badge would read as Discovery.
+    const sql = teamBadgeEligibleSql();
+    assert.match(sql, /FROM player_ratings e/);
+    assert.ok(sql.includes(LADDER_WHERE), sql);
 });

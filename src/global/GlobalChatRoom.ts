@@ -3,9 +3,15 @@ import { randomUUID } from 'node:crypto';
 import { verifyJwt } from '../lib/jwt';
 import { isBanned } from '../middleware/auth';
 import { DEFAULT_RATING, DEFAULT_RD } from '../elo/glicko2';
+import { effectiveRatings } from '../elo/ladder';
+import { isInPlacement } from '../elo/placement';
+import { presenceFor } from '../elo/placementPrivacy';
 import type { AppContext } from '../context';
 import { ladderRanks } from '../stats/rest';
 import { badgeModes, type BadgeMode } from '../users/badgeMode';
+import { MatchesChangedBatcher } from './matchesChanged';
+import { forgetLobbyLists, LobbiesChangedBatcher, setLobbiesChangedSink } from './lobbiesChanged';
+import type { Matchmaker, MmTransport } from '../matchmaking/Matchmaker';
 
 /**
  * Process-wide GLOBAL chat room — a single instance for the whole
@@ -28,9 +34,17 @@ import { badgeModes, type BadgeMode } from '../users/badgeMode';
  *
  * Wire protocol (JSON frames):
  *   client → server : hello {token}, chat {body}, invite {target_user_id, lobby_id}, ping
- *   server → client : global_state {history, online}, chat {line},
- *                     presence {online}, lobby_created {lobby}, invite {from, lobbyId,
- *                     roomName, modId}, invite_sent {login}, error {code, message}, pong
+ *   server → client, to everybody:
+ *                     chat {line}, presence {online, onlineUsers}, lobby_created {lobby},
+ *                     matches_changed {matchIds, userIds}, lobbies_changed {}
+ *   server → client, to the user concerned:
+ *                     global_state {history, online, onlineUsers}, invite {from, lobbyId,
+ *                     roomName, modId}, invite_sent {login}, match_rated {...},
+ *                     tournament_update {...}, team_invite {...}, error {code, message}, pong
+ *
+ * A token that does not verify (expired, or signed with a key the server no longer has) gets
+ * `error invalid_token` and a 4003 close. The launcher signs the player out on it; it used to
+ * retry for ever.
  */
 
 interface AttachedSocket {
@@ -50,6 +64,8 @@ interface AttachedSocket {
     /** Rolling-minute counter for room invites sent (separate rate limit). */
     inviteWindowStart: number;
     inviteCount: number;
+    /** What the launcher said it understands in its hello (`features`). */
+    features: Set<string>;
 }
 
 interface ChatLine {
@@ -64,7 +80,7 @@ interface ChatLine {
 const IDLE_KICK_AFTER_MS = 90 * 1000;
 const MAX_CHAT_LEN = 500;
 
-export class GlobalChatRoom {
+export class GlobalChatRoom implements MmTransport {
     private chatRing: ChatLine[] = [];
     private attached = new Map<WebSocket, AttachedSocket>();
     /** userId → epoch ms the auto-mute lifts. Keyed by user (not socket) so
@@ -80,6 +96,13 @@ export class GlobalChatRoom {
     /** Debounce timer for refreshPlayers() so a burst of lobby state changes
      * collapses into one presence rebroadcast. */
     private playersRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+
+    /** The quick-match queue, attached once at startup (index.ts). Its frames ride this socket. */
+    private matchmaker: Matchmaker | null = null;
+
+    attachMatchmaker(m: Matchmaker): void {
+        this.matchmaker = m;
+    }
 
     /** Live count of authenticated sockets — the presence number. */
     get onlineCount(): number {
@@ -111,6 +134,10 @@ export class GlobalChatRoom {
         ws.on('close', () => {
             const attached = this.attached.get(ws);
             this.attached.delete(ws);
+            // A socket REPLACED by a newer one for the same user is not the user going away.
+            if (attached && ![...this.attached.values()].some((a) => a.userId === attached.userId)) {
+                try { this.matchmaker?.socketGone(attached.userId); } catch { /* never break a close */ }
+            }
             // Only re-broadcast presence if this socket had actually
             // joined (passed hello) — an unauthenticated socket closing
             // never changed the count.
@@ -149,6 +176,14 @@ export class GlobalChatRoom {
                 break;
             case 'ping':
                 this.send(ws, { type: 'pong' });
+                break;
+            case 'mm_join':
+            case 'mm_leave':
+            case 'mm_ping':
+            case 'mm_accept':
+            case 'mm_decline':
+            case 'mm_challenge':
+                await this.handleMatchmaking(ws, attached, f);
                 break;
             default:
                 this.sendError(ws, 'unknown_type', `Unknown frame type: ${f.type}`);
@@ -225,6 +260,55 @@ export class GlobalChatRoom {
         this.send(ws, { type: 'invite_sent', login: targetLogin });
     }
 
+    private async handleMatchmaking(
+        ws: WebSocket,
+        attached: AttachedSocket,
+        f: { type: string } & Record<string, unknown>,
+    ): Promise<void> {
+        const mm = this.matchmaker;
+        if (!mm) {
+            this.send(ws, { type: 'mm_error', code: 'not_supported', message: 'Quick match queue is off.' });
+            return;
+        }
+        try {
+            switch (f.type) {
+                case 'mm_join': await mm.join(attached.userId, f); break;
+                case 'mm_leave': mm.leave(attached.userId, 'left'); break;
+                case 'mm_ping': mm.ping(attached.userId); break;
+                case 'mm_accept': await mm.accept(attached.userId, f); break;
+                case 'mm_decline': mm.decline(attached.userId, f); break;
+                case 'mm_challenge': await mm.challenge(attached.userId, f); break;
+            }
+        } catch {
+            this.send(ws, { type: 'mm_error', code: 'internal', message: 'Quick match failed on the server.' });
+        }
+    }
+
+    /** MmTransport: the user's one socket. */
+    sendTo(userId: string, frame: object): boolean {
+        for (const [ws, a] of this.attached) {
+            if (a.userId !== userId || ws.readyState !== 1) continue;
+            this.send(ws, frame);
+            return true;
+        }
+        return false;
+    }
+
+    /** MmTransport: every launcher that said it speaks quick match. */
+    broadcastFeature(frame: object): void {
+        const payload = JSON.stringify(frame);
+        for (const [ws, a] of this.attached) {
+            if (!a.features.has('matchmaking') || ws.readyState !== 1) continue;
+            try { ws.send(payload); } catch { /* socket dying */ }
+        }
+    }
+
+    /** Whether this user's launcher speaks quick match (for tests and the REST status). */
+    speaksMatchmaking(userId: string): boolean {
+        for (const a of this.attached.values()) if (a.userId === userId) return a.features.has('matchmaking');
+        return false;
+    }
+
     /**
      * Broadcast a "new room" announcement to every connected launcher so it can
      * show a small in-app toast. The client filters (not-own, mod-installed) and
@@ -258,6 +342,33 @@ export class GlobalChatRoom {
         } catch { /* never break room creation on a broadcast hiccup */ }
     }
 
+    /** Collects `matches_changed` notes for a second and sends them as one frame. */
+    private readonly matchesChanged = new MatchesChangedBatcher((frame) => this.broadcast(frame, null));
+
+    /**
+     * `lobbies_changed`, batched per second: the rooms code calls `noteLobbiesChanged()` on every
+     * change a room list shows, and this room is the sink it lands in.
+     */
+    private readonly lobbiesChanged = new LobbiesChangedBatcher((frame) => {
+        forgetLobbyLists();
+        this.broadcast(frame, null);
+    });
+
+    constructor() {
+        setLobbiesChangedSink(() => this.lobbiesChanged.note());
+    }
+
+    /**
+     * Tell EVERY launcher that a match was stored or its result or rating changed, so the pages
+     * built from the community's matches refresh now instead of on their next minute — or, for
+     * most of them, the next time the player switched tabs. Batched (see MatchesChangedBatcher),
+     * best-effort, never throws.
+     */
+    announceMatchesChanged(matchId: string, userIds: readonly string[]): void {
+        try { this.matchesChanged.add(matchId, userIds); }
+        catch { /* never break a report on an announcement */ }
+    }
+
     /**
      * Tell the players of one match that it ended up rated after all.
      *
@@ -276,16 +387,26 @@ export class GlobalChatRoom {
         lobbyId: string;
         modId: string;
         mapName: string | null;
-        perUser: ReadonlyMap<string, { result: number; before: number | null; after: number | null }>;
+        perUser: ReadonlyMap<string, {
+            result: number; before: number | null; after: number | null;
+            /** Per-player extras: rd_before/after, placement_played/required/completed, entered_rank. */
+            extra?: Record<string, unknown>;
+        }>;
         /** Set when the announcement is that the match STOPPED counting — a verified crash
          *  voided it. The launcher then says so instead of painting a result. */
         unratedReason?: string | null;
+        /** Fields every recipient gets: elo_factor, farm_streak, rating_mode, tournament. */
+        extra?: Record<string, unknown>;
     }): void {
         try {
             for (const [ws, attached] of this.attached) {
                 const mine = notice.perUser.get(attached.userId);
                 if (!mine) continue;
                 this.send(ws, {
+                    // The extras first, so the fields every launcher already reads can never be
+                    // overwritten by one of them.
+                    ...(notice.extra ?? {}),
+                    ...(mine.extra ?? {}),
                     type: 'match_rated',
                     match_id: notice.matchId,
                     lobby_id: notice.lobbyId,
@@ -447,6 +568,11 @@ export class GlobalChatRoom {
             strikeWindowStart: now,
             inviteWindowStart: now,
             inviteCount: 0,
+            features: new Set(
+                Array.isArray(frame.features)
+                    ? (frame.features as unknown[]).filter((x): x is string => typeof x === 'string').slice(0, 32)
+                    : [],
+            ),
         });
 
         // Hand the joiner the recent history + current presence in one
@@ -458,6 +584,13 @@ export class GlobalChatRoom {
             onlineUsers: await this.onlineUsers(),
         });
         await this.broadcastPresence();
+        // A search survives a reconnect: tell him he is still queued, and who else is.
+        try {
+            this.matchmaker?.socketBack(userId);
+            if (this.matchmaker && this.speaksMatchmaking(userId)) {
+                this.send(ws, { type: 'mm_searchers_changed', searchers: this.matchmaker.searchers() });
+            }
+        } catch { /* never break a hello */ }
     }
 
     private handleChat(
@@ -628,28 +761,31 @@ export class GlobalChatRoom {
         // modes, keyed apart.
         const ratingTeamByUser = new Map<string, number>();
         const rdTeamByUser = new Map<string, number>();
+        // Rated matches on each ladder, so the launcher can write "in placement 3/10" where a
+        // placing player's number used to be, and tell a never-played 1500 from an earned one.
+        const gamesByUser = new Map<string, number>();
+        const gamesTeamByUser = new Map<string, number>();
         try {
             const ids = [...new Set([...this.attached.values()].map((a) => a.userId))];
             if (this.ctx && ids.length > 0) {
-                const placeholders = ids.map(() => '?').join(',');
-                const rows = await this.ctx.db
-                    .prepare(
-                        `SELECT user_id, mode, rating, rd FROM elo_ratings
-                         WHERE mode IN ('default', 'team') AND user_id IN (${placeholders})`,
-                    )
-                    .bind(...ids)
-                    .all<{ user_id: string; mode: string; rating: number; rd: number }>();
-                for (const r of rows.results) {
-                    if (r.mode === 'team') {
-                        ratingTeamByUser.set(r.user_id, r.rating);
-                        rdTeamByUser.set(r.user_id, r.rd);
-                        continue;
-                    }
-                    ratingByUser.set(r.user_id, r.rating);
+                // Through the same helper the engine reads, the deviation grown to now. Every id
+                // comes back, the defaults standing for "unrated".
+                const [solo, team] = await Promise.all([
+                    effectiveRatings(this.ctx.db, ids, 'default'),
+                    effectiveRatings(this.ctx.db, ids, 'team'),
+                ]);
+                for (const [id, r] of solo) {
+                    ratingByUser.set(id, r.rating);
                     // The deviation goes with the rating, and without it the number is
                     // ambiguous: the client could not tell a 1500 nobody has played for from
                     // one somebody landed on, so the panel showed both the same.
-                    rdByUser.set(r.user_id, r.rd);
+                    rdByUser.set(id, r.rd);
+                    gamesByUser.set(id, r.games_played);
+                }
+                for (const [id, r] of team) {
+                    ratingTeamByUser.set(id, r.rating);
+                    rdTeamByUser.set(id, r.rd);
+                    gamesTeamByUser.set(id, r.games_played);
                 }
                 // Set only here: without a ctx no query ran at all, and an empty
                 // roster has nobody to report either way.
@@ -666,7 +802,7 @@ export class GlobalChatRoom {
         // sent WITHOUT the field, which the launcher reads as "unknown" and draws no badge.
         const connectedIds = [...this.attached.values()].map((a) => a.userId);
         const ranks = this.ctx
-            ? await ladderRanks(this.ctx, connectedIds)
+            ? await ladderRanks(this.ctx, connectedIds, 'default')
             : new Map<string, number>();
         // The team ladder and the badge preference, for the badge each player CHOSE (design
         // handoff 51b-51c). Read here rather than cached on the socket for the reason the
@@ -684,9 +820,14 @@ export class GlobalChatRoom {
             status: string; rating: number | null; rd: number | null; ladderRank?: number;
             ratingTeam: number | null; rdTeam: number | null; ladderRankTeam?: number;
             badgeMode?: string;
+            gamesPlayed?: number; gamesPlayedTeam?: number;
+            inPlacement?: boolean; inPlacementTeam?: boolean;
         }[] = [];
         for (const a of this.attached.values()) {
-            out.push({
+            // A player still being PLACED is listed without that ladder's number: presence is ONE
+            // payload for everybody, so it goes to nobody, and his own launcher takes it from his
+            // standing (src/elo/placementPrivacy.ts). The progress beside it stays.
+            out.push(presenceFor({
                 userId: a.userId,
                 login: a.login,
                 avatarUrl: a.avatarUrl,
@@ -700,7 +841,13 @@ export class GlobalChatRoom {
                 rdTeam: ratingsKnown ? (rdTeamByUser.get(a.userId) ?? DEFAULT_RD) : null,
                 ladderRankTeam: teamRanks.get(a.userId),
                 badgeMode: modes.get(a.userId),
-            });
+                gamesPlayed: ratingsKnown ? (gamesByUser.get(a.userId) ?? 0) : undefined,
+                gamesPlayedTeam: ratingsKnown ? (gamesTeamByUser.get(a.userId) ?? 0) : undefined,
+                inPlacement: ratingsKnown
+                    ? isInPlacement(gamesByUser.get(a.userId) ?? 0, 'default') : undefined,
+                inPlacementTeam: ratingsKnown
+                    ? isInPlacement(gamesTeamByUser.get(a.userId) ?? 0, 'team') : undefined,
+            }));
         }
         return out;
     }

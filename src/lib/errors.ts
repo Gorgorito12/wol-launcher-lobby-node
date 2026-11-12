@@ -71,6 +71,15 @@ export const Errors = {
         details,
     ),
     UserBanned:      () => new HttpError(403, 'user_banned',    'This account is banned from multiplayer.'),
+    // A renewal refused because the Discord sign-in is too old (src/lib/jwt.ts,
+    // SESSION_MAX_AGE_SECONDS). 403 and not 401 ON PURPOSE: a launcher signs out on a 401, and
+    // the token it holds is still valid — it should be allowed to run out its days, after which
+    // the ordinary 401 signs the player out. Launchers only log this; nobody reads the sentence.
+    SessionTooOld:   () => new HttpError(
+        403,
+        'session_too_old',
+        'This session can no longer be renewed — sign in with Discord again.',
+    ),
     // BOTH LANGUAGES, and this is the one error where that is not decoration.
     //
     // Everything else here is localised by the launcher from the CODE, so the sentence is a
@@ -101,6 +110,12 @@ export const Errors = {
         403,
         'tournament_not_participant',
         'This room belongs to a tournament match between two other players.',
+    ),
+    // A room the quick-match queue opened admits only the two players it matched.
+    NotMatchParticipant: () => new HttpError(
+        403,
+        'not_match_participant',
+        'This room was opened for a quick match between two other players.',
     ),
     TournamentClosed: () => new HttpError(
         409,
@@ -137,6 +152,22 @@ export const Errors = {
         'That line-up cannot enter this tournament.',
         { reason },
     ),
+    // Seeding or starting a team tournament while some entrant is not a full line-up — a
+    // draft tournament whose teams were never formed. The ids say which, so the launcher can
+    // point at them; the sentence is what an older launcher shows verbatim.
+    RosterIncomplete: (entrantIds: readonly string[], rosterSize: number) => new HttpError(
+        409,
+        'tournament_roster_incomplete',
+        `Some entrants do not have a full line-up of ${rosterSize} yet. Form the teams first.`,
+        { entrant_ids: [...entrantIds], roster_size: rosterSize },
+    ),
+    // A draft merge naming a player who no longer holds a place — withdrawn, rejected, or
+    // already merged into another team.
+    EntrantNotAvailable: () => new HttpError(
+        409,
+        'entrant_not_available',
+        'One of those players is no longer available to join a team.',
+    ),
     TeamFull:         () => new HttpError(
         409,
         'team_full',
@@ -154,6 +185,20 @@ export const Errors = {
         409,
         'team_badge_locked',
         'Play a rated team match to unlock the Teams badge.',
+    ),
+    // The replay bucket is not configured (REPLAY_S3_* unset). A launcher treats this as
+    // "this server keeps no recordings" and stops there — it is not a failure to retry.
+    ReplaysDisabled: () => new HttpError(
+        503,
+        'replays_disabled',
+        'This server does not store match recordings.',
+    ),
+    // The object store answered something this server could not use. Distinct from a 500 so
+    // a client can tell "storage is unwell" from "this server has a bug".
+    StorageError:    () => new HttpError(
+        502,
+        'storage_error',
+        'The recording storage did not answer as expected. Try again later.',
     ),
     Conflict:        (msg: string) => new HttpError(409, 'conflict', msg),
     Internal:        (msg = 'Unexpected server error.') =>

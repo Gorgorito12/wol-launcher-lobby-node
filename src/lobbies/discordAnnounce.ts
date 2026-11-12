@@ -1,8 +1,10 @@
 import { fetch } from 'undici';
 import { normaliseSqliteTimestamp } from '../lib/time';
+import { modIdInList, modsForWebhook } from '../lib/modIds';
 import type { FastifyBaseLogger } from 'fastify';
 import type { Config } from '../env';
 import type { Db } from '../db';
+import { noteLobbiesChanged } from '../global/lobbiesChanged';
 
 /**
  * Optional Discord channel announcements for lobbies, with LIVE updates.
@@ -18,6 +20,12 @@ import type { Db } from '../db';
  *  - Best-effort and non-blocking: it must NEVER throw into or slow down room
  *    creation or the WS broadcast path. Every network call swallows its errors.
  *  - Private rooms are NOT announced at all.
+ *  - Each webhook announces only the mods in its own slot of
+ *    `DISCORD_WEBHOOK_MOD_IDS` (aligned by index with the webhook list, like the
+ *    role pings). A webhook with no slot — one appended later — announces every mod.
+ *    The choice is made once, in announceLobbyCreated: a webhook that skipped a room
+ *    never got a message, so it is never in `state.targets` / `discord_targets`, and
+ *    the edit, close and rehydrate paths leave it alone with no check of their own.
  *  - Per-room state is cached in memory for the hot path, but the posted message
  *    ids are ALSO PERSISTED on `lobbies.discord_targets` (migration 0002), and a
  *    cache miss REHYDRATES from the DB — see `ensureState`. This used to be
@@ -71,10 +79,37 @@ export function configure(config: Config, logger: FastifyBaseLogger, db: Db): vo
     } catch {
         /* never let a startup log break configure() */
     }
+
+    // Which mods each webhook announces, once per start. The filter is positional, so a
+    // reordered DISCORD_WEBHOOK_URL silently moves it to another channel — the journal
+    // is where that shows. Only the webhook's public id is logged, never its token.
+    try {
+        config.discordWebhookUrls.forEach((url, i) => {
+            logger.info(
+                { webhook: i, webhookId: webhookIdOf(url), mods: modsForWebhook(config.discordWebhookModIds, i) },
+                'Discord announce: webhook mod filter (DISCORD_WEBHOOK_MOD_IDS)',
+            );
+        });
+        const extra = config.discordWebhookModIds.length - config.discordWebhookUrls.length;
+        if (config.discordWebhookUrls.length > 0 && extra > 0) {
+            logger.warn(
+                { webhooks: config.discordWebhookUrls.length, slots: config.discordWebhookModIds.length },
+                'Discord announce: DISCORD_WEBHOOK_MOD_IDS has more slots than DISCORD_WEBHOOK_URL has ' +
+                'webhooks — the extra slots apply to nothing. Check that both lists are in the same order.',
+            );
+        }
+    } catch {
+        /* never let a startup log break configure() */
+    }
 }
 
 function webhookUrls(): string[] {
     return cfg?.discordWebhookUrls ?? [];
+}
+
+/** Whether the webhook at index `i` announces rooms of `modId`. */
+function webhookAnnounces(i: number, modId: string): boolean {
+    return modIdInList(modsForWebhook(cfg?.discordWebhookModIds ?? [], i), modId);
 }
 
 /**
@@ -198,13 +233,23 @@ export interface NewRoom {
 }
 
 /**
- * Post the initial "new room" embed to every configured webhook and start
- * tracking the room for live edits. No-op when no webhook is configured or the
- * room is private. Fire-and-forget from the caller.
+ * Post the initial "new room" embed to every webhook that announces this room's
+ * mod (its slot of DISCORD_WEBHOOK_MOD_IDS) and start tracking the room for live
+ * edits. No-op when the room is private or no webhook announces its mod.
+ * Fire-and-forget from the caller.
  */
 export async function announceLobbyCreated(room: NewRoom): Promise<void> {
-    const urls = webhookUrls();
-    if (urls.length === 0 || room.isPrivate) return;
+    if (room.isPrivate) return;
+    // Keep each webhook's ORIGINAL index: it is what roleIdFor(i) is aligned with, and
+    // re-indexing the filtered list would ping another server's role.
+    const chosen = webhookUrls()
+        .map((url, i) => ({ url, i }))
+        .filter((w) => webhookAnnounces(w.i, room.modId));
+    if (chosen.length === 0) {
+        // Before the room is registered, so a room no webhook announces leaves no state.
+        log?.debug({ lobbyId: room.id, modId: room.modId }, 'Discord announce skipped: no webhook announces this mod');
+        return;
+    }
 
     const state: RoomAnnounceState = {
         id: room.id,
@@ -230,7 +275,7 @@ export async function announceLobbyCreated(room: NewRoom): Promise<void> {
     // build it once and reuse it in each per-webhook payload below.
     const embed = buildEmbed(state);
     await Promise.allSettled(
-        urls.map(async (url, i) => {
+        chosen.map(async ({ url, i }) => {
             // Optionally @mention this SERVER'S role (e.g. "Players"/"Jugadores")
             // so its community gets pinged. A role belongs to one server, so the
             // ping is per-webhook (roleIdFor(i)). The mention MUST live in `content`
@@ -417,6 +462,8 @@ export function notifyRoomChanged(
     lobbyId: string,
     change: { players?: number; status?: RoomStatus; title?: string },
 ): void {
+    // Every room, announced or not: the launchers' room list wants to know (lobbies_changed).
+    noteLobbiesChanged();
     void (async () => {
         const state = await ensureState(lobbyId);
         if (!state) return;
@@ -448,6 +495,7 @@ export function notifyRoomChanged(
  * embed reading "Open" forever.
  */
 export function finalizeRoom(lobbyId: string, status: RoomStatus = 'closed'): void {
+    noteLobbiesChanged();
     void (async () => {
         const state = await ensureState(lobbyId);
         if (!state) return;
@@ -612,4 +660,82 @@ function buildEmbed(state: RoomAnnounceState): Record<string, unknown> {
     }
 
     return embed;
+}
+
+// ---------- quick-match searchers --------------------------------------------
+
+/**
+ * "X is looking for a 1v1": posted when a quick-match search has waited a while with nobody.
+ *
+ * It replaces the room embed the old quick match produced as a side effect — with a server
+ * queue there is no room until two people are matched, so nothing told the community somebody
+ * was waiting. Same webhooks, same per-mod filter and the same role ping as a room. The
+ * message is DELETED when the search ends (matched, cancelled, timed out), so the channel
+ * never shows a searcher who is gone. In memory only: a restart empties the queue, and the
+ * few messages left behind say "searching" with a timestamp that ages visibly.
+ */
+const searching = new Map<string, { url: string; messageId: string }[]>();
+
+export interface Searcher {
+    ticketId: string;
+    modId: string;
+    playerName: string;
+    playerAvatar: string | null;
+    competitive: boolean;
+    queuedAt: number;
+}
+
+export async function announceSearching(s: Searcher): Promise<void> {
+    const chosen = webhookUrls()
+        .map((url, i) => ({ url, i }))
+        .filter((w) => webhookAnnounces(w.i, s.modId));
+    if (chosen.length === 0) return;
+    searching.set(s.ticketId, []);
+    const author: Record<string, unknown> = { name: s.playerName || 'Player' };
+    if (s.playerAvatar) author.icon_url = s.playerAvatar;
+    const embed = {
+        author,
+        title: `🔎 Looking for a 1v1 · ${modLabel(s.modId)}`,
+        color: COLOR_OPEN,
+        fields: [
+            { name: 'Mod', value: modLabel(s.modId), inline: true },
+            { name: 'Mode', value: s.competitive ? '⚔️ Ranked' : 'Casual', inline: true },
+            { name: 'Searching since', value: `<t:${Math.floor(s.queuedAt / 1000)}:R>`, inline: true },
+        ],
+        thumbnail: { url: `${MOD_ICON_BASE}/${encodeURIComponent(s.modId)}/icon.png` },
+        footer: { text: 'AoE3 Mod Launcher · Multiplayer › Rooms › Play' },
+    };
+    await Promise.allSettled(chosen.map(async ({ url, i }) => {
+        const payload: Record<string, unknown> = { embeds: [embed] };
+        const roleId = roleIdFor(i);
+        if (roleId) {
+            payload.content = `<@&${roleId}>`;
+            payload.allowed_mentions = { parse: [], roles: [roleId] };
+        }
+        try {
+            const resp = await fetch(`${url}?wait=true`, {
+                method: 'POST', headers: jsonHeaders(), body: JSON.stringify(payload),
+            });
+            if (!resp.ok) { log?.warn({ status: resp.status }, 'Discord searcher announce failed'); return; }
+            const msg = (await resp.json().catch(() => null)) as { id?: string } | null;
+            const list = searching.get(s.ticketId);
+            if (msg?.id && list) list.push({ url, messageId: msg.id });
+            else if (msg?.id) await deleteMessage(url, msg.id); // withdrawn while posting
+        } catch (err) {
+            log?.warn({ err }, 'Discord searcher announce threw');
+        }
+    }));
+}
+
+export async function withdrawSearching(ticketId: string): Promise<void> {
+    const list = searching.get(ticketId);
+    searching.delete(ticketId);
+    if (!list) return;
+    await Promise.allSettled(list.map((t) => deleteMessage(t.url, t.messageId)));
+}
+
+async function deleteMessage(url: string, messageId: string): Promise<void> {
+    try {
+        await fetch(`${url}/messages/${encodeURIComponent(messageId)}`, { method: 'DELETE', headers: jsonHeaders() });
+    } catch { /* best-effort */ }
 }

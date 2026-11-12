@@ -1,4 +1,6 @@
 import 'dotenv/config';
+import type { ReplayStorage } from './replays/presign';
+import { parseModSlots } from './lib/modIds';
 
 /**
  * Effective configuration. Mirrors the original Worker's <c>readConfig</c>
@@ -13,7 +15,12 @@ export interface Config {
 
     // Storage paths
     dbPath: string;
-    replaysDir: string;
+
+    // Where competitive match recordings live: an S3-compatible bucket (Oracle Object
+    // Storage). Null when the REPLAY_S3_* variables are not all set — the replay routes then
+    // answer 503 replays_disabled and everything else runs as usual. The bytes never pass
+    // through this server: it only signs short-lived URLs (see src/replays/).
+    replayStorage: ReplayStorage | null;
 
     // Public tunables — same defaults the original wrangler.toml declared.
     maxConcurrentUsers: number;
@@ -77,13 +84,23 @@ export interface Config {
     // loadConfig). The displayed text is each role's own name.
     discordPlayersRoleIds: string[];
 
+    // Which mods' rooms each webhook announces — a LIST aligned POSITIONALLY with
+    // discordWebhookUrls, like discordPlayersRoleIds: slot[i] filters webhook[i]. A
+    // slot is one mod id or several joined with `+`; an empty slot or `*` = every
+    // mod. A webhook with NO slot (one appended to DISCORD_WEBHOOK_URL later) shows
+    // every mod, so add new webhooks at the END. Unset = every webhook, every mod.
+    // Read through modsForWebhook + modIdInList (src/lib/modIds.ts), never raw.
+    discordWebhookModIds: string[][];
+
     // Mod ids whose matches are allowed to move ELO. Everything else is still
-    // stored in the match history — it just doesn't score. This is policy, not
-    // capability: a rating that adds up wins across mods is adding up games that
-    // cannot even be played against each other, since the mod fingerprint gate
-    // keeps players of different mods apart. Comma-separated; defaults to the one
-    // mod with a real ladder. Widening it needs no code change and no deploy of a
-    // new build, only a restart.
+    // stored in the match history — it just doesn't score. Defaults to `*`: EVERY
+    // mod, the base game included, shares one ladder per mode, and a mod added to
+    // the catalog later is ranked with no change here. That is a policy choice: a
+    // single match is always on one mod (the fingerprint gate keeps players of
+    // different mods apart), and the rating measures the player across all of them.
+    // A comma-separated list of ids narrows it to those mods (`*` may sit in the
+    // list too). Changing it needs no new build, only a restart. Every check goes
+    // through isRankedMod (src/elo/ratability.ts) — never compare against this raw.
     rankedModIds: string[];
 
     // How long a competitive game must have been running before walking out of it
@@ -114,6 +131,28 @@ export interface Config {
      * release is out locks every player out at once. See DEPLOY.md.</p>
      */
     minLauncherVersion: string;
+
+    /**
+     * The secret behind the one-way IP hashes (src/lib/ipHash.ts). Empty means "derive one from
+     * JWT_SIGNING_KEY", which is fine as long as that key never changes; set it explicitly to
+     * rotate the signing key without forgetting who shared a network last week.
+     */
+    ipHashSecret: string;
+    /** Under this many seconds a match is "very short" for the new-account rule and the alerts. */
+    newAccountShortMatchSeconds: number;
+    /** Alert the operator when one side has beaten the same opponent this many times in a row. */
+    alertFarmStreak: number;
+    /** …or when a pair has played this many very short matches within the window below. */
+    alertShortMatches: number;
+    alertShortWindowDays: number;
+    /** Optional: an operator-only Discord webhook for those alerts. Nothing is posted without it. */
+    discordAdminWebhookUrl: string;
+    /** Where the monthly highlights go. Defaults to the first room-announcement webhook. */
+    discordHighlightsWebhookUrls: string[];
+    /** 'es' | 'en' | 'both'. */
+    discordHighlightsLang: string;
+    /** The highlights of a month are posted only within this many days after it ends. */
+    highlightsPostWindowDays: number;
 }
 
 function intEnv(name: string, fallback: number): number {
@@ -160,7 +199,8 @@ function roleIdListEnv(name: string, fallback: string[]): string[] {
 /**
  * Parse a comma/newline-separated list of plain ids (no URL shape to validate).
  * Trims, drops empties, lowercases — ids are compared case-insensitively so an
- * operator typing "WoL" in the .env still matches the launcher's "wol".
+ * operator typing "WoL" in the .env still matches the launcher's "wol". A `*` is kept
+ * as a literal entry; giving it a meaning is the consumer's job (see isRankedMod).
  */
 function idListEnv(name: string, fallback: string[]): string[] {
     const raw = process.env[name];
@@ -170,6 +210,35 @@ function idListEnv(name: string, fallback: string[]): string[] {
         .map((s) => s.trim().toLowerCase())
         .filter((s) => s.length > 0);
     return ids.length > 0 ? ids : fallback;
+}
+
+/**
+ * The replay bucket, or null when it is not configured. All five values are required and the
+ * endpoint must be https: a half-configured bucket is reported as "disabled" rather than
+ * signing URLs that can never work. Exported so `scripts/admin.ts replay:selftest` can check
+ * the credentials without loading the rest of the configuration.
+ *
+ * Deliberately NOT in the hard-fail list in loadConfig: recordings are optional, and a server
+ * that refused to boot over them would take rooms and chat down with it.
+ */
+export function replayStorageFromEnv(): ReplayStorage | null {
+    const endpoint = strEnv('REPLAY_S3_ENDPOINT', '').trim().replace(/\/+$/, '');
+    const region = strEnv('REPLAY_S3_REGION', '').trim();
+    const accessKey = strEnv('REPLAY_S3_ACCESS_KEY', '').trim();
+    const secretKey = strEnv('REPLAY_S3_SECRET_KEY', '').trim();
+    const bucket = strEnv('REPLAY_BUCKET', '').trim();
+    if (!endpoint || !region || !accessKey || !secretKey || !bucket) return null;
+    if (!/^https:\/\/[^/\s]+$/i.test(endpoint)) return null;
+    return { endpoint, region, accessKey, secretKey, bucket };
+}
+
+/**
+ * The largest recording accepted. Exported for the same reason as `replayStorageFromEnv`:
+ * `scripts/admin.ts replay:attach` must enforce the cap the upload route enforces, without
+ * loading the configuration that refuses to start with no Discord secrets.
+ */
+export function replayMaxBytesFromEnv(): number {
+    return intEnv('REPLAY_MAX_BYTES', 20 * 1024 * 1024);
 }
 
 /**
@@ -183,7 +252,7 @@ export function loadConfig(): Config {
         host: strEnv('HOST', '127.0.0.1'),
 
         dbPath: strEnv('DB_PATH', './lobby.db'),
-        replaysDir: strEnv('REPLAYS_DIR', './replays'),
+        replayStorage: replayStorageFromEnv(),
 
         maxConcurrentUsers: intEnv('MAX_CONCURRENT_USERS', 60),
         maxActiveGames: intEnv('MAX_ACTIVE_GAMES', 16),
@@ -208,7 +277,7 @@ export function loadConfig(): Config {
         dailyRequestBudget: intEnv('DAILY_REQUEST_BUDGET', 100_000),
         dailyDegradeThreshold: intEnv('DAILY_DEGRADE_THRESHOLD', 80_000),
         dailyHardLimit: intEnv('DAILY_HARD_LIMIT', 95_000),
-        replayMaxBytes: intEnv('REPLAY_MAX_BYTES', 5 * 1024 * 1024),
+        replayMaxBytes: replayMaxBytesFromEnv(),
         lobbyMaxPlayers: intEnv('LOBBY_MAX_PLAYERS', 8),
         devAuthBypass: (process.env.DEV_AUTH_BYPASS || '').toLowerCase() === 'true',
 
@@ -233,8 +302,9 @@ export function loadConfig(): Config {
         // roleIdListEnv — empties/"none" are KEPT as positional placeholders (unlike
         // urlListEnv, which drops them), so the index alignment holds.
         discordPlayersRoleIds: roleIdListEnv('DISCORD_PLAYERS_ROLE_ID', ['1088344884882194563']),
+        discordWebhookModIds: parseModSlots(process.env.DISCORD_WEBHOOK_MOD_IDS),
 
-        rankedModIds: idListEnv('RANKED_MOD_IDS', ['wol']),
+        rankedModIds: idListEnv('RANKED_MOD_IDS', ['*']),
 
         competitiveAbandonSeconds: intEnv('COMPETITIVE_ABANDON_SECONDS', 300),
         // A verified crash voids a rated 1v1 at most this many times per player per window;
@@ -242,6 +312,22 @@ export function loadConfig(): Config {
         crashVoidPerWindow: intEnv('CRASH_VOID_PER_WINDOW', 1),
         crashVoidWindowSeconds: intEnv('CRASH_VOID_WINDOW_SECONDS', 24 * 60 * 60),
         minLauncherVersion: strEnv('MIN_LAUNCHER_VERSION', ''),
+
+        ipHashSecret: strEnv('IP_HASH_SECRET', ''),
+        newAccountShortMatchSeconds: intEnv('NEW_ACCOUNT_SHORT_MATCH_SECONDS', 600),
+        alertFarmStreak: intEnv('ALERT_FARM_STREAK', 5),
+        alertShortMatches: intEnv('ALERT_SHORT_MATCHES', 3),
+        alertShortWindowDays: intEnv('ALERT_SHORT_WINDOW_DAYS', 7),
+        discordAdminWebhookUrl: strEnv('DISCORD_ADMIN_WEBHOOK_URL', ''),
+        discordHighlightsWebhookUrls: (() => {
+            const own = urlListEnv('DISCORD_HIGHLIGHTS_WEBHOOK_URL');
+            if (own.length > 0) return own;
+            const rooms = urlListEnv('DISCORD_WEBHOOK_URL');
+            return rooms.length > 0 ? [rooms[0]!] : [];
+        })(),
+        // English by default (2026-11-11): the server's community is not only Spanish-speaking.
+        discordHighlightsLang: strEnv('DISCORD_HIGHLIGHTS_LANG', 'en'),
+        highlightsPostWindowDays: intEnv('HIGHLIGHTS_POST_WINDOW_DAYS', 3),
     };
 
     // Hard fail on missing secrets — we don't want the service to start

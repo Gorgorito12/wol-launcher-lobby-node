@@ -1,9 +1,18 @@
 import type { FastifyInstance } from 'fastify';
 import { chargeIpQuota, ipRateLimit, userRateLimit, Limits } from '../middleware/rateLimit';
 import { requireAuth } from '../middleware/auth';
-import { Errors } from '../lib/errors';
+import { Errors, HttpError } from '../lib/errors';
 import { WIN_AT, LOSS_AT } from '../elo/ratability';
 import { attachParticipants } from '../matches/rest';
+import { replayView } from '../replays/rules';
+import { decayRd, type RatingMode } from '../elo/glicko2';
+import { isInactive, orderPlacement, PLACEMENT_REQUIRED, placementRequired } from '../elo/placement';
+import { normaliseSqliteTimestamp, sqliteTimestampToMs } from '../lib/time';
+import { forCommunity, highlightsFor, monthOf, previousMonth, type Highlights } from './highlights';
+import { maybePostMonthlyHighlights } from './highlightsAnnounce';
+import { currentStreaks } from './currentStreaks';
+import { ratingPeaks } from './ratingPeaks';
+import { TOURNAMENT_REF_COLUMNS, TOURNAMENT_REF_JOIN, withTournamentRef } from '../tournaments/matchRef';
 import type { AppContext } from '../context';
 
 /**
@@ -17,67 +26,29 @@ import type { AppContext } from '../context';
  */
 
 /**
- * PLACEMENT: how many RATED matches a player plays before he is on the table. Until then he is
- * "in placement" — he has a rating, it moves and it is shown to him, but he is not ranked and
- * the payload lists him under `placement` with his progress instead.
- *
- * <p><b>Why placement exists at all: the ladder is ordered by the rating it PRINTS.</b> It used
- * to be ordered by `rating - 2*rd` (Glicko-2's conservative estimate) while printing `rating`, so
- * the column did not descend — 1571 above 1720 on the live table — and players read it as a
- * broken ranking. The conservative order existed for one reason: with a bar of 1, a newcomer
- * who won his first three games (rd ≈ 230, rating ≈ 1626) landed above regulars with a dozen.
- * Placement answers that the way Age of Empires III: DE does (10 placement games, then ranked by
- * Elo): a player does not compete for a place until his first matches have settled his rating,
- * and from then on the table is simply the rating, top to bottom.</p>
- *
- * <p><b>Five, not ten, and the reason is activity.</b> AoE3 DE uses ten. This community plays
- * about 35 rated matches a month across ~18 players — roughly four rated matches per player per
- * month — so ten would keep an ordinary player off the table for two to three months. Five is a
- * bit over one month. What made an earlier bar of five unacceptable (the table showed 3 of 18
- * active players and everybody else simply did not exist) is answered by the `placement` list:
- * nobody who has played disappears, they are shown with their progress (3/5).</p>
- *
- * <p>The history, so it is not re-litigated blind: 3 (+ an rd filter that showed nobody) → 1 → 5
- * → 1 (with the conservative ORDER BY doing the bar's job) → 5 as placement, with the plain
- * rating ORDER BY. The launcher prints this number (`min_decided`) and reads it as the placement
- * length; it never hardcodes it. The launcher's win percentage keeps its OWN five-match sample
- * bar — a different question that merely happens to share the number today.</p>
- */
-export const MIN_DECIDED = 5;
-
-/**
- * What the ladder is ordered by: the RATING, the same number every surface prints beside the
- * name — so the table descends, which is the one property a ranking has to have to be read as
- * one. The newcomer-with-a-hot-start problem the conservative order (`rating - 2*rd`) used to
- * solve is solved by {@link MIN_DECIDED} (placement) instead; see there.
- *
- * <p>Do NOT bring the deviation back into this expression. It was there for a year and its
- * cost was a column that does not descend, reported as "someone with a higher ELO is placed
- * lower". `src/stats/ladder.test.ts` pins this.</p>
- *
- * <p>The `user_id` tiebreak is load-bearing since {@link ladderRanks} exists. Without it two
- * players on the same rating came back in whatever order SQLite chose, which was harmless
- * while the position lived only in the list — and wrong the moment a second query computes the
- * same position for a room, because the two could disagree about who is 3rd.</p>
- *
- * <p>`idx_elo_rating (mode, rating DESC)` serves this ORDER BY again.</p>
+n
  */
 export const LADDER_ORDER_BY = 'e.rating DESC, e.user_id ASC';
 
 /**
- * Who is on a ladder at all. SHARED, not copied, by the list and by the count of it.
+ * Who is RANKED on a ladder. SHARED, not copied, by the list, the count of it and every position.
  *
- * <p>A count that filtered differently from the list it describes would be worse than no
- * count: it would put somebody at "7 of 18" in a table showing 20 names, and the disagreement
- * would be invisible from either side. Two queries spelling out the same three conditions is
- * exactly the shape that drifts, so there is one string and both interpolate it.</p>
+ * <p>A count that filtered differently from the list it describes would put somebody at "7 of 18"
+ * in a table showing 20 names, invisibly from either side. So there is one string and every query
+ * interpolates it.</p>
  *
- * <p>The bound parameters are positional, so a caller must bind mode then MIN_DECIDED in that
- * order, after whatever its own SELECT needs.</p>
+ * <p>`e` is `player_ratings`. Binds, in order, after whatever the caller's own SELECT needs: the
+ * mode, then that mode's placement requirement — {@link ladderBinds} gives both. Inactive players
+ * are NOT filtered out: they keep their place and carry `inactive: true`.</p>
  */
 export const LADDER_WHERE = `WHERE e.mode = ?
            AND u.is_banned = 0
            AND e.games_played >= ?`;
+
+/** The two values {@link LADDER_WHERE} binds, for one ladder. */
+export function ladderBinds(mode: 'default' | 'team'): [string, number] {
+    return [mode, placementRequired(mode)];
+}
 
 /**
  * A player's position on a ladder, for the surfaces that show a player without showing the
@@ -89,14 +60,14 @@ export const LADDER_WHERE = `WHERE e.mode = ?
  * with a second alias, which is the two-copies shape {@link LADDER_WHERE} exists to prevent.
  * Here the list and the position cannot filter or order differently.</p>
  *
- * <p>Binds: mode, MIN_DECIDED, then the user ids.</p>
+ * <p>Binds: mode, the placement requirement, then the user ids.</p>
  */
 export function ladderRankSql(userCount: number): string {
     const ids = Array.from({ length: userCount }, () => '?').join(', ');
     return `WITH ranked AS (
                 SELECT e.user_id AS user_id,
                        ROW_NUMBER() OVER (ORDER BY ${LADDER_ORDER_BY}) AS ladder_pos
-                FROM elo_ratings e
+                FROM player_ratings e
                 JOIN users u ON u.id = e.user_id
                 ${LADDER_WHERE}
             )
@@ -120,7 +91,7 @@ export async function ladderRanks(
     if (unique.length === 0) return out;
     try {
         const rows = await ctx.db.prepare(ladderRankSql(unique.length))
-            .bind(mode, MIN_DECIDED, ...unique)
+            .bind(...ladderBinds(mode), ...unique)
             .all<{ user_id: string; ladder_pos: number }>();
         for (const id of unique) out.set(id, 0);
         for (const r of rows.results ?? []) out.set(r.user_id, r.ladder_pos);
@@ -338,6 +309,7 @@ export function topMapsSql(mod: string | null, mode: 'default' | 'team' | null =
 export const TOP_MAPS_SQL = topMapsSql(null);
 
 
+
 const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 50;
 
@@ -426,21 +398,30 @@ let civCache: { at: number; mod: string | null; mode: string; payload: unknown }
 let matchupCache: { at: number; mod: string | null; mode: string; payload: unknown } | null = null;
 
 /**
- * Forget the civilization and matchup tables, and the community payloads that carry
- * `top_civs`. Called by the matches routes when a confirmation has just filled in a
- * civilization a report left blank (migration 0019): the memo is a minute long, and a match
- * that just learned who played what should show up on the next request, not the next
- * minute. Cheap — three slots and a small map — and a no-op when nothing was cached.
+ * Forget every memo built from the matches table: the community payloads, the civilization and
+ * matchup tables, the list of mods with matches and the month's highlights. Called by the
+ * matches routes whenever a match is stored or its result, rating or civilizations change —
+ * together with the `matches_changed` frame that makes every open launcher ask again. Without
+ * it the launchers would ask at once and be answered with the list as it stood a minute (the
+ * highlights: five minutes) before the match. Cheap — a few slots and a small map — and a no-op
+ * when nothing was cached. The deck memo is left alone: decks are what players SAY they carry,
+ * which no match changes.
  */
-export function invalidateCivStatsCaches(): void {
+export function invalidateMatchStatsCaches(): void {
     civCache = null;
     matchupCache = null;
     communityCache.clear();
+    modsCache = null;
+    highlightsCache = null;
 }
 let deckCache: { at: number; mod: string | null; payload: unknown } | null = null;
 
 /** The list of mods that have matches. Its own slot; it is tiny and asked once a page. */
 let modsCache: { at: number; payload: unknown } | null = null;
+
+/** The monthly highlights, memoised for five minutes: a few seconds of SQL, asked by everyone. */
+let highlightsCache: { at: number; current: string; payload: { current: Highlights; previous: Highlights } } | null = null;
+const HIGHLIGHTS_CACHE_TTL_MS = 5 * 60_000;
 
 /** A civilization is listed once it has been played this many RATED 1v1s. One is enough to be
  *  a fact; what needs a sample is the win RATE, and that bar lives in the launcher, next to the
@@ -488,9 +469,13 @@ interface LeaderRow {
     avatar_url: string | null;
     rating: number;
     rd: number;
+    volatility: number;
     games_played: number;
+    last_rated_at: string | null;
     wins: number;
     losses: number;
+    rated_wins: number;
+    rated_losses: number;
 }
 
 /** One civilization a player has been seen with, and how often. */
@@ -556,34 +541,30 @@ interface TotalsRow { matches: number; rated: number; players: number }
 interface TopMapRow { map_name: string; n: number }
 
 /**
- * One ladder, ranked.
+ * One ladder, ranked: the players who finished placement, by rating.
  *
- * <p>Extracted so the 1v1 and team tables cannot drift apart: they differ by the `mode`
- * they select and by nothing else, which is exactly the property that makes a second
- * ladder cheap.</p>
+ * <p>Extracted so the 1v1 and team tables cannot drift apart: they differ by the `mode` they
+ * select and by nothing else.</p>
  *
- * <p><b>The win/loss tally is scoped to the same mode</b>, through `matches.rating_mode`.
- * It used to count every `match_participants` row a player had, which was harmless while
- * one ladder existed and would silently pad a player's 1v1 record with their team wins
- * the moment a second one did. NULL means a row written before migration 0010, all of
- * which were 1v1.</p>
+ * <p><b>Two records per row, both scoped to the same mode.</b> `wins`/`losses` are every DECIDED
+ * match of the mode, all time — what launchers already shipped read. `rated_wins`/`rated_losses`
+ * are the RATED ones, the record that goes with the rating; `season_wins`/`season_losses` carry the
+ * same pair for launchers that read seasons, because there is now one season, forever. NULL
+ * `rating_mode` means a row written before migration 0010, all of which were 1v1.</p>
  *
- * <p>The tally is a LEFT JOIN so a player with a rating but no decided games still
- * appears and is then filtered by the predicate, rather than vanishing for a reason the
- * query does not state. SUM() over no rows is NULL, not 0 — hence the COALESCEs — and
- * aliases cannot be used in WHERE, so the predicate repeats the expression.</p>
- *
- * <p><b>The order is the plain `rating`</b> — see {@link LADDER_ORDER_BY}. It was `rating - 2*rd`
- * for a year, which kept a newcomer with a hot start below the regulars but left the printed
- * column out of order. Placement ({@link MIN_DECIDED}) keeps the newcomer off the table until
- * his rating has settled, so the table can be ordered by the number it shows.</p>
+
  */
-async function ladder(ctx: AppContext, mode: 'default' | 'team', limit: number) {
+async function ladder(
+    ctx: AppContext,
+    mode: 'default' | 'team',
+    limit: number,
+) {
     const rows = await ctx.db.prepare(
         `SELECT u.id, u.discord_username, u.display_name, u.avatar_url,
-                e.rating, e.rd, e.games_played,
-                COALESCE(w.wins, 0) AS wins, COALESCE(w.losses, 0) AS losses
-         FROM elo_ratings e
+                e.rating, e.rd, e.volatility, e.games_played, e.last_rated_at,
+                COALESCE(w.wins, 0) AS wins, COALESCE(w.losses, 0) AS losses,
+                COALESCE(s.wins, 0) AS rated_wins, COALESCE(s.losses, 0) AS rated_losses
+         FROM player_ratings e
          JOIN users u ON u.id = e.user_id
          LEFT JOIN (
              SELECT mp.user_id AS user_id,
@@ -594,16 +575,28 @@ async function ladder(ctx: AppContext, mode: 'default' | 'team', limit: number) 
              WHERE COALESCE(m.rating_mode, 'default') = ?
              GROUP BY mp.user_id
          ) w ON w.user_id = e.user_id
+         LEFT JOIN (
+             SELECT mp.user_id AS user_id,
+                    SUM(CASE WHEN mp.result >= ? THEN 1 ELSE 0 END) AS wins,
+                    SUM(CASE WHEN mp.result <= ? THEN 1 ELSE 0 END) AS losses
+             FROM match_participants mp
+             JOIN matches m ON m.id = mp.match_id
+             WHERE m.rated = 1 AND COALESCE(m.rating_mode, 'default') = ?
+             GROUP BY mp.user_id
+         ) s ON s.user_id = e.user_id
          ${LADDER_WHERE}
          ORDER BY ${LADDER_ORDER_BY}
          LIMIT ?`,
-    ).bind(WIN_AT, LOSS_AT, mode, mode, MIN_DECIDED, limit).all<LeaderRow>();
+    ).bind(
+        WIN_AT, LOSS_AT, mode,
+        WIN_AT, LOSS_AT, mode,
+        ...ladderBinds(mode),
+        limit,
+    ).all<LeaderRow>();
 
     const players = rows.results ?? [];
 
-    // What each of them plays: ONE query for the page, never one per row. The launcher
-    // draws these as flags beside the name; a player with none gets an empty list, which
-    // the launcher reads as "nothing known" and a launcher older than the field ignores.
+    // What each of them plays: ONE query for the page, never one per row.
     let topCivs = new Map<string, TopCiv[]>();
     if (players.length > 0) {
         const civRows = await ctx.db.prepare(topCivsSql(players.length))
@@ -612,91 +605,141 @@ async function ladder(ctx: AppContext, mode: 'default' | 'team', limit: number) 
         topCivs = topCivsFor(civRows.results ?? []);
     }
 
-    // Each player's place on the OTHER ladder (design handoff 51a): a badge's tooltip always
-    // names the other badge — "#2 in the teams ladder · 1v1: Industrial #5" — so a 1v1 row
-    // carries its team position and a team row its 1v1 one. One batched query for the page;
-    // the field is omitted on failure, which the launcher reads as "unknown".
-    const other = await ladderRanks(ctx, players.map((p) => p.id), mode === 'team' ? 'default' : 'team');
+    // Each player's place on the OTHER ladder (design handoff 51a), for the badge tooltip. One
+    // batched query; omitted on failure, which the launcher reads as "unknown".
+    const other = await ladderRanks(
+        ctx, players.map((p) => p.id), mode === 'team' ? 'default' : 'team');
 
-    // The rank is decided HERE, by the same ordering that produced the list. A client
-    // filtering its copy must not renumber: the third row is the third player, not the
-    // third thing that survived the client's own filter.
-    return players.map((r, i) => ({
-        rank: i + 1,
-        user_id: r.id,
-        discord_username: r.discord_username,
-        display_name: r.display_name,
-        avatar_url: r.avatar_url,
-        rating: r.rating,
-        rd: r.rd,
-        games_played: r.games_played,
-        wins: r.wins,
-        losses: r.losses,
-        top_civs: topCivs.get(r.id) ?? [],
-        ...(mode === 'team'
-            ? { ladder_rank: other.get(r.id) }
-            : { ladder_rank_team: other.get(r.id) }),
-    }));
+    const now = Date.now();
+    // The 🔥 pill (design 55a): the current win streak of everybody on the page, in one query.
+    const streaks = await currentStreaks(ctx, players.map((p) => p.id), mode, now);
+    // The PEAK column (2026-10-28): each player's peak by the profile's own rule, two queries for
+    // the page. Null where there is none; a launcher draws the column only when some row has one.
+    const peaks = await ratingPeaks(ctx, players.map((p) => p.id), mode);
+
+    // The rank is decided HERE, by the same ordering that produced the list. A client filtering
+    // its copy must not renumber.
+    return players.map((r, i) => {
+        const lastMs = sqliteTimestampToMs(r.last_rated_at);
+        return {
+            rank: i + 1,
+            user_id: r.id,
+            discord_username: r.discord_username,
+            display_name: r.display_name,
+            avatar_url: r.avatar_url,
+            rating: r.rating,
+            rd: lastMs === null ? r.rd : decayRd(r.rd, r.volatility, now - lastMs),
+            games_played: r.games_played,
+            wins: r.wins,
+            losses: r.losses,
+            rated_wins: r.rated_wins,
+            rated_losses: r.rated_losses,
+            season_wins: r.rated_wins,
+            season_losses: r.rated_losses,
+            top_civs: topCivs.get(r.id) ?? [],
+            ...(mode === 'team'
+                ? { ladder_rank: other.get(r.id) }
+                : { ladder_rank_team: other.get(r.id) }),
+            inactive: isInactive(lastMs, now),
+            last_rated_at: r.last_rated_at ? normaliseSqliteTimestamp(r.last_rated_at) : null,
+            streak: streaks.get(r.id) ?? 0,
+            rating_peak: peaks.get(r.id)?.peak ?? null,
+            rating_peak_at: peaks.get(r.id)?.peakAt ?? null,
+        };
+    });
 }
 
 /**
- * How many players are ON a ladder, ignoring the page limit.
+ * The players still being PLACED on a ladder (at least one rated match, fewer than required),
+ * most matches first, then by name. Never their results — another player sees only the progress.
  *
- * <p>It exists because the launcher's profile says "rank 7 of 18", and `leaderboard.length`
- * is only that number while the table is smaller than the page — the day it passes 50 that
- * sentence would quietly start reporting the page size as the size of the league.</p>
- *
- * <p>It shares {@link LADDER_WHERE} with the list itself, which is the only reason the two
- * can be trusted to describe the same set of people.</p>
+ * <p><b>And never their rating.</b> Everybody listed here is placing, and a placing rating goes to
+ * its owner only (src/elo/placementPrivacy.ts); this payload is one memoised answer for every
+ * reader, so the number goes to nobody and the launcher draws its own row from its own standing.
+ * Omitted, not null: the progress is the whole row now. A launcher older than this reads the
+ * missing number as 0 on other players' rows — which is why the server ships after it.</p>
  */
-export async function ladderSize(ctx: AppContext, mode: 'default' | 'team'): Promise<number> {
+async function placementLadder(ctx: AppContext, mode: 'default' | 'team', limit: number) {
+    const rows = await ctx.db.prepare(
+        `SELECT u.id AS user_id, u.discord_username, u.display_name, u.avatar_url,
+                e.games_played, e.last_rated_at
+           FROM player_ratings e
+           JOIN users u ON u.id = e.user_id
+          WHERE e.mode = ? AND u.is_banned = 0
+            AND e.games_played > 0 AND e.games_played < ?`,
+    ).bind(...ladderBinds(mode)).all<{
+        user_id: string; discord_username: string; display_name: string; avatar_url: string | null;
+        games_played: number; last_rated_at: string | null;
+    }>();
+    const now = Date.now();
+    const required = placementRequired(mode);
+    const streaks = await currentStreaks(ctx, (rows.results ?? []).map((r) => r.user_id), mode, now);
+    const list = (rows.results ?? []).map((r) => {
+        return {
+            user_id: r.user_id,
+            discord_username: r.discord_username,
+            display_name: r.display_name,
+            avatar_url: r.avatar_url,
+            placement_played: r.games_played,
+            placement_required: required,
+            last_rated_at: r.last_rated_at ? normaliseSqliteTimestamp(r.last_rated_at) : null,
+            streak: streaks.get(r.user_id) ?? 0,
+        };
+    });
+    return orderPlacement(list).slice(0, limit);
+}
+
+/** How many players are being placed on a ladder. */
+async function placementSize(ctx: AppContext, mode: 'default' | 'team'): Promise<number> {
+    const row = await ctx.db.prepare(
+        `SELECT COUNT(*) AS n FROM player_ratings e JOIN users u ON u.id = e.user_id
+          WHERE e.mode = ? AND u.is_banned = 0 AND e.games_played > 0 AND e.games_played < ?`,
+    ).bind(...ladderBinds(mode)).first<{ n: number }>();
+    return row?.n ?? 0;
+}
+
+/** This month so far and the previous one, memoised for five minutes. Null on failure. */
+async function cachedHighlights(nowMs: number): Promise<{ current: Highlights; previous: Highlights } | null> {
+    const current = monthOf(nowMs);
+    if (highlightsCache && highlightsCache.current === current
+        && nowMs - highlightsCache.at < HIGHLIGHTS_CACHE_TTL_MS) {
+        return highlightsCache.payload;
+    }
+    if (!statsCtx) return null;
+    try {
+        const [cur, prev] = await Promise.all([
+            highlightsFor(statsCtx, current, nowMs),
+            highlightsFor(statsCtx, previousMonth(current), nowMs),
+        ]);
+        highlightsCache = { at: nowMs, current, payload: { current: cur, previous: prev } };
+        return highlightsCache.payload;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * How many players are RANKED on a ladder, ignoring the page limit — the "of 18" in "rank 7 of
+ * 18", and what the rank badges' age shares are cut from. Shares {@link LADDER_WHERE} with the
+ * list itself.
+ */
+export async function ladderSize(
+    ctx: AppContext,
+    mode: 'default' | 'team',
+): Promise<number> {
     const row = await ctx.db.prepare(
         `SELECT COUNT(*) AS n
-         FROM elo_ratings e
+         FROM player_ratings e
          JOIN users u ON u.id = e.user_id
          ${LADDER_WHERE}`,
-    ).bind(mode, MIN_DECIDED).first<{ n: number }>();
+    ).bind(...ladderBinds(mode)).first<{ n: number }>();
     return row?.n ?? 0;
 }
 
 /**
- * The players IN PLACEMENT on a ladder: they have played at least one rated match of this mode
- * but fewer than {@link MIN_DECIDED}, so they have a rating and no place yet.
- *
- * <p>It exists so that a placement bar does not make people disappear — the reason an earlier
- * bar of five was reverted (the table showed 3 of 18 active players). The launcher lists them
- * under the table with their progress ("3/5").</p>
- *
- * <p>Ordered by how close they are to finishing, then by rating, then by id so two equal rows
- * never swap between polls. Never ranked: a position here would be a place on a table they are
- * not on yet.</p>
- */
-async function placement(ctx: AppContext, mode: 'default' | 'team', limit: number) {
-    const rows = await ctx.db.prepare(
-        `SELECT u.id, u.discord_username, u.display_name, u.avatar_url,
-                e.rating, e.rd, e.games_played
-         FROM elo_ratings e
-         JOIN users u ON u.id = e.user_id
-         WHERE e.mode = ?
-           AND u.is_banned = 0
-           AND e.games_played >= 1
-           AND e.games_played < ?
-         ORDER BY e.games_played DESC, e.rating DESC, e.user_id ASC
-         LIMIT ?`,
-    ).bind(mode, MIN_DECIDED, limit).all<Omit<LeaderRow, 'wins' | 'losses'>>();
-
-    return (rows.results ?? []).map((r) => ({
-        user_id: r.id,
-        discord_username: r.discord_username,
-        display_name: r.display_name,
-        avatar_url: r.avatar_url,
-        rating: r.rating,
-        rd: r.rd,
-        games_played: r.games_played,
-    }));
-}
 
 export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
+    statsCtx = ctx;
     // NO ipRateLimit preHandler here, on purpose - see the cache check below. The quota is
     // charged inside the handler, and only when the request is actually going to do work.
     app.get('/stats/community', async (req, reply) => {
@@ -757,16 +800,11 @@ export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
             // of the multiplayer notes: the community strip is one endpoint, because the
             // request budget is per IP and shared behind a Radmin NAT — a second route would
             // cost double for a page nobody asked twice for.
-            const [leaderboard, leaderboard_team, ranked_players, ranked_players_team,
-                   placement_players, placement_players_team] =
-                await Promise.all([
-                    ladder(ctx, 'default', limit),
-                    ladder(ctx, 'team', limit),
-                    ladderSize(ctx, 'default'),
-                    ladderSize(ctx, 'team'),
-                    placement(ctx, 'default', MAX_LIMIT),
-                    placement(ctx, 'team', MAX_LIMIT),
+
                 ]);
+            // Without the top lists: every launcher asks for this payload once a minute, and only
+            // the ranking's Highlights view needs them (GET /stats/highlights).
+            const monthly_highlights = forCommunity(await cachedHighlights(now));
 
             // Source is lobbies.created_at, and the wording on the card has to match:
             // this is when people OPEN ROOMS, not when they play. Rooms are stamped by
@@ -871,9 +909,12 @@ export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
                 `SELECT m.id, m.mod_id, m.map_name, m.duration_seconds,
                         m.created_at AS reported_at,
                         m.rated, m.unrated_reason,
-                        l.competitive
+                        l.competitive,
+                        m.replay_key, m.replay_uploaded_at, m.replay_size_bytes,
+                        ${TOURNAMENT_REF_COLUMNS}
                    FROM matches m
                    LEFT JOIN lobbies l ON l.id = m.lobby_id
+                   ${TOURNAMENT_REF_JOIN}
                   ${mod ? 'WHERE m.mod_id = ?' : ''}
                   ORDER BY m.created_at DESC
                   LIMIT ?`,
@@ -882,14 +923,33 @@ export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
 
             // Coerced to real booleans, NULL preserved - see the identical block in
             // /matches/history for why a raw SQLite 1 takes a whole page down on the client.
-            const recent_matches = (recentRows.results ?? []).map((m) => ({
-                ...m,
-                rated: m.rated == null ? null : Boolean(m.rated),
-                competitive: m.competitive == null ? null : Boolean(m.competitive),
-            }));
+            //
+            // The recording fields come from `replayView`, the same rule every match list uses;
+            // the object key itself never leaves the server - a download asks for a signed link
+            // by match id.
+            const replayNow = new Date();
+            const recent_matches = (recentRows.results ?? []).map((m) => {
+                // `tournament` rides in `rest`: the bracket a game was played for, so the Rooms
+                // page can say "TOURNAMENT" instead of "COMPETITIVE" (src/tournaments/matchRef.ts).
+                const { replay_key, replay_uploaded_at, replay_size_bytes, ...rest } =
+                    withTournamentRef(m as Record<string, unknown> & { id: string });
+                return {
+                    ...rest,
+                    id: m.id,
+                    rated: m.rated == null ? null : Boolean(m.rated),
+                    competitive: m.competitive == null ? null : Boolean(m.competitive),
+                    ...replayView({
+                        replay_key: replay_key as string | null,
+                        replay_uploaded_at: replay_uploaded_at as string | null,
+                        replay_size_bytes: replay_size_bytes as number | null,
+                    }, replayNow),
+                };
+            });
             // The same helper the history endpoint uses, so "who played" is assembled one way
-            // in this codebase: one query for the whole page, never one per match.
-            await attachParticipants(ctx, recent_matches);
+            // in this codebase: one query for the whole page, never one per match. No viewer:
+            // this payload is shared by every reader for a minute, so a player still being
+            // placed shows his rating changes to nobody here (src/elo/placementPrivacy.ts).
+            await attachParticipants(ctx, recent_matches, null);
 
             // 2v2 against 3v3. Nothing stores a format, so it is derived by counting participants
             // and sides per match - the same shape /matches/history derives player_count from. It
@@ -912,6 +972,11 @@ export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
                 generated_at: new Date(now).toISOString(),
                 min_decided: MIN_DECIDED,
                 mode,
+                // There are no seasons any more. Null is exactly what a launcher that knows
+                // seasons reads as "this server has none": no selector, no medal, no notice.
+                season: null,
+                // Rated matches needed to be ranked, per ladder (10 in 1v1, 5 in teams).
+                placement_required: { ...PLACEMENT_REQUIRED },
                 leaderboard,
                 // The team ladder rides the same payload. An older launcher ignores the extra
                 // field; a newer one against an older server deserializes it to null, which it
@@ -922,11 +987,7 @@ export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
                 // reads these; a launcher older than them shows the rank alone.
                 ranked_players,
                 ranked_players_team,
-                // Who is still in placement (fewer than min_decided rated matches), with their
-                // progress. A launcher older than placement ignores it; the table above it is
-                // ordered by the printed rating, so nobody here could have been on it anyway.
-                placement: placement_players,
-                placement_team: placement_players_team,
+
                 // Which mod this whole payload is about, echoed back. The launcher draws it beside
                 // the figures; without it a cached page and a fresh one are indistinguishable.
                 mod: mod,
@@ -976,6 +1037,8 @@ export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
             const done = Date.now();
             communityCache.set(key, { at: done, payload });
             pruneCommunityCache(done);
+            // A cold memo is one of the moments the month's highlights may be due on Discord.
+            void maybePostMonthlyHighlights(ctx, req.log, done);
             return payload;
         })();
 
@@ -1007,6 +1070,21 @@ export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
      * The launcher decides what to SHOW: the record and the count always, a percentage only past
      * its own bar, and never an ordering by that percentage. This endpoint only counts.
      */
+    /**
+     * The month's top lists (the ranking's Highlights view): this month so far and the last one,
+     * with `leaders` — the top five of every highlight. The same five-minute memo as the
+     * community payload, so both answers come from one computation. Fetched lazily, only when
+     * that view opens, under its own rate-limit scope.
+     */
+    app.get('/stats/highlights', {
+        preHandler: [ipRateLimit(ctx, Limits.StatsHighlightsIp)],
+    }, async (_req, reply) => {
+        const payload = await cachedHighlights(Date.now());
+        if (!payload) throw new HttpError(503, 'highlights_unavailable', 'The highlights could not be computed.');
+        reply.header('Cache-Control', 'public, max-age=60');
+        return payload;
+    });
+
     app.get('/stats/civs', {
         preHandler: [ipRateLimit(ctx, Limits.StatsCivsIp)],
     }, async (req, reply) => {

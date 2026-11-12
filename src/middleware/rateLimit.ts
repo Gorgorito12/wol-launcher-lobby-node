@@ -135,13 +135,23 @@ export function userRateLimit(ctx: AppContext, rule: RateLimitRule): preHandlerH
  * for end users. If you tune one, tune it here, not at the call site.
  */
 export const Limits = {
-    CatchAllIp:       { scope: 'all',       keyKind: 'ip',   perMinute: 120, perDay: 15000 } as const,
+    // The daily caps on the two below used to be 15 000, which is LESS than one launcher makes
+    // on its own: the Rooms tab polls /lobbies every 5 s (17 280 a day), plus the WebSocket and
+    // the stats. A player who left the launcher in the tray ran out in about 18 hours, and from
+    // then on every route — the lobby WebSocket included — answered 429 until 00:00 UTC. The
+    // per-minute caps are what stop a script; the daily one only has to clear a few machines
+    // behind one Radmin NAT / CGNAT running all day.
+    CatchAllIp:       { scope: 'all',       keyKind: 'ip',   perMinute: 120, perDay: 100000 } as const,
     AuthDeviceIp:     { scope: 'authd',     keyKind: 'ip',   perMinute: 5,   perDay: 30   } as const,
     AuthPollIp:       { scope: 'authp',     keyKind: 'ip',   perMinute: 60,  perDay: 500  } as const,
     AuthIp:           { scope: 'auth',      keyKind: 'ip',   perMinute: 60,  perDay: 500  } as const,
+    // Renewing a session token (POST /auth/refresh). By USER, like every other write here: two
+    // players behind one Radmin NAT each renew their own. The launcher asks at most every 30
+    // minutes while a renewal is due, so honest use is a request every few days.
+    SessionRefreshUser: { scope: 'refresh-u', keyKind: 'user', perMinute: 6, perDay: 60 } as const,
     LobbyCreateIp:    { scope: 'lcreate',   keyKind: 'ip',   perMinute: 20,  perDay: 200  } as const,
     LobbyJoinIp:      { scope: 'ljoin',     keyKind: 'ip',   perMinute: 20,  perDay: 200  } as const,
-    LobbyListIp:      { scope: 'llist',     keyKind: 'ip',   perMinute: 120, perDay: 15000 } as const,
+    LobbyListIp:      { scope: 'llist',     keyKind: 'ip',   perMinute: 120, perDay: 100000 } as const,
     ChatIp:           { scope: 'chat',      keyKind: 'ip',   perMinute: 30,  perDay: 500  } as const,
     StatsIp:          { scope: 'stats',     keyKind: 'ip',   perMinute: 20,  perDay: 500  } as const,
     // Public community stats (leaderboard + activity). Its OWN scope rather than a
@@ -163,6 +173,15 @@ export const Limits = {
     // behind a shared Radmin NAT.
     StatsMatchupsIp:  { scope: 'statsm',    keyKind: 'ip',   perMinute: 20,  perDay: 600  } as const,
     StatsDecksIp:     { scope: 'statsd',    keyKind: 'ip',   perMinute: 20,  perDay: 600  } as const,
+    // An ended season's final table. Its own scope for the reason the two above have one: it
+    // is opened from the ranking's season selector by people who also keep the community strip
+    // open, and behind one Radmin NAT they share the count. The answer never changes once the
+    // season is over, so the launcher keeps it for the session and honest use stays far below.
+    StatsSeasonIp:    { scope: 'statss',    keyKind: 'ip',   perMinute: 20,  perDay: 600  } as const,
+    // The month's top lists (the ranking's Highlights view). Its own scope for the same reason
+    // as the tables above: opened lazily by people who keep the community strip open, and
+    // behind one Radmin NAT they share the count. Memoised five minutes server-side.
+    StatsHighlightsIp: { scope: 'statsh',   keyKind: 'ip',   perMinute: 20,  perDay: 600  } as const,
     // Keyed by USER, not IP: two players behind one Radmin NAT each upload their own decks,
     // and an IP budget would make the second one's silently fail. Deliberately tiny — the
     // launcher uploads once a session, and there is no reason for a legitimate client to
@@ -192,11 +211,29 @@ export const Limits = {
     // Team upkeep: creating, inviting, answering, leaving. By USER, like every other
     // write here, because two people behind one Radmin NAT each run their own team.
     TeamInviteUser:   { scope: 'team-u',   keyKind: 'user', perMinute: 10,  perDay: 60   } as const,
+    // Looking a player up by name for a team invitation or a line-up (src/users/search.ts).
+    // Asked as the user types, so generous per minute; bounded per day so the user table
+    // cannot be walked a fragment at a time.
+    UserSearchUser:   { scope: 'usearch-u', keyKind: 'user', perMinute: 30,  perDay: 600  } as const,
     LobbyCreateUser:  { scope: 'lcreate-u', keyKind: 'user', perMinute: 10,  perDay: 100  } as const,
     LobbyJoinUser:    { scope: 'ljoin-u',   keyKind: 'user', perMinute: 50,  perDay: 200  } as const,
+    // The rooms list's per-host ping (GET /lobbies/radmin). A launcher asks every 10 s, only while
+    // the Rooms page is in front, so a day of that is 8 640; the cap leaves room for two copies.
+    HostRadminUser:   { scope: 'lradmin-u', keyKind: 'user', perMinute: 12,  perDay: 20000 } as const,
     ReportUser:       { scope: 'report-u',  keyKind: 'user', perMinute: 5,   perDay: 20   } as const,
     // The badge-mode switch in the profile. A user setting clicked by hand, by USER like the
     // writes above; generous per minute because somebody trying the three options clicks
     // three times in a row, small per day because nothing legitimate changes it often.
     BadgeModeUser:    { scope: 'badge-u',   keyKind: 'user', perMinute: 20,  perDay: 200  } as const,
+    // Competitive recordings: asking for an upload URL and confirming it. By USER for the
+    // usual reason (two players behind one Radmin NAT each report their own matches). A
+    // launcher makes two calls per reported match, so this is far above honest use.
+    ReplayUploadUser: { scope: 'replay-up', keyKind: 'user', perMinute: 10,  perDay: 100  } as const,
+    // Download links for a recording. By USER; a caster going through a tournament's
+    // matches asks for one link per match, which a handful a minute covers.
+    ReplayDownloadUser: { scope: 'replay-dl', keyKind: 'user', perMinute: 30, perDay: 500 } as const,
+    // The launcher's Ranking > Matches view: one page of community matches per call, a
+    // search waits 300 ms after the last keystroke, and "Load 30 more" is a click. By IP like
+    // the other public read surfaces, with its own scope so it never starves them.
+    MatchesBrowseIp:  { scope: 'mbrowse',   keyKind: 'ip',   perMinute: 30,  perDay: 1500 } as const,
 } satisfies Record<string, RateLimitRule>;

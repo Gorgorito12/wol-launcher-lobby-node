@@ -17,9 +17,14 @@
  *    a busy tournament is archived out from under its players.
  */
 import type { Db } from '../db';
+import { effectiveRatings } from '../elo/ladder';
 import type { BracketMatch, BracketUpdate, Slot } from './bracket';
 import type { EntrantStatus, TournamentFormat, TeamSource } from './entrants';
-import { aliveWhereClause, CAPPED_STATUSES, type TournamentStatus } from './lifecycle';
+import {
+    aliveWhereClause, CAPPED_STATUSES, DELETABLE_STATUSES, dueForDeletionWhereClause,
+    FINISHED_PUBLIC_DAYS, playedSql, publicWhereClause, UNPLAYED_KEEP_DAYS,
+    type TournamentStatus,
+} from './lifecycle';
 
 // ---------------------------------------------------------------- row shapes
 
@@ -137,6 +142,8 @@ export const USER_DISPLAY_NAME_SQL =
 export interface RosterMember {
     user_id: string;
     display_name: string;
+    /** The Discord picture, a ready URL, or null. Additive: an older launcher draws the initial. */
+    avatar_url: string | null;
 }
 
 /**
@@ -154,16 +161,17 @@ export async function loadRosterMembers(
     tournamentId: string,
 ): Promise<Map<string, RosterMember[]>> {
     const r = await db.prepare(
-        `SELECT m.entrant_id, m.user_id, ${USER_DISPLAY_NAME_SQL} AS display_name
+        `SELECT m.entrant_id, m.user_id, ${USER_DISPLAY_NAME_SQL} AS display_name,
+                u.avatar_url AS avatar_url
            FROM tournament_entrant_members m
            JOIN tournament_entrants e ON e.id = m.entrant_id
            LEFT JOIN users u ON u.id = m.user_id
           WHERE e.tournament_id = ?`,
-    ).bind(tournamentId).all<{ entrant_id: string; user_id: string; display_name: string }>();
+    ).bind(tournamentId).all<{ entrant_id: string; user_id: string; display_name: string; avatar_url: string | null }>();
 
     const out = new Map<string, RosterMember[]>();
     for (const row of r.results ?? []) {
-        const member = { user_id: row.user_id, display_name: row.display_name };
+        const member = { user_id: row.user_id, display_name: row.display_name, avatar_url: row.avatar_url ?? null };
         const list = out.get(row.entrant_id);
         if (list) list.push(member);
         else out.set(row.entrant_id, [member]);
@@ -194,6 +202,7 @@ export async function loadRosters(
 export interface ManagerRow {
     user_id: string;
     display_name: string;
+    avatar_url: string | null;
 }
 
 /**
@@ -223,7 +232,7 @@ export async function isManager(
  */
 export async function listManagers(db: Db, tournamentId: string): Promise<ManagerRow[]> {
     const r = await db.prepare(
-        `SELECT m.user_id, ${USER_DISPLAY_NAME_SQL} AS display_name
+        `SELECT m.user_id, ${USER_DISPLAY_NAME_SQL} AS display_name, u.avatar_url AS avatar_url
            FROM tournament_managers m
            LEFT JOIN users u ON u.id = m.user_id
           WHERE m.tournament_id = ?
@@ -334,6 +343,49 @@ export async function isEntrantMember(
     return !!row;
 }
 
+/**
+ * Which side of a tournament room every entrant member plays on: entrant 1 is Team 1, entrant 2
+ * is Team 2. The same join as {@link isEntrantMember}, over the FROZEN rosters, so the side a
+ * player is seated on and the door that let him in can never disagree.
+ */
+export const TOURNAMENT_SIDES_SQL =
+    `SELECT m.user_id,
+            CASE WHEN m.entrant_id = tm.entrant1_id THEN 1 ELSE 2 END AS side
+       FROM tournament_matches tm
+       JOIN tournament_entrant_members m
+         ON m.entrant_id = tm.entrant1_id OR m.entrant_id = tm.entrant2_id
+      WHERE tm.id = ?`;
+
+export async function entrantSidesForMatch(
+    db: Db,
+    tournamentMatchId: string,
+): Promise<Record<string, 1 | 2>> {
+    const r = await db.prepare(TOURNAMENT_SIDES_SQL)
+        .bind(tournamentMatchId).all<{ user_id: string; side: number }>();
+    const out: Record<string, 1 | 2> = {};
+    for (const row of r.results ?? []) out[row.user_id] = row.side === 1 ? 1 : 2;
+    return out;
+}
+
+/**
+ * The latest match reported from a room of this bracket slot — what the tournament detail
+ * reads to say why a played slot has not moved yet (`pending_report`).
+ */
+export async function latestReportForSlot(
+    db: Db,
+    tournamentMatchId: string,
+): Promise<string | null> {
+    const row = await db.prepare(
+        `SELECT m.id
+           FROM matches m
+           JOIN lobbies l ON l.id = m.lobby_id
+          WHERE l.tournament_match_id = ?
+          ORDER BY m.created_at DESC, m.rowid DESC
+          LIMIT 1`,
+    ).bind(tournamentMatchId).first<{ id: string }>();
+    return row?.id ?? null;
+}
+
 /** Every open room bound to any slot of this tournament — what cancelling has to close. */
 export async function openLobbiesForTournament(db: Db, tournamentId: string): Promise<string[]> {
     const r = await db.prepare(
@@ -345,25 +397,23 @@ export async function openLobbiesForTournament(db: Db, tournamentId: string): Pr
 }
 
 /**
- * The condition every public listing and both creation caps share.
+ * The public list's condition. It embeds `aliveWhereClause` - the rule both creation caps
+ * share - verbatim, so the list cannot hide what the cap still counts (the symptom would be
+ * somebody told they own two tournaments while seeing one).
  *
- * Exported and pinned by a test the way `LADDER_WHERE` is, because there is no database
- * harness in this repo and this string is the only place the "which tournaments exist"
- * rule is written down for SQL. If it and `isStale` drift, the list hides what the cap
- * still counts, and the symptom is somebody told they own two tournaments while seeing
- * one.
- *
- * Drafts are excluded here on purpose: a draft is invisible until its owner opens
- * registration. The owner's OWN drafts come back through `listOwnDrafts`, because
- * otherwise the person who just created one could not find it again.
+ * Drafts are excluded on purpose: a draft is invisible until its owner opens registration.
+ * The owner's OWN drafts come back through `listOwnDrafts`. An ended tournament stays only
+ * for its window (`publicWhereClause`): a cancelled one with no game played is the owner's
+ * alone (`listMine`), a finished one leaves after a month and stays with who took part.
  */
-export const TOURNAMENT_LIST_WHERE = `WHERE t.status <> 'draft' AND ${aliveWhereClause('t')}`;
+export const TOURNAMENT_LIST_WHERE = `WHERE ${publicWhereClause('t')}`;
 
 export interface TournamentListRow {
     id: string;
     name: string;
     mod_id: string;
     owner_user_id: string;
+    owner_name?: string | null;
     format: TournamentFormat;
     team_source: TeamSource;
     entry_mode: 'open' | 'approval';
@@ -372,6 +422,8 @@ export interface TournamentListRow {
     confirmed_count: number;
     entrant_count: number;
     pending_count: number;
+    /** 1 when a game of it was played - what keeps it from ever being deleted. */
+    has_games: number;
     created_at: string;
     last_activity_at: string;
 }
@@ -379,6 +431,7 @@ export interface TournamentListRow {
 export const LIST_COLUMNS = `
     t.id, t.name, t.mod_id, t.owner_user_id, t.format, t.team_source, t.entry_mode,
     t.status, t.capacity, t.confirmed_count, t.created_at, t.last_activity_at,
+    (SELECT ${USER_DISPLAY_NAME_SQL} FROM users u WHERE u.id = t.owner_user_id) AS owner_name,
     (SELECT COUNT(*) FROM tournament_entrants e
       WHERE e.tournament_id = t.id
         AND e.status IN ('pending','confirmed','waitlist')) AS entrant_count,
@@ -388,7 +441,10 @@ export const LIST_COLUMNS = `
     -- memo over this list stays anonymous.
     (SELECT COUNT(*) FROM tournament_entrants e
       WHERE e.tournament_id = t.id
-        AND e.status = 'pending') AS pending_count`;
+        AND e.status = 'pending') AS pending_count,
+    -- A property of the tournament, not of the viewer: the launcher offers Delete only on one
+    -- with no game, and the server refuses the rest anyway.
+    CASE WHEN ${playedSql('t')} THEN 1 ELSE 0 END AS has_games`;
 
 /** The public list: newest activity first, drafts excluded, stale ones already gone. */
 export async function listTournaments(db: Db, limit: number): Promise<TournamentListRow[]> {
@@ -421,7 +477,80 @@ export async function listOwnDrafts(db: Db, userId: string): Promise<TournamentL
     return r.results ?? [];
 }
 
-/** Rating rows for seeding, for exactly the users asked about. */
+/**
+ * The ended tournaments only the caller still sees (2026-11-11): their own cancelled or
+ * abandoned ones with no game played, for the week before the sweep deletes them, and the
+ * finished ones past the public month that they played in, organised or helped run. Capped
+ * at 20, and outside the anonymous memo for the reason `listOwnDrafts` is.
+ *
+ * Binds: the user id four times.
+ */
+export const MINE_SQL =
+    `SELECT ${LIST_COLUMNS}
+       FROM tournaments t
+      WHERE (t.owner_user_id = ?
+             AND t.status IN ('cancelled','abandoned')
+             AND NOT ${playedSql('t')}
+             AND julianday('now') - julianday(COALESCE(t.cancelled_at, t.abandoned_at, t.last_activity_at))
+                 <= ${UNPLAYED_KEEP_DAYS})
+         OR (t.status = 'finished'
+             AND julianday('now') - julianday(COALESCE(t.finished_at, t.last_activity_at)) > ${FINISHED_PUBLIC_DAYS}
+             AND (t.owner_user_id = ?
+                  OR EXISTS (SELECT 1 FROM tournament_managers mg
+                              WHERE mg.tournament_id = t.id AND mg.user_id = ?)
+                  OR EXISTS (SELECT 1 FROM tournament_entrant_members em
+                               JOIN tournament_entrants ee ON ee.id = em.entrant_id
+                              WHERE ee.tournament_id = t.id AND em.user_id = ?)))
+      ORDER BY t.last_activity_at DESC
+      LIMIT 20`;
+
+export async function listMine(db: Db, userId: string): Promise<TournamentListRow[]> {
+    const r = await db.prepare(MINE_SQL).bind(userId, userId, userId, userId).all<TournamentListRow>();
+    return r.results ?? [];
+}
+
+/**
+ * What the list needs to know about one player: the tournaments they are still in, and whether a
+ * match of theirs is waiting. The list itself is one anonymous payload shared by everybody, which
+ * is why this is a query of its own and never part of the memo.
+ *
+ * `alert` is 'play' when both sides are known and no room exists, or the room is the player's own,
+ * and 'join' when the rival opened it. A room is the open lobby bound to that bracket slot, the
+ * same test the tournament detail draws.
+ */
+export const MY_ENTRIES_SQL =
+    `SELECT e.tournament_id,
+            (SELECT CASE WHEN l.id IS NOT NULL AND l.host_user_id <> ? THEN 'join' ELSE 'play' END
+               FROM tournament_matches tm
+               LEFT JOIN lobbies l ON l.tournament_match_id = tm.id AND l.status <> 'closed'
+              WHERE tm.tournament_id = e.tournament_id AND tm.status = 'pending'
+                AND (tm.entrant1_id = e.id OR tm.entrant2_id = e.id)
+                AND tm.entrant1_id IS NOT NULL AND tm.entrant2_id IS NOT NULL
+              ORDER BY tm.round
+              LIMIT 1) AS alert
+       FROM tournament_entrant_members m
+       JOIN tournament_entrants e ON e.id = m.entrant_id
+       JOIN tournaments t ON t.id = e.tournament_id
+      WHERE m.user_id = ?
+        AND e.status IN ('confirmed','pending','waitlist')
+        AND t.status IN ('registration','ready','running')
+        AND ${aliveWhereClause('t')}`;
+
+export interface MyEntryRow {
+    tournament_id: string;
+    alert: 'play' | 'join' | null;
+}
+
+export async function listMyEntries(db: Db, userId: string): Promise<MyEntryRow[]> {
+    const r = await db.prepare(MY_ENTRIES_SQL).bind(userId, userId).all<MyEntryRow>();
+    return r.results ?? [];
+}
+
+/**
+ * Ratings for seeding, for exactly the users asked about, through the same helper every rating
+ * reader uses. A player with no rated match at all is left out, and seeding reads that as the
+ * default.
+ */
 export async function ratingsFor(
     db: Db,
     userIds: readonly string[],
@@ -429,12 +558,11 @@ export async function ratingsFor(
 ): Promise<Map<string, { rating: number; rd: number }>> {
     const out = new Map<string, { rating: number; rd: number }>();
     if (userIds.length === 0) return out;
-    const marks = userIds.map(() => '?').join(',');
-    const r = await db.prepare(
-        `SELECT user_id, rating, rd FROM elo_ratings
-          WHERE mode = ? AND user_id IN (${marks})`,
-    ).bind(mode, ...userIds).all<{ user_id: string; rating: number; rd: number }>();
-    for (const row of r.results ?? []) out.set(row.user_id, { rating: row.rating, rd: row.rd });
+    const eff = await effectiveRatings(db, userIds, mode);
+    for (const [id, r] of eff) {
+        if (r.source === 'default') continue;
+        out.set(id, { rating: r.rating, rd: r.rd });
+    }
     return out;
 }
 
@@ -777,6 +905,59 @@ export async function updateTournamentSettings(
     await db.prepare(
         `UPDATE tournaments SET ${sets.join(', ')}, last_activity_at = datetime('now') WHERE id = ?`,
     ).bind(...binds, tournamentId).run();
+}
+
+/**
+ * Delete a tournament its owner asked to delete - only a draft, cancelled or abandoned one with
+ * no game played. ONE conditional statement, so the rule is checked where the row dies: the
+ * route reads first to answer with the right reason, and this is what holds if something
+ * changed in between. The children go by `ON DELETE CASCADE` (entrants and their rosters,
+ * bracket slots, co-organisers). Returns whether it was deleted.
+ *
+ * Rooms keep a `tournament_match_id` with no foreign key; a closed room pointing at a slot
+ * that no longer exists is cleared afterwards, which is cosmetic.
+ */
+export async function deleteTournament(db: Db, tournamentId: string): Promise<boolean> {
+    const slots = await db.prepare(
+        `SELECT id FROM tournament_matches WHERE tournament_id = ?`,
+    ).bind(tournamentId).all<{ id: string }>();
+    const statuses = DELETABLE_STATUSES.map((s) => `'${s}'`).join(',');
+    const r = await db.prepare(
+        `DELETE FROM tournaments
+          WHERE id = ? AND status IN (${statuses}) AND NOT ${playedSql('tournaments')}`,
+    ).bind(tournamentId).run();
+    if (r.changes === 0) return false;
+    await unlinkRooms(db, (slots.results ?? []).map((s) => s.id));
+    return true;
+}
+
+/** Clear the slot a room pointed at, after its tournament is gone. */
+export async function unlinkRooms(db: Db, slotIds: readonly string[]): Promise<void> {
+    if (slotIds.length === 0) return;
+    await db.prepare(
+        `UPDATE lobbies SET tournament_match_id = NULL
+          WHERE tournament_match_id IN (${slotIds.map(() => '?').join(',')})`,
+    ).bind(...slotIds).run();
+}
+
+/** Whether a game of this tournament was played (see `playedSql`). */
+export async function hasGames(db: Db, tournamentId: string): Promise<boolean> {
+    const row = await db.prepare(
+        `SELECT CASE WHEN ${playedSql('t')} THEN 1 ELSE 0 END AS played FROM tournaments t WHERE t.id = ?`,
+    ).bind(tournamentId).first<{ played: number }>();
+    return (row?.played ?? 0) === 1;
+}
+
+/** The startup sweep's deletion: every tournament `dueForDeletionWhereClause` names. */
+export async function deleteDue(db: Db): Promise<string[]> {
+    const due = await db.prepare(
+        `SELECT t.id FROM tournaments t WHERE ${dueForDeletionWhereClause('t')}`,
+    ).bind().all<{ id: string }>();
+    const deleted: string[] = [];
+    for (const { id } of due.results ?? []) {
+        if (await deleteTournament(db, id)) deleted.push(id);
+    }
+    return deleted;
 }
 
 /**

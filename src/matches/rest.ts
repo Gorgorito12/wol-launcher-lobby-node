@@ -3,9 +3,15 @@ import { Errors } from '../lib/errors';
 import { uuid } from '../lib/ids';
 import { requireAuth } from '../middleware/auth';
 import { ipRateLimit, Limits } from '../middleware/rateLimit';
-import { applyMatch, DEFAULT_RATING, DEFAULT_RD, DEFAULT_VOLATILITY,
-         type ParticipantOutcome, type RatingMode } from '../elo/glicko2';
-import { ratabilityReason, compareReadings, canUpgradeFromConfirmation, WIN_AT, LOSS_AT,
+import { type ParticipantOutcome, type RatingMode } from '../elo/glicko2';
+import { effectiveRatings, rateStoredMatch, type PlayerChange, type RatedMatch } from '../elo/ladder';
+import { placementRequired } from '../elo/placement';
+import {
+    historyRowFor, participantsFor, resultParticipantsFor, standingShownTo, type CurrentGames,
+} from '../elo/placementPrivacy';
+import { isNewAccountShort } from '../elo/newAccount';
+import { checkPairAlerts } from '../elo/alerts';
+import { ratabilityReason, isRankedMod, compareReadings, canUpgradeFromConfirmation, WIN_AT, LOSS_AT,
          matchShape, teamEvidenceMet, isDecided, MIN_DURATION_SECONDS, MAX_AGE_MS,
          type UnratedReason } from '../elo/ratability';
 import { decideByAbandon, PAIR_COOLDOWN_MS, type AbandonRecord } from '../elo/abandon';
@@ -17,8 +23,15 @@ import { sqliteTimestampToMs, normaliseSqliteTimestamp } from '../lib/time';
 import { finalizeRoom } from '../lobbies/discordAnnounce';
 import { advanceTournamentFromMatch } from '../tournaments/advance';
 import { getTournament, loadBracket } from '../tournaments/store';
-import { invalidateCivStatsCaches, ladderRanks, ladderSize } from '../stats/rest';
+import { invalidateMatchStatsCaches, ladderRanks, ladderSize, ratedRecordFor } from '../stats/rest';
+import { refundsFor, standingFor } from '../stats/standing';
+import { maybePostMonthlyHighlights } from '../stats/highlightsAnnounce';
+import { parseRoomTeams, sidesFromParticipants, sidesFromRoomTeams, teamsMismatch } from './teamsMismatch';
+import { recordIpHash, requestIpHash } from '../lib/ipHash';
 import { normalizeBadgeMode } from '../users/badgeMode';
+import { replayView } from '../replays/rules';
+import { TOURNAMENT_REF_COLUMNS, TOURNAMENT_REF_JOIN, withTournamentRef } from '../tournaments/matchRef';
+import { teamEvidenceForMatch, type GameFingerprint } from './teamEvidence';
 import type { AppContext } from '../context';
 
 interface ReportMatchBody {
@@ -66,6 +79,105 @@ function parseRoster(json: string | null): Set<string> | null {
     } catch {
         return null;
     }
+}
+
+/** Each player's change from one rating. Empty when nothing rated. */
+type RatingDiff = Map<string, PlayerChange>;
+
+/**
+ * The latest IP hash a player reached a room from, as a scalar subquery for an INSERT into
+ * match_participants. Binds: lobby id, user id. NULL when none was recorded.
+ */
+const LATEST_IP_HASH_SQL =
+    `(SELECT ip_hash FROM lobby_member_ips WHERE lobby_id = ? AND user_id = ?
+       ORDER BY seen_at DESC LIMIT 1)`;
+
+/**
+ * The new-account rule (src/elo/newAccount.ts), asked of a STORED match: every input is a stored
+ * row — the match's own `created_at` and duration, each player's account age, and every IP hash
+ * the room recorded for them — so the answer never depends on the clock at the moment it is
+ * asked. Never throws: a lookup that fails answers false, and the match rates as it always did.
+ */
+async function isNewAccountShortMatch(ctx: AppContext, matchId: string): Promise<boolean> {
+    try {
+        const m = await ctx.db.prepare(
+            `SELECT created_at, duration_seconds, lobby_id, rating_mode FROM matches WHERE id = ?`,
+        ).bind(matchId).first<{
+            created_at: string; duration_seconds: number | null; lobby_id: string | null; rating_mode: string | null;
+        }>();
+        if (!m) return false;
+        const parts = await ctx.db.prepare(
+            `SELECT p.user_id, p.team, p.ip_hash, u.created_at AS account_created
+               FROM match_participants p JOIN users u ON u.id = p.user_id
+              WHERE p.match_id = ? ORDER BY p.user_id`,
+        ).bind(matchId).all<{ user_id: string; team: number; ip_hash: string | null; account_created: string | null }>();
+        const rows = parts.results ?? [];
+        const ips = new Map<string, Set<string>>();
+        const add = (id: string, h: string | null) => {
+            if (!h) return;
+            const set = ips.get(id) ?? new Set<string>();
+            set.add(h);
+            ips.set(id, set);
+        };
+        for (const r of rows) add(r.user_id, r.ip_hash);
+        if (m.lobby_id) {
+            const seen = await ctx.db.prepare(
+                `SELECT user_id, ip_hash FROM lobby_member_ips WHERE lobby_id = ?`,
+            ).bind(m.lobby_id).all<{ user_id: string; ip_hash: string }>();
+            for (const r of seen.results ?? []) add(r.user_id, r.ip_hash);
+        }
+        const isTeam = m.rating_mode === 'team';
+        return isNewAccountShort({
+            participants: rows.map((r, i) => ({
+                userId: r.user_id,
+                // In a 1v1 both players report team 0; each is his own side.
+                side: isTeam ? (r.team | 0) : i,
+                accountCreatedMs: sqliteTimestampToMs(r.account_created),
+                ipHashes: ips.get(r.user_id) ?? new Set<string>(),
+            })),
+            durationSeconds: m.duration_seconds ?? 0,
+            matchAtMs: sqliteTimestampToMs(m.created_at) ?? Date.now(),
+            shortSeconds: ctx.config.newAccountShortMatchSeconds,
+        });
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * The fields a rating adds to the result payloads (`POST /matches`, the room's `match_reported`)
+ * and to the `match_rated` frame: the anti-farm factor and streak, the ladder, whether it was a
+ * tournament game, and per player the deviation, the placement progress and — for whoever just
+ * finished placement — the rank he enters the table at.
+ */
+async function ratingExtras(
+    ctx: AppContext,
+    matchId: string,
+    mode: RatingMode,
+    rated: RatedMatch | null,
+): Promise<{ top: Record<string, unknown>; perUser: Map<string, Record<string, unknown>> }> {
+    const t = await ctx.db.prepare(`SELECT tournament_match_id FROM matches WHERE id = ?`)
+        .bind(matchId).first<{ tournament_match_id: string | null }>();
+    const top: Record<string, unknown> = { rating_mode: mode, tournament: !!t?.tournament_match_id };
+    const perUser = new Map<string, Record<string, unknown>>();
+    if (!rated) return { top, perUser };
+    top.elo_factor = rated.eloFactor;
+    top.farm_streak = rated.farmStreak;
+    const required = placementRequired(mode);
+    const completed = [...rated.perPlayer].filter(([, c]) => c.gamesAfter === required).map(([id]) => id);
+    const ranks = completed.length ? await ladderRanks(ctx, completed, mode) : new Map<string, number>();
+    for (const [id, c] of rated.perPlayer) {
+        const done = c.gamesAfter === required;
+        perUser.set(id, {
+            rd_before: c.rdBefore,
+            rd_after: c.rdAfter,
+            placement_played: Math.min(c.gamesAfter, required),
+            placement_required: required,
+            placement_completed: done,
+            entered_rank: done ? (ranks.get(id) ?? null) : null,
+        });
+    }
+    return { top, perUser };
 }
 
 interface ConfirmationRow {
@@ -164,8 +276,25 @@ async function fillMissingCivs(
     }
     // The civilization and matchup tables are memoised for a minute; a match that just
     // gained its civilizations should show up on the next request, not the next minute.
-    if (filled > 0) invalidateCivStatsCaches();
+    if (filled > 0) void notifyMatchesChanged(ctx, matchId);
     return filled;
+}
+
+/**
+ * A match was stored, or its result, rating or civilizations changed: forget the stats memos
+ * built from the matches table and tell every open launcher, so the pages showing the
+ * community's matches refresh now (the `matches_changed` frame, batched per second). Looks the
+ * participants up itself so every call site is one line. Never awaited by a route and never
+ * throws: an announcement must not slow down or fail a report.
+ */
+async function notifyMatchesChanged(ctx: AppContext, matchId: string): Promise<void> {
+    try {
+        invalidateMatchStatsCaches();
+        const rows = await ctx.db.prepare(
+            `SELECT user_id FROM match_participants WHERE match_id = ?`,
+        ).bind(matchId).all<{ user_id: string }>();
+        ctx.globalChat.announceMatchesChanged(matchId, (rows.results ?? []).map((r) => r.user_id));
+    } catch { /* best-effort */ }
 }
 
 /**
@@ -195,11 +324,6 @@ async function applyConfirmedCivs(
     }
 }
 
-/** The match's own fingerprint, to compare a confirmation against. */
-interface GameFingerprint {
-    seed: number | null;
-    hostTime: number | null;
-}
 
 /**
  * Tie a lobby's stored confirmations to a match and write down whether they agree.
@@ -310,10 +434,12 @@ async function tieConfirmations(
 /**
  * Advance the bracket this match belongs to, and tell the two sides.
  *
- * Called from THREE places, because a match can be decided at three different moments:
- * the host's report, a late 1v1 reading, and a team match's other side finally agreeing.
- * The third is the one that is easy to forget and the one without which no team
- * tournament would ever finish a round.
+ * Called wherever a match can be decided: the host's report, the late 1v1 paths (a reading,
+ * an abandonment), a team match released by the other side's reading, and the tail of
+ * `POST /matches/confirm`. Every call is safe to repeat. What decides whether the slot
+ * MOVES is src/tournaments/reportVerdict.ts: a team match moves only once the OTHER side has
+ * corroborated it, never on the host's report alone and never when it was played with other
+ * sides than the room's.
  *
  * Never throws. By the time it runs the match is stored and rated, so a bracket that
  * fails to move must not cost the report — the owner can award the match by hand, and the
@@ -380,12 +506,14 @@ async function maybeDecideByAbandonLater(
     log: FastifyBaseLogger,
     lobbyId: string,
     matchId: string,
+    nowMs: number = Date.now(),
 ): Promise<void> {
     try {
         const match = await ctx.db.prepare(
-            `SELECT id, mod_id, map_name, unrated_reason FROM matches WHERE id = ?`,
+            `SELECT id, mod_id, map_name, unrated_reason, created_at FROM matches WHERE id = ?`,
         ).bind(matchId).first<{
             id: string; mod_id: string; map_name: string | null; unrated_reason: string | null;
+            created_at: string;
         }>();
         if (!match || match.unrated_reason !== 'no_decided_result') return;
 
@@ -413,11 +541,18 @@ async function maybeDecideByAbandonLater(
             return;
         }
 
+        // A match the new-account rule refuses is still decided — the bracket needs the result —
+        // but rates nobody. See isNewAccountShortMatch.
+        const closed = await isNewAccountShortMatch(ctx, matchId);
+
         // CLAIM the row, exactly as the late-reading path does: both can fire for one match
         // and a client can resend, and an await is where two requests interleave.
         const claim = await ctx.db.prepare(
-            `UPDATE matches SET unrated_reason = NULL, rated = 1, decided_by = 'abandon'
-             WHERE id = ? AND unrated_reason = 'no_decided_result'`,
+            closed
+                ? `UPDATE matches SET unrated_reason = 'new_account_short', rated = 0, decided_by = 'abandon'
+                   WHERE id = ? AND unrated_reason = 'no_decided_result'`
+                : `UPDATE matches SET unrated_reason = NULL, rated = 1, decided_by = 'abandon'
+                   WHERE id = ? AND unrated_reason = 'no_decided_result'`,
         ).bind(matchId).run();
         if (!claim.changes) {
             log.info({ match_id: matchId }, 'late abandonment lost the race; already decided');
@@ -433,26 +568,21 @@ async function maybeDecideByAbandonLater(
                 `UPDATE match_participants SET result = ? WHERE match_id = ? AND user_id = ?`,
             ).bind(o.result, matchId, o.userId)));
 
-            const diff = await withLadderLock(() => applyMatch(ctx.db, outcomes));
-
-            const stamps = [];
-            for (const o of outcomes) {
-                const d = diff.get(o.userId);
-                if (!d) continue;
-                stamps.push(ctx.db.prepare(
-                    `UPDATE match_participants SET rating_before = ?, rating_after = ?
-                     WHERE match_id = ? AND user_id = ?`,
-                ).bind(d.before, d.after, matchId, o.userId));
-            }
-            if (stamps.length) await ctx.db.batch(stamps);
+            const rated = closed ? null
+                : await withLadderLock(() => rateStoredMatch(ctx.db, matchId, 'default'));
+            const diff: RatingDiff = rated?.perPlayer ?? new Map();
+            const extras = await ratingExtras(ctx, matchId, 'default', rated);
 
             log.info(
-                { match_id: matchId, lobby_id: lobbyId,
+                { match_id: matchId, lobby_id: lobbyId, new_account_short: closed,
                   winner: verdict.winnerId, loser: verdict.loserId, reason: verdict.reason },
-                'match decided by abandonment, after the report',
+                closed
+                    ? 'match decided by abandonment; new account and short, result kept, not rated'
+                    : 'match decided by abandonment, after the report',
             );
 
             // The room closed minutes ago, so this is the only way either player learns it.
+            void notifyMatchesChanged(ctx, matchId);
             ctx.globalChat.announceMatchRated({
                 matchId,
                 lobbyId,
@@ -460,8 +590,13 @@ async function maybeDecideByAbandonLater(
                 mapName: match.map_name,
                 perUser: new Map(outcomes.map((o) => {
                     const d = diff.get(o.userId);
-                    return [o.userId, { result: o.result, before: d?.before ?? null, after: d?.after ?? null }];
+                    return [o.userId, {
+                        result: o.result, before: d?.before ?? null, after: d?.after ?? null,
+                        extra: extras.perUser.get(o.userId),
+                    }];
                 })),
+                unratedReason: closed ? 'new_account_short' : null,
+                extra: extras.top,
             });
 
             await maybeAdvanceTournament(ctx, log, matchId);
@@ -491,15 +626,20 @@ async function maybeUpgradeFromConfirmation(
     log: FastifyBaseLogger,
     lobbyId: string,
     matchId: string,
+    nowMs: number = Date.now(),
 ): Promise<void> {
     const match = await ctx.db.prepare(
-        `SELECT id, mod_id, map_name, unrated_reason, game_seed, game_host_time
+        `SELECT id, mod_id, map_name, unrated_reason, game_seed, game_host_time, created_at
          FROM matches WHERE id = ?`,
     ).bind(matchId).first<{
         id: string; mod_id: string; map_name: string | null;
         unrated_reason: string | null; game_seed: number | null; game_host_time: number | null;
+        created_at: string;
     }>();
     if (!match || match.unrated_reason !== 'no_decided_result') return;
+
+    // Decided either way; not rated when the new-account rule applies. See isNewAccountShortMatch.
+    const closed = await isNewAccountShortMatch(ctx, matchId);
 
     const roster = await ctx.db.prepare(
         `SELECT roster_at_start FROM lobbies WHERE id = ?`,
@@ -550,8 +690,11 @@ async function maybeUpgradeFromConfirmation(
 
         // CLAIM the row. Zero changes means another path already decided this match.
         const claim = await ctx.db.prepare(
-            `UPDATE matches SET unrated_reason = NULL, rated = 1, decided_by = ?
-             WHERE id = ? AND unrated_reason = 'no_decided_result'`,
+            closed
+                ? `UPDATE matches SET unrated_reason = 'new_account_short', rated = 0, decided_by = ?
+                   WHERE id = ? AND unrated_reason = 'no_decided_result'`
+                : `UPDATE matches SET unrated_reason = NULL, rated = 1, decided_by = ?
+                   WHERE id = ? AND unrated_reason = 'no_decided_result'`,
         ).bind(row.user_id, matchId).run();
         if (!claim.changes) {
             log.info({ match_id: matchId }, 'late reading lost the race; already decided');
@@ -599,26 +742,22 @@ async function maybeUpgradeFromConfirmation(
                 await ctx.db.batch(resultWrites);
             }
 
-            const diff = await withLadderLock(() => applyMatch(ctx.db, outcomes));
-
-            const stamps = [];
-            for (const o of outcomes) {
-                const d = diff.get(o.userId);
-                if (!d) continue;
-                stamps.push(ctx.db.prepare(
-                    `UPDATE match_participants SET rating_before = ?, rating_after = ?
-                     WHERE match_id = ? AND user_id = ?`,
-                ).bind(d.before, d.after, matchId, o.userId));
-            }
-            if (stamps.length) await ctx.db.batch(stamps);
+            const rated = closed ? null
+                : await withLadderLock(() => rateStoredMatch(ctx.db, matchId, 'default'));
+            const diff: RatingDiff = rated?.perPlayer ?? new Map();
+            const extras = await ratingExtras(ctx, matchId, 'default', rated);
 
             log.info(
                 { match_id: matchId, lobby_id: lobbyId, decided_by: row.user_id,
+                  new_account_short: closed,
                   reason: decision.reason, adopted_fingerprint: decision.adoptFingerprint },
-                'match decided by a late reading',
+                closed
+                    ? 'match decided by a late reading; new account and short, result kept, not rated'
+                    : 'match decided by a late reading',
             );
 
             // The room closed minutes ago, so this is the only way either player learns it.
+            void notifyMatchesChanged(ctx, matchId);
             ctx.globalChat.announceMatchRated({
                 matchId,
                 lobbyId,
@@ -626,8 +765,13 @@ async function maybeUpgradeFromConfirmation(
                 mapName: match.map_name,
                 perUser: new Map(outcomes.map((o) => {
                     const d = diff.get(o.userId);
-                    return [o.userId, { result: o.result, before: d?.before ?? null, after: d?.after ?? null }];
+                    return [o.userId, {
+                        result: o.result, before: d?.before ?? null, after: d?.after ?? null,
+                        extra: extras.perUser.get(o.userId),
+                    }];
                 })),
+                unratedReason: closed ? 'new_account_short' : null,
+                extra: extras.top,
             });
 
             // A 1v1 settled minutes after the fact still has to move its bracket, with the
@@ -657,57 +801,8 @@ async function maybeUpgradeFromConfirmation(
     }
 }
 
-/**
- * Whether a team match has the reading from the OTHER side that lets it rate.
- *
- * <p>The I/O half of {@link teamEvidenceMet}. It recomputes `agreement` and `same_game`
- * in memory with exactly the rules `tieConfirmations` writes to the row, rather than
- * reading the stored columns — <b>because at report time they are not written yet</b>.
- * The player who just lost usually leaves first, so their confirmation routinely lands
- * before the match row exists, and `tieConfirmations` only runs once it does. Reading
- * the columns here would therefore report "no evidence" for precisely the ordering that
- * is most common.</p>
- *
- * <p>The stored columns remain the durable record; this is the same question asked a few
- * milliseconds earlier.</p>
- */
-async function teamEvidenceForMatch(
-    ctx: AppContext,
-    lobbyId: string | null,
-    participants: readonly { user_id: string; team: number; result: number }[],
-    reporterUserId: string,
-    fingerprint: GameFingerprint,
-): Promise<boolean> {
-    if (!lobbyId) return false;
-
-    const teams = new Map(participants.map((p) => [p.user_id, p.team | 0] as [string, number]));
-    const reported = new Map(participants.map((p) => [p.user_id, p.result] as [string, number]));
-
-    const rows = await ctx.db.prepare(
-        `SELECT user_id, result, game_seed FROM match_confirmations WHERE lobby_id = ?`,
-    ).bind(lobbyId).all<{ user_id: string; result: number; game_seed: number | null }>();
-
-    const confirmations = (rows.results ?? []).map((r) => {
-        const reportedResult = reported.get(r.user_id);
-        return {
-            userId: r.user_id,
-            agreement: reportedResult === undefined
-                ? 'not_reported'
-                : compareReadings(reportedResult, r.result),
-            // Seed alone, the same rule tieConfirmations uses — both machines must
-            // generate the same map, so they must share it.
-            sameGame: fingerprint.seed === null || r.game_seed === null
-                ? 'unknown'
-                : String(fingerprint.seed === r.game_seed),
-        };
-    });
-
-    return teamEvidenceMet({
-        teams,
-        reporterTeam: teams.get(reporterUserId) ?? null,
-        confirmations,
-    });
-}
+// teamEvidenceForMatch — "has the other side corroborated this team match?" — lives in
+// ./teamEvidence.ts, because the bracket asks the same question (tournaments/advance.ts).
 
 /**
  * Rate a team match that was stored waiting for the opposing side's reading, now that
@@ -730,10 +825,11 @@ async function maybeRateAwaitingTeamMatch(
     log: FastifyBaseLogger,
     lobbyId: string,
     matchId: string,
+    nowMs: number = Date.now(),
 ): Promise<void> {
     const match = await ctx.db.prepare(
         `SELECT unrated_reason, rating_mode, game_seed, game_host_time,
-                host_user_id, mod_id, map_name
+                host_user_id, mod_id, map_name, created_at
          FROM matches WHERE id = ?`,
     ).bind(matchId).first<{
         unrated_reason: string | null;
@@ -743,6 +839,7 @@ async function maybeRateAwaitingTeamMatch(
         host_user_id: string;
         mod_id: string;
         map_name: string | null;
+        created_at: string;
     }>();
     if (!match || match.unrated_reason !== 'awaiting_confirmation') return;
 
@@ -758,9 +855,16 @@ async function maybeRateAwaitingTeamMatch(
     );
     if (!met) return;
 
+    // The new-account rule applies to a team match too: its result stands — the bracket
+    // moves — and nobody is rated.
+    const closed = await isNewAccountShortMatch(ctx, matchId);
+
     const claim = await ctx.db.prepare(
-        `UPDATE matches SET unrated_reason = NULL, rated = 1
-         WHERE id = ? AND unrated_reason = 'awaiting_confirmation'`,
+        closed
+            ? `UPDATE matches SET unrated_reason = 'new_account_short', rated = 0
+               WHERE id = ? AND unrated_reason = 'awaiting_confirmation'`
+            : `UPDATE matches SET unrated_reason = NULL, rated = 1
+               WHERE id = ? AND unrated_reason = 'awaiting_confirmation'`,
     ).bind(matchId).run();
     if (!claim.changes) {
         log.info({ match_id: matchId }, 'team match already rated by another path');
@@ -776,24 +880,19 @@ async function maybeRateAwaitingTeamMatch(
             team: p.team | 0,
         }));
 
-        const diff = await withLadderLock(() => applyMatch(ctx.db, outcomes, mode));
+        const rated = closed ? null
+            : await withLadderLock(() => rateStoredMatch(ctx.db, matchId, mode));
+        const diff: RatingDiff = rated?.perPlayer ?? new Map();
+        const extras = await ratingExtras(ctx, matchId, mode, rated);
 
-        const stamps = [];
-        for (const o of outcomes) {
-            const d = diff.get(o.userId);
-            if (!d) continue;
-            stamps.push(ctx.db.prepare(
-                `UPDATE match_participants SET rating_before = ?, rating_after = ?
-                 WHERE match_id = ? AND user_id = ?`,
-            ).bind(d.before, d.after, matchId, o.userId));
-        }
-        if (stamps.length) await ctx.db.batch(stamps);
-
-        log.info({ match_id: matchId, lobby_id: lobbyId, mode },
-            'team match rated once both sides had read it');
+        log.info({ match_id: matchId, lobby_id: lobbyId, mode, new_account_short: closed },
+            closed
+                ? 'team match corroborated; new account and short, result kept, not rated'
+                : 'team match rated once both sides had read it');
 
         // The room closed when the host reported, so this is the only way anybody learns
         // the match ended up counting.
+        void notifyMatchesChanged(ctx, matchId);
         ctx.globalChat.announceMatchRated({
             matchId,
             lobbyId,
@@ -801,13 +900,18 @@ async function maybeRateAwaitingTeamMatch(
             mapName: match.map_name,
             perUser: new Map(outcomes.map((o) => {
                 const d = diff.get(o.userId);
-                return [o.userId, { result: o.result, before: d?.before ?? null, after: d?.after ?? null }];
+                return [o.userId, {
+                    result: o.result, before: d?.before ?? null, after: d?.after ?? null,
+                    extra: extras.perUser.get(o.userId),
+                }];
             })),
+            unratedReason: closed ? 'new_account_short' : null,
+            extra: extras.top,
         });
 
-        // THE ONE THAT MAKES TEAM TOURNAMENTS WORK. A team match is never rated on the
-        // reporter's word: it sits `awaiting_confirmation` until the other side agrees, and
-        // this is where that agreement lands. Without this call no team bracket ever moves.
+        // Where most team brackets move. A team match is never rated — and its bracket never
+        // advances — on the reporter's word: it sits `awaiting_confirmation` until the other
+        // side agrees, and this is where that agreement lands (src/tournaments/reportVerdict.ts).
         await maybeAdvanceTournament(ctx, log, matchId);
     } catch (err) {
         // Back to waiting. The results are untouched by design, so only the rating state
@@ -984,10 +1088,17 @@ async function abandonVerdict(
  *
  * ONE extra query for the whole page, never one per match: fifty ids go into a single
  * IN and the rows are grouped here.
+ *
+ * <p><b>`viewerId` decides whose numbers are shown.</b> A participant still being PLACED on the
+ * match's ladder reaches nobody but himself with his before/after, and every participant carries
+ * his current placement progress so the launcher can say so (src/elo/placementPrivacy.ts). Null
+ * — the default — is a payload shared by everyone, such as the cached `recent_matches`, and hides
+ * him from all.</p>
  */
 export async function attachParticipants(
     ctx: AppContext,
     matches: Array<Record<string, unknown> & { id: string }>,
+    viewerId: string | null = null,
 ): Promise<void> {
     if (matches.length === 0) return;
 
@@ -995,8 +1106,10 @@ export async function attachParticipants(
     const parts = await ctx.db.prepare(
         `SELECT mp.match_id, mp.user_id, mp.team, mp.civ, mp.home_city, mp.result,
                 mp.rating_before, mp.rating_after,
+                COALESCE(m.rating_mode, 'default') AS rating_mode,
                 u.discord_username, u.display_name, u.avatar_url
          FROM match_participants mp
+         JOIN matches m ON m.id = mp.match_id
          -- INNER, and unlike the two LEFT JOINs on elo_ratings elsewhere in this codebase
          -- that is right here: match_participants.user_id is a FK to users(id) ON DELETE
          -- CASCADE, so a participant cannot outlive its user. A LEFT could only add a
@@ -1017,18 +1130,22 @@ export async function attachParticipants(
         result: number;
         rating_before: number | null;
         rating_after: number | null;
+        rating_mode: string;
         discord_username: string;
         display_name: string;
         avatar_url: string | null;
     }>();
 
-    const byMatch = new Map<string, unknown[]>();
+    const games = await currentGames(ctx, (parts.results ?? []).map((p) => p.user_id));
+
+    const byMatch = new Map<string, { mode: RatingMode; list: Array<{ user_id: string } & Record<string, unknown>> }>();
     for (const p of parts.results ?? []) {
-        let list = byMatch.get(p.match_id);
-        if (!list) {
-            list = [];
-            byMatch.set(p.match_id, list);
+        let entry = byMatch.get(p.match_id);
+        if (!entry) {
+            entry = { mode: p.rating_mode === 'team' ? 'team' : 'default', list: [] };
+            byMatch.set(p.match_id, entry);
         }
+        const list = entry.list;
         // Same shape the rooms list already uses for a lobby host, so the launcher parses
         // one convention rather than a third one invented here.
         list.push({
@@ -1051,7 +1168,30 @@ export async function attachParticipants(
         });
     }
 
-    for (const m of matches) m.participants = byMatch.get(m.id) ?? [];
+    for (const m of matches) {
+        const entry = byMatch.get(m.id);
+        m.participants = entry ? participantsFor(entry.list, entry.mode, viewerId, games) : [];
+    }
+}
+
+/**
+ * Rated matches each of these players has on each ladder RIGHT NOW — the "current state" the
+ * placement-privacy rule reads (src/elo/placementPrivacy.ts). Through the same helper the engine
+ * reads, so a player with no row is the unplayed default, 0. A database error is NOT swallowed:
+ * guessing "nobody is placing" would publish exactly the numbers this exists to withhold.
+ */
+export async function currentGames(ctx: AppContext, userIds: readonly string[]): Promise<CurrentGames> {
+    const unique = [...new Set(userIds)];
+    const out = new Map<string, { default: number; team: number }>();
+    if (unique.length === 0) return out;
+    const [solo, team] = await Promise.all([
+        effectiveRatings(ctx.db, unique, 'default'),
+        effectiveRatings(ctx.db, unique, 'team'),
+    ]);
+    for (const id of unique) {
+        out.set(id, { default: solo.get(id)?.games_played ?? 0, team: team.get(id)?.games_played ?? 0 });
+    }
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -1178,11 +1318,12 @@ async function foundMatchFromReadingsInner(
 ): Promise<string | null> {
     const lobby = await ctx.db.prepare(
         `SELECT host_user_id, mod_id, mod_combined_hash, status, started_at, roster_at_start,
-                competitive
+                competitive, tournament_match_id
            FROM lobbies WHERE id = ?`,
     ).bind(lobbyId).first<{
         host_user_id: string; mod_id: string; mod_combined_hash: string; status: string;
         started_at: string | null; roster_at_start: string | null; competitive: number;
+        tournament_match_id: string | null;
     }>();
     if (!lobby || lobby.competitive !== 1) return null;
 
@@ -1257,10 +1398,10 @@ async function foundMatchFromReadingsInner(
     const founder = readings.find((r) => r.user_id === decision.founderId)!;
 
     // The eligibility a report has to pass, asked of what the server itself knows: the mod
-    // is the room's, the clock runs from the room's start to the moment the founding reading
-    // arrived — the launcher confirms within seconds of its game closing.
-    const mod = (lobby.mod_id || '').trim().toLowerCase();
-    if (!ctx.config.rankedModIds.some((m) => m === mod)) {
+    // is the room's (ranked unless the operator narrowed RANKED_MOD_IDS), the clock runs from
+    // the room's start to the moment the founding reading arrived — the launcher confirms
+    // within seconds of its game closing.
+    if (!isRankedMod(ctx.config.rankedModIds, lobby.mod_id)) {
         log.info({ lobby_id: lobbyId, mod_id: lobby.mod_id }, 'founding refused: mod not ranked');
         return null;
     }
@@ -1285,21 +1426,24 @@ async function foundMatchFromReadingsInner(
             `INSERT INTO matches (id, lobby_id, host_user_id, mod_id, mod_combined_hash,
                                   map_name, map_pool, duration_seconds, started_at, ended_at,
                                   replay_sha256, game_seed, game_host_time,
-                                  unrated_reason, rated, decided_by, rating_mode)
-             VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, 'no_decided_result', 0, 'founded', 'default')`,
+                                  unrated_reason, rated, decided_by, rating_mode,
+                                  tournament_match_id)
+             VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, 'no_decided_result', 0, 'founded', 'default', ?)`,
         ).bind(
             matchId, lobbyId, lobby.host_user_id, lobby.mod_id, lobby.mod_combined_hash,
             durationSeconds,
             normaliseSqliteTimestamp(lobby.started_at!),
             new Date(endedAtMs).toISOString(),
             founder.replay_sha256, founder.game_seed, founder.game_host_time,
+            lobby.tournament_match_id ?? null,
         ),
     ];
     for (const id of participantIds) {
         inserts.push(ctx.db.prepare(
-            `INSERT INTO match_participants (match_id, user_id, team, civ, home_city, score, result)
-             VALUES (?, ?, 0, ?, ?, 0, ?)`,
-        ).bind(matchId, id, civs[id] ?? null, homeCities[id] ?? null, results.get(id) ?? 0.5));
+            `INSERT INTO match_participants (match_id, user_id, team, civ, home_city, score, result, ip_hash)
+             VALUES (?, ?, 0, ?, ?, 0, ?, ${LATEST_IP_HASH_SQL})`,
+        ).bind(matchId, id, civs[id] ?? null, homeCities[id] ?? null, results.get(id) ?? 0.5,
+               lobbyId, id));
     }
     await ctx.db.batch(inserts);
 
@@ -1307,20 +1451,17 @@ async function foundMatchFromReadingsInner(
         const outcomes: ParticipantOutcome[] = participantIds.map((id) => ({
             userId: id, result: results.get(id) ?? 0.5,
         }));
-        const diff = await withLadderLock(() => applyMatch(ctx.db, outcomes));
-
-        const stamps = [ctx.db.prepare(
-            `UPDATE matches SET unrated_reason = NULL, rated = 1 WHERE id = ?`,
-        ).bind(matchId)];
-        for (const o of outcomes) {
-            const d = diff.get(o.userId);
-            if (!d) continue;
-            stamps.push(ctx.db.prepare(
-                `UPDATE match_participants SET rating_before = ?, rating_after = ?
-                 WHERE match_id = ? AND user_id = ?`,
-            ).bind(d.before, d.after, matchId, o.userId));
-        }
-        await ctx.db.batch(stamps);
+        // A founded match falls under the new-account rule like any other: decided, not rated.
+        const closed = await isNewAccountShortMatch(ctx, matchId);
+        const rated = closed ? null
+            : await withLadderLock(() => rateStoredMatch(ctx.db, matchId, 'default'));
+        const diff: RatingDiff = rated?.perPlayer ?? new Map();
+        await ctx.db.prepare(
+            closed
+                ? `UPDATE matches SET unrated_reason = 'new_account_short', rated = 0 WHERE id = ?`
+                : `UPDATE matches SET unrated_reason = NULL, rated = 1 WHERE id = ?`,
+        ).bind(matchId).run();
+        const extras = await ratingExtras(ctx, matchId, 'default', rated);
 
         await tieConfirmations(
             ctx, log, lobbyId, matchId,
@@ -1335,6 +1476,7 @@ async function foundMatchFromReadingsInner(
         );
 
         // Nobody is in the room any more, so this is the only way either player learns it.
+        void notifyMatchesChanged(ctx, matchId);
         ctx.globalChat.announceMatchRated({
             matchId,
             lobbyId,
@@ -1342,8 +1484,13 @@ async function foundMatchFromReadingsInner(
             mapName: null,
             perUser: new Map(outcomes.map((o) => {
                 const d = diff.get(o.userId);
-                return [o.userId, { result: o.result, before: d?.before ?? null, after: d?.after ?? null }];
+                return [o.userId, {
+                    result: o.result, before: d?.before ?? null, after: d?.after ?? null,
+                    extra: extras.perUser.get(o.userId),
+                }];
             })),
+            unratedReason: closed ? 'new_account_short' : null,
+            extra: extras.top,
         });
 
         await maybeAdvanceTournament(ctx, log, matchId);
@@ -1421,9 +1568,10 @@ async function maybeVoidByCrashLater(
 ): Promise<void> {
     try {
         const match = await ctx.db.prepare(
-            `SELECT rated, rating_mode, mod_id, map_name FROM matches WHERE id = ?`,
+            `SELECT rated, rating_mode, mod_id, map_name, created_at FROM matches WHERE id = ?`,
         ).bind(matchId).first<{
             rated: number | null; rating_mode: string | null; mod_id: string; map_name: string | null;
+            created_at: string;
         }>();
         if (!match || match.rated !== 1) return;
         if (match.rating_mode === 'team') return;
@@ -1452,6 +1600,7 @@ async function maybeVoidByCrashLater(
 
         // Both players learn it stopped counting. Results are kept — the card shows what the
         // recording said — and the ratings are null: nothing moved.
+        void notifyMatchesChanged(ctx, matchId);
         ctx.globalChat.announceMatchRated({
             matchId,
             lobbyId,
@@ -1518,10 +1667,10 @@ async function maybeRevertContradictedFounding(
 ): Promise<void> {
     try {
         const match = await ctx.db.prepare(
-            `SELECT decided_by, rated, game_seed, game_host_time FROM matches WHERE id = ?`,
+            `SELECT decided_by, rated, game_seed, game_host_time, created_at FROM matches WHERE id = ?`,
         ).bind(matchId).first<{
             decided_by: string | null; rated: number | null;
-            game_seed: number | null; game_host_time: number | null;
+            game_seed: number | null; game_host_time: number | null; created_at: string;
         }>();
         if (!match || match.decided_by !== 'founded' || match.rated !== 1) return;
 
@@ -1565,12 +1714,24 @@ async function maybeRevertContradictedFounding(
                 { match_id: matchId, lobby_id: lobbyId, contradicted_by: c.user_id, replayed },
                 'founded match contradicted by a later reading; reverted and ladder replayed',
             );
+            void notifyMatchesChanged(ctx, matchId);
             return;
         }
     } catch (err) {
         log.info({ match_id: matchId, err: String(err) }, 'contradiction check failed');
     }
 }
+
+/**
+ * The three paths that rate a match AFTER it was stored, for the database harness
+ * (scripts/test-admin.ts), which exercises the new-account fence in each. Not for use by the
+ * server; the routes call these directly.
+ */
+export const latePathsForTests = {
+    maybeDecideByAbandonLater,
+    maybeUpgradeFromConfirmation,
+    maybeRateAwaitingTeamMatch,
+};
 
 export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void {
     // The rooms ask through this door — see foundingHook for why it is a door and not an
@@ -1602,15 +1763,21 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
         // the reporter. Null when there was no room at all — see RatabilityInput.
         let roomIsCompetitive: boolean | null = null;
         let roomStartedAtMs: number | null = null;
+        // The bracket match this game was for, and the teams the room froze at Start.
+        let tournamentMatchId: string | null = null;
+        let teamsAtStart: string | null = null;
         if (body.lobby_id) {
             const lobby = await ctx.db.prepare(
-                `SELECT host_user_id, roster_at_start, competitive, started_at
+                `SELECT host_user_id, roster_at_start, competitive, started_at,
+                        tournament_match_id, teams_at_start
                    FROM lobbies WHERE id = ?`,
             ).bind(body.lobby_id).first<{
                 host_user_id: string;
                 roster_at_start: string | null;
                 competitive: number;
                 started_at: string | null;
+                tournament_match_id: string | null;
+                teams_at_start: string | null;
             }>();
             if (!lobby) throw Errors.NotFound('Lobby');
             // Whoever is host NOW. After a mid-match host migration that is the player the
@@ -1620,6 +1787,10 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
             rosterAtStart = lobby.roster_at_start;
             roomIsCompetitive = lobby.competitive === 1;
             roomStartedAtMs = sqliteTimestampToMs(lobby.started_at);
+            tournamentMatchId = lobby.tournament_match_id ?? null;
+            teamsAtStart = lobby.teams_at_start ?? null;
+            // Where the host reported from, hashed, for the new-account rule.
+            await recordIpHash(ctx, body.lobby_id, userId, requestIpHash(ctx, req));
         } else {
             const self = body.participants.find((p) => p.user_id === userId);
             if (!self) throw Errors.Forbidden();
@@ -1726,8 +1897,9 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
             ctx.db.prepare(
                 `INSERT INTO matches (id, lobby_id, host_user_id, mod_id, mod_combined_hash,
                                       map_name, map_pool, duration_seconds, started_at, ended_at,
-                                      replay_sha256, game_seed, game_host_time)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                                      replay_sha256, game_seed, game_host_time,
+                                      tournament_match_id, room_teams)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             ).bind(
                 matchId,
                 body.lobby_id ?? null,
@@ -1742,14 +1914,17 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
                 duplicateRecording ? null : replaySha,
                 duplicateRecording ? null : gameSeed,
                 duplicateRecording ? null : gameHostTime,
+                tournamentMatchId,
+                teamsAtStart,
             ),
         ];
         for (const p of body.participants) {
             inserts.push(ctx.db.prepare(
-                `INSERT INTO match_participants (match_id, user_id, team, civ, home_city, score, result)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                `INSERT INTO match_participants
+                     (match_id, user_id, team, civ, home_city, score, result, ip_hash)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ${LATEST_IP_HASH_SQL})`,
             ).bind(matchId, p.user_id, p.team | 0, p.civ ?? null, p.home_city ?? null,
-                   p.score | 0, p.result));
+                   p.score | 0, p.result, body.lobby_id ?? '', p.user_id));
         }
         await ctx.db.batch(inserts);
 
@@ -1790,6 +1965,14 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
         // for a shape ratabilityReason already refused with `not_1v1`.
         const shape = matchShape(body.participants);
         const ratingMode: RatingMode = shape === 'team' ? 'team' : 'default';
+
+        // The room promised one line-up and the recording shows another: stored, shown with both
+        // line-ups, not rated. Before the team evidence below — a mismatch is final, not pending.
+        if (unratedReason === null && shape === 'team'
+            && teamsMismatch(body.participants, parseRoomTeams(teamsAtStart))) {
+            unratedReason = 'teams_mismatch';
+            req.log.info({ match_id: matchId }, 'team match not rated: the recording\'s sides differ from the room\'s');
+        }
 
         // A TEAM match is not rated on the reporter's word alone. His report is his own
         // side's reading; the ladder waits for one from the other side that agrees, on the
@@ -1878,18 +2061,15 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
             }
         }
 
-        let diff = new Map<string, { before: number; after: number; rdBefore: number; rdAfter: number }>();
+        // A brand-new account, a very short match and an opponent on the same network: stored, not
+        // rated (src/elo/newAccount.ts). Asked of the stored rows, which now carry the IP hashes.
+        if (unratedReason === null && await isNewAccountShortMatch(ctx, matchId)) {
+            unratedReason = 'new_account_short';
+        }
+
+        let rated: RatedMatch | null = null;
         if (unratedReason === null) {
-            const outcomes: ParticipantOutcome[] = body.participants.map((p) => ({
-                userId: p.user_id,
-                result: p.result,
-                // Only for a real team shape. Sending `team` for a 1v1 would change
-                // nothing (two players on different sides face each other either way),
-                // but sending the 0 that every pre-team report carries would put both
-                // players on the SAME side and skip the only pairing there is.
-                team: shape === 'team' ? (p.team | 0) : undefined,
-            }));
-            diff = await withLadderLock(() => applyMatch(ctx.db, outcomes, ratingMode));
+            rated = await withLadderLock(() => rateStoredMatch(ctx.db, matchId, ratingMode));
         } else {
             req.log.info(
                 { match_id: matchId, mod_id: body.mod_id, players: body.participants.length,
@@ -1918,25 +2098,20 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
             ratingMode, crashedUserId, matchId,
         ).run();
 
-        const updates = [];
-        for (const p of body.participants) {
-            const d = diff.get(p.user_id);
-            if (!d) continue;
-            updates.push(ctx.db.prepare(
-                `UPDATE match_participants SET rating_before = ?, rating_after = ?
-                 WHERE match_id = ? AND user_id = ?`,
-            ).bind(d.before, d.after, matchId, p.user_id));
-        }
-        if (updates.length) await ctx.db.batch(updates);
+        const diff: RatingDiff = rated?.perPlayer ?? new Map();
+        const extras = await ratingExtras(ctx, matchId, ratingMode, rated);
 
         // Built once and sent twice: to the room over the socket, and back to the
         // host in the response. The per-participant RESULT is the load-bearing part
         // and not just the ratings — the guest has no recording of their own, so
         // without it their end-of-match card could only say "no result" even when
-        // they had won.
+        // they had won. Each copy passes through resultParticipantsFor for its
+        // recipient: a player this match did not finish placing keeps his rating to
+        // himself (src/elo/placementPrivacy.ts).
         const participantsPayload = body.participants.map((p) => {
             const d = diff.get(p.user_id);
             return {
+                ...(extras.perUser.get(p.user_id) ?? {}),
                 user_id: p.user_id,
                 result: p.result,
                 rating_before: d?.before ?? null,
@@ -1997,7 +2172,12 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
             // polls of the match history to discover whether they had won. The `ws`
             // library queues the close frame behind data already queued on the same
             // sender, so this arrives first.
-            ctx.rooms.publish(body.lobby_id, {
+            //
+            // One frame PER RECIPIENT: a participant this match did not finish placing reaches
+            // the others without his rating (src/elo/placementPrivacy.ts) — his result and his
+            // progress stay — while he sees his own.
+            const reported = {
+                ...extras.top,
                 type: 'match_reported',
                 match_id: matchId,
                 lobby_id: body.lobby_id,
@@ -2005,18 +2185,41 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
                 duration_seconds: Math.max(0, body.duration_seconds | 0),
                 rated: unratedReason === null,
                 unrated_reason: unratedReason,
-                participants: participantsPayload,
-            });
+                // What the room promised and what the game was, for the "didn't count" card.
+                ...(unratedReason === 'teams_mismatch'
+                    ? {
+                        ingame_teams: sidesFromParticipants(body.participants),
+                        room_teams: sidesFromRoomTeams(parseRoomTeams(teamsAtStart)),
+                    }
+                    : {}),
+            };
+            ctx.rooms.publishPerUser(body.lobby_id, (recipientId) => ({
+                ...reported,
+                participants: resultParticipantsFor(participantsPayload, recipientId),
+            }));
 
             ctx.rooms.close(body.lobby_id, 4007, 'match_reported');
             finalizeRoom(body.lobby_id);
         }
 
+        // Not awaited: none may slow down or fail the report.
+        void checkPairAlerts(ctx, req.log, matchId);
+        void notifyMatchesChanged(ctx, matchId);
+        void maybePostMonthlyHighlights(ctx, req.log);
+
         return reply.send({
+            ...extras.top,
             match_id: matchId,
             rated: unratedReason === null,
             unrated_reason: unratedReason,
-            rating_changes: participantsPayload,
+            ...(unratedReason === 'teams_mismatch'
+                ? {
+                    ingame_teams: sidesFromParticipants(body.participants),
+                    room_teams: sidesFromRoomTeams(parseRoomTeams(teamsAtStart)),
+                }
+                : {}),
+            // As the reporting host may see them: the same rule as the room's frame above.
+            rating_changes: resultParticipantsFor(participantsPayload, userId),
         });
     });
 
@@ -2059,6 +2262,7 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
         // and cannot be checked, so it is refused rather than trusted.
         const roster = parseRoster(lobby.roster_at_start);
         if (roster === null || !roster.has(userId)) throw Errors.Forbidden();
+        await recordIpHash(ctx, body.lobby_id, userId, requestIpHash(ctx, req));
 
         // The reading's civilizations, kept only for players who were in the room. Stored
         // with the confirmation so that a report arriving AFTER this can still use them.
@@ -2152,6 +2356,13 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
             // missing at report time — the fingerprint that its anti-farm brake demands,
             // which the host never has when the host is the one who walked out.
             await maybeDecideByAbandonLater(ctx, req.log, body.lobby_id, match.id);
+
+            // The bracket, once every path above has had its say. A team match the ladder
+            // refused for some other reason (a duplicate recording, a mod outside the ranked
+            // list) never waited 'awaiting_confirmation', so nothing above would move its
+            // bracket when the other side's reading lands — this does. Idempotent through
+            // claimMatchResult, so the slot a path above already moved is a no-op here.
+            await maybeAdvanceTournament(ctx, req.log, match.id);
         }
 
         return reply.send({ ok: true, matched: !!match });
@@ -2182,7 +2393,13 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
             // 0007) - so it is joined. LEFT, because `matches.lobby_id` is nullable and the
             // lobby may be gone; that yields NULL, which the client renders as nothing at all.
             `SELECT m.id, m.mod_id, m.map_name, m.map_pool, m.duration_seconds, m.started_at, m.ended_at,
-                    m.replay_object_key, m.rated, m.unrated_reason,
+                    m.created_at,
+                    m.replay_object_key, m.replay_key, m.replay_uploaded_at, m.replay_size_bytes,
+                    m.rated, m.unrated_reason,
+                    COALESCE(m.rating_mode, 'default') AS rating_mode,
+                    m.elo_factor, m.farm_streak, m.room_teams AS room_teams_json,
+                    m.tournament_match_id,
+                    ${TOURNAMENT_REF_COLUMNS},
                     l.competitive,
                     mp.team, mp.civ, mp.score, mp.result,
                     mp.rating_before, mp.rating_after,
@@ -2190,6 +2407,7 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
              FROM match_participants mp
              JOIN matches m ON m.id = mp.match_id
              LEFT JOIN lobbies l ON l.id = m.lobby_id
+             ${TOURNAMENT_REF_JOIN}
              WHERE mp.user_id = ?
              ORDER BY m.started_at DESC
              LIMIT 50`,
@@ -2205,90 +2423,162 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
         // NULL is PRESERVED rather than folded into false. A row from before migration 0006 has
         // no answer, and "we don't know" is not "it did not count" — flattening it would make
         // every old match claim it was unrated.
-        const matches = (rows.results ?? []).map((m) => ({
-            ...m,
-            rated: m.rated == null ? null : Boolean(m.rated),
-            // Same coercion and the same NULL rule, for the same two reasons. A match whose
-            // lobby row is gone is "we don't know what kind of room this was", never "casual".
-            competitive: m.competitive == null ? null : Boolean(m.competitive),
-        }));
-        await attachParticipants(ctx, matches);
+        const now = new Date();
+        // Whoever is reading, from the token the launcher always sends when signed in. This is a
+        // public route, so it may be nobody — and then a player still being placed shows nobody
+        // his numbers (src/elo/placementPrivacy.ts), the subject of this history included.
+        const viewerId = req.userId ?? null;
+        const subjectGames = await currentGames(ctx, [userId]);
+        const matches: Array<Record<string, unknown> & { id: string }> = (rows.results ?? []).map((m) => {
+            const {
+                room_teams_json, replay_key, replay_uploaded_at, replay_size_bytes, ...rest
+            } = withTournamentRef(m as Record<string, unknown> & { id: string });
+            return historyRowFor({
+                ...rest,
+                id: m.id,
+                rated: m.rated == null ? null : Boolean(m.rated),
+                // Whether a competitive recording is in the bucket (src/replays/rest.ts), when it
+                // expires, and its size - the one rule every match list uses (`replayView`). The
+                // key itself stays on the server: the client asks for a signed link by match id.
+                // `has_replay` is a real boolean for the reason `rated` is one.
+                ...replayView({
+                    replay_key: replay_key as string | null,
+                    replay_uploaded_at: replay_uploaded_at as string | null,
+                    replay_size_bytes: replay_size_bytes as number | null,
+                }, now),
+                // Same coercion and the same NULL rule, for the same two reasons. A match whose
+                // lobby row is gone is "we don't know what kind of room this was", never "casual".
+                competitive: m.competitive == null ? null : Boolean(m.competitive),
+                // `tournament` (in `rest`) is the bracket this game was played for — the History
+                // shows "{tournament} · {round}" instead of the map, and never an anti-farm
+                // percentage on it. Null otherwise. Built by withTournamentRef, the same helper
+                // the two community lists use (src/tournaments/matchRef.ts).
+                // The teams the room froze at Start, as lists of user ids (Team 1 first). The
+                // in-game sides are added below from the participants, for a team match only.
+                room_teams: sidesFromRoomTeams(parseRoomTeams(room_teams_json as string | null)),
+            }, userId, m.rating_mode === 'team' ? 'team' : 'default', viewerId, subjectGames);
+        });
+        await attachParticipants(ctx, matches, viewerId);
+
+        // The in-game sides, read from the stored teams, for 4- and 6-player matches. The card
+        // that says "didn't count: teams didn't match" names both line-ups.
+        for (const m of matches) {
+            const parts = (m.participants as Array<{ user_id: string; team: number }> | undefined) ?? [];
+            m.ingame_teams = parts.length === 4 || parts.length === 6 ? sidesFromParticipants(parts) : null;
+        }
+
+        // Which of this player's matches were placement, and the one that finished it: the
+        // History marks "Placement complete!" on that row. One ordinal per ladder, computed
+        // over the player's whole rated history.
+        const ordinals = await ctx.db.prepare(
+            `SELECT m.id AS match_id, COALESCE(m.rating_mode, 'default') AS mode,
+                    ROW_NUMBER() OVER (PARTITION BY COALESCE(m.rating_mode, 'default')
+                                       ORDER BY m.created_at, m.id) AS ordinal
+               FROM matches m JOIN match_participants p ON p.match_id = m.id
+              WHERE p.user_id = ? AND m.rated = 1`,
+        ).bind(userId).all<{ match_id: string; mode: string; ordinal: number }>();
+        const ordinalOf = new Map((ordinals.results ?? []).map((r) => [r.match_id, r] as [string, typeof r]));
+        for (const m of matches) {
+            const o = ordinalOf.get(m.id);
+            const required = placementRequired(o?.mode === 'team' ? 'team' : 'default');
+            m.placement_index = o && o.ordinal <= required ? o.ordinal : null;
+            m.placement_completed = !!o && o.ordinal === required;
+        }
         return reply.send({ matches });
     });
+
 
     app.get('/matches/elo/:userId', {
         preHandler: [ipRateLimit(ctx, Limits.StatsIp)],
     }, async (req, reply) => {
         const userId = (req.params as { userId: string }).userId;
-        const row = await ctx.db.prepare(
-            `SELECT rating, rd, volatility, games_played, updated_at
-             FROM elo_ratings WHERE user_id = ? AND mode = 'default'`,
-        ).bind(userId).first<{
-            rating: number;
-            rd: number;
-            volatility: number;
-            games_played: number;
-            updated_at: string;
-        }>();
+        const now = Date.now();
+        // The player's OWN business — placement results and refunds — only when the request is
+        // authenticated as that player. Everybody else gets the public standing.
+        const self = req.userId === userId;
 
-        // Decided games only. A result of 0.5 means the outcome could not be read —
-        // no recording, a team game, a skirmish, or any match reported before the
-        // launcher could read one — so it is counted as neither a win nor a loss.
-        // Most stored rows are 0.5, which is why the client must divide by wins+losses
-        // and not by games_played: doing the latter would report "3% wins" for someone
-        // who won 3 of their 4 decided games.
+        // A ladder this player is still being PLACED on goes to anybody else without its number —
+        // rating, deviation and volatility, flat and under `ladders` alike — while he gets all of
+        // it (src/elo/placementPrivacy.ts). Omitted rather than null: every launcher reads the
+        // flat pair as plain numbers, and asks only for its own standing.
+        const [solo, team] = await Promise.all([
+            standingFor(ctx, userId, 'default', now, { self }).then((s) => standingShownTo(s, 'default', self)),
+            standingFor(ctx, userId, 'team', now, { self }).then((s) => standingShownTo(s, 'team', self)),
+        ]);
+
+        // Decided games of every kind, all time: the pair launchers already shipped read. A result
+        // of 0.5 is neither. The RATED record per ladder is in `ladders`.
         const tally = await ctx.db.prepare(
             `SELECT SUM(CASE WHEN result >= 0.999 THEN 1 ELSE 0 END) AS wins,
                     SUM(CASE WHEN result <= 0.001 THEN 1 ELSE 0 END) AS losses
              FROM match_participants WHERE user_id = ?`,
         ).bind(userId).first<{ wins: number | null; losses: number | null }>();
+        const record = await ratedRecordFor(ctx, userId);
+        const ratedSolo = record.get('default') ?? { wins: 0, losses: 0 };
+        const ratedTeam = record.get('team') ?? { wins: 0, losses: 0 };
 
-        // SUM() over no rows is NULL, not 0.
-        const wins = tally?.wins ?? 0;
-        const losses = tally?.losses ?? 0;
-
-        // The player's place on the 1v1 ladder, for the rank badge on the launcher's account
-        // block. Same helper as the rooms list, the room and the players panel. 0 = not on the
-        // ladder; the helper failing leaves it undefined, and JSON then omits the field, which
-        // the launcher reads as "unknown" rather than as Discovery.
-        const ladder_rank = (await ladderRanks(ctx, [userId])).get(userId);
-        // And how many are on that ladder: the ages are cut by a SHARE of it, so the badge
-        // cannot be drawn from the position alone. Sent here rather than left to the
-        // community-stats payload, which can land after this and has no way to repaint the
-        // account block. Omitted on failure, like the position.
-        let ladder_size: number | undefined;
-        try { ladder_size = await ladderSize(ctx, 'default'); } catch { ladder_size = undefined; }
-
-        // The TEAM ladder's standing and the badge preference (design handoff 51): the account
-        // block wears the badge the player CHOSE, and the profile's selector needs both ladders
-        // to offer the choice. Defaulted like the 1v1 row — no team row means unrated — and the
-        // position and size omitted on failure, so the launcher reads "unknown", never Discovery.
-        const teamRow = await ctx.db.prepare(
-            `SELECT rating, rd, games_played FROM elo_ratings WHERE user_id = ? AND mode = 'team'`,
-        ).bind(userId).first<{ rating: number; rd: number; games_played: number }>();
-        const ladder_rank_team = (await ladderRanks(ctx, [userId], 'team')).get(userId);
-        let ladder_size_team: number | undefined;
-        try { ladder_size_team = await ladderSize(ctx, 'team'); } catch { ladder_size_team = undefined; }
         const modeRow = await ctx.db.prepare('SELECT badge_mode FROM users WHERE id = ?')
             .bind(userId).first<{ badge_mode: string | null }>();
-        const team = {
-            rating_team: teamRow?.rating ?? DEFAULT_RATING,
-            rd_team: teamRow?.rd ?? DEFAULT_RD,
-            games_played_team: teamRow?.games_played ?? 0,
-            ladder_rank_team,
-            ladder_size_team,
+
+        let refunds: Awaited<ReturnType<typeof refundsFor>> | undefined;
+        if (self) {
+            try { refunds = await refundsFor(ctx, userId); } catch { refunds = undefined; }
+            reply.header('Cache-Control', 'private, no-store');
+        }
+
+        return reply.send({
+            // ---- the flat fields every launcher reads ----
+            rating: solo.rating,
+            rd: solo.rd,
+            volatility: solo.volatility,
+            games_played: solo.games_played,
+            wins: tally?.wins ?? 0,
+            losses: tally?.losses ?? 0,
+            // One endless season: the rated record, so an older launcher shows the right pair.
+            season_wins: ratedSolo.wins,
+            season_losses: ratedSolo.losses,
+            ladder_rank: solo.ladder_rank,
+            ladder_size: solo.ladder_size,
+            rating_team: team.rating,
+            rd_team: team.rd,
+            games_played_team: team.games_played,
+            season_wins_team: ratedTeam.wins,
+            season_losses_team: ratedTeam.losses,
+            ladder_rank_team: team.ladder_rank,
+            ladder_size_team: team.ladder_size,
             // Omitted for a user id the server does not know, rather than invented.
             badge_mode: modeRow ? normalizeBadgeMode(modeRow.badge_mode) : undefined,
-        };
-
-        // No row: unrated, which is the starting rating. This endpoint always answered
-        // that way — it is where the chip's 1500 comes from — while the rooms list, the
-        // presence frame and the room roster sent null for the same player. Same
-        // constants everywhere now, so they cannot drift apart again.
-        if (!row) return reply.send({
-            rating: DEFAULT_RATING, rd: DEFAULT_RD, volatility: DEFAULT_VOLATILITY,
-            games_played: 0, wins, losses, ladder_rank, ladder_size, ...team,
+            // There are no seasons any more: no history, no medals.
+            past_seasons: [],
+            season_titles: [],
+            // ---- the standing per ladder (design 55d-55f) ----
+            placement_required: { default: solo.placement_required, team: team.placement_required },
+            ladders: { default: solo, team },
+            ...(refunds ? { refunds } : {}),
         });
-        return reply.send({ ...row, wins, losses, ladder_rank, ladder_size, ...team });
+    });
+
+    // POST /matches/refunds/seen — the player pressed "Got it" on a refund notice. With no ids,
+    // every unseen refund of the caller is marked. Only ever the caller's own rows.
+    app.post('/matches/refunds/seen', {
+        preHandler: [requireAuth(), ipRateLimit(ctx, Limits.StatsIp)],
+    }, async (req, reply) => {
+        const userId = req.userId!;
+        const body = (req.body ?? {}) as { refund_ids?: unknown };
+        const ids = Array.isArray(body.refund_ids)
+            ? (body.refund_ids as unknown[]).filter((x): x is string => typeof x === 'string').slice(0, 50)
+            : null;
+        if (ids && ids.length > 0) {
+            const marks = ids.map(() => '?').join(', ');
+            await ctx.db.prepare(
+                `UPDATE rating_refunds SET seen_at = datetime('now')
+                  WHERE user_id = ? AND seen_at IS NULL AND refund_id IN (${marks})`,
+            ).bind(userId, ...ids).run();
+        } else {
+            await ctx.db.prepare(
+                `UPDATE rating_refunds SET seen_at = datetime('now') WHERE user_id = ? AND seen_at IS NULL`,
+            ).bind(userId).run();
+        }
+        return reply.send({ ok: true });
     });
 }

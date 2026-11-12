@@ -31,41 +31,55 @@
  */
 import 'dotenv/config';
 import { meetsMinimum } from '../src/lib/launcherVersion.js';
-import { rmSync } from 'node:fs';
+import { readFileSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
 import { Db } from '../src/db';
 import {
-    applyMatch,
     DEFAULT_RATING,
     DEFAULT_RD,
-    DEFAULT_VOLATILITY,
-    type ParticipantOutcome,
     type RatingMode,
 } from '../src/elo/glicko2';
+import { effectiveRatings } from '../src/elo/ladder';
+import { isInPlacement, placementRequired } from '../src/elo/placement';
+import { matchupKey } from '../src/elo/antifarm';
+import { rawConsecutiveWins, shortMatchCount } from '../src/elo/alerts';
+import { uuid } from '../src/lib/ids';
+import { loadConfig, replayMaxBytesFromEnv, replayStorageFromEnv } from '../src/env';
+import { presignObject } from '../src/replays/presign';
+import { attachRefusal, objectKeyFor, type ReplayMatchRow } from '../src/replays/rules';
+import { fetch, type Response as UndiciResponse } from 'undici';
+import { KvStore } from '../src/kv';
+import type { AppContext } from '../src/context';
+import { standingFor } from '../src/stats/standing';
+import { highlightsFor, monthOf, previousMonth, renderDiscord } from '../src/stats/highlights';
+import { highlightsEmbeds, highlightsMessage, postHighlights } from '../src/stats/highlightsAnnounce';
 import * as tourn from './adminTournaments';
+import { bareArgsOf, looksLikeDbPath } from './adminArgs';
 
 // ---------------------------------------------------------------- argv
 
 const ARGV = process.argv.slice(2);
-const COMMAND = ARGV.find((a) => !a.startsWith('--')) ?? 'help';
+
+/** ARGV without the flags and the values they consumed (see adminArgs.ts), in order. */
+function bareArgs(): string[] {
+    return bareArgsOf(ARGV);
+}
+
+const COMMAND = bareArgs()[0] ?? 'help';
 const APPLY = ARGV.includes('--apply');
 
 /** Positional arguments after the command, in order, excluding flags and the db path. */
 function positionals(): string[] {
-    const all = ARGV.filter((a) => !a.startsWith('--'));
     // The db path is recognised by shape — it is the only positional that looks like a
     // path. Anything else is the command's own argument.
-    return all.slice(1).filter((a) => !looksLikeDbPath(a));
-}
-
-function looksLikeDbPath(a: string): boolean {
-    return a.endsWith('.db') || a.includes('/') || a.includes('\\');
+    return bareArgs().slice(1).filter((a) => !looksLikeDbPath(a));
 }
 
 function resolveDbPath(): string {
-    const positional = ARGV.filter((a) => !a.startsWith('--')).find(looksLikeDbPath);
+    const positional = bareArgs().find(looksLikeDbPath);
     return positional || process.env.DB_PATH || './lobby.db';
 }
 
@@ -240,9 +254,8 @@ interface RatingRow {
 }
 
 /**
- * One ladder, keyed by user id. `default` is the 1v1 ladder and `team` the one 2v2 and 3v3
- * share (migration 0010). It defaults to 1v1 because that was the only ladder when every
- * existing caller was written, and `scripts/test-admin.ts` relies on that.
+ * One ladder, keyed by user id. `default` is the 1v1 ladder and `team` the one 2v2 and 3v3 share.
+ * `rd` is as stored (as of the player's last rated match), not grown to now: this is for diffs.
  */
 export async function readRatings(
     db: Db,
@@ -250,7 +263,7 @@ export async function readRatings(
 ): Promise<Map<string, RatingRow>> {
     const rows = await db.prepare(
         `SELECT e.user_id, e.rating, e.rd, e.games_played, u.display_name
-           FROM elo_ratings e LEFT JOIN users u ON u.id = e.user_id
+           FROM player_ratings e LEFT JOIN users u ON u.id = e.user_id
           WHERE e.mode = ?`,
     ).bind(mode).all<RatingRow>();
     const map = new Map<string, RatingRow>();
@@ -258,10 +271,10 @@ export async function readRatings(
     return map;
 }
 
-/** Print who moved between two ladders. The empty case is the interesting one for --verify. */
-function printRatingDiff(before: Map<string, RatingRow>, after: Map<string, RatingRow>): number {
+/** Print who moved between two ladders. The empty case is the interesting one for a self-check. */
+function printRatingDiff(before: Map<string, RatingRow>, after: Map<string, RatingRow>, top = 0): number {
     const ids = new Set([...before.keys(), ...after.keys()]);
-    let moved = 0;
+    const rows: Array<{ who: string; rb: number | null; ra: number | null; gb: number | string; ga: number | string }> = [];
     for (const id of [...ids].sort()) {
         const b = before.get(id);
         const a = after.get(id);
@@ -269,14 +282,23 @@ function printRatingDiff(before: Map<string, RatingRow>, after: Map<string, Rati
         const ra = a?.rating ?? null;
         if (rb !== null && ra !== null && Math.abs(rb - ra) < 0.0005
             && b!.games_played === a!.games_played) continue;
-        moved++;
-        const who = a?.display_name ?? b?.display_name ?? id;
+        rows.push({
+            who: a?.display_name ?? b?.display_name ?? id, rb, ra,
+            gb: b?.games_played ?? '-', ga: a?.games_played ?? '-',
+        });
+    }
+    // With `top`, the biggest movers first and only that many: a full recompute moves everyone.
+    const shown = top > 0
+        ? [...rows].sort((x, y) => Math.abs((y.ra ?? 0) - (y.rb ?? 0)) - Math.abs((x.ra ?? 0) - (x.rb ?? 0))).slice(0, top)
+        : rows;
+    for (const r of shown) {
         console.log(
-            `  ${pad(who, 22)} ${pad(num(rb, 1), 8)} -> ${pad(num(ra, 1), 8)}` +
-            `  games ${b?.games_played ?? '-'} -> ${a?.games_played ?? '-'}`,
+            `  ${pad(r.who, 22)} ${pad(num(r.rb, 1), 8)} -> ${pad(num(r.ra, 1), 8)}` +
+            `  games ${r.gb} -> ${r.ga}`,
         );
     }
-    return moved;
+    if (top > 0 && rows.length > shown.length) console.log(`  … and ${rows.length - shown.length} more`);
+    return rows.length;
 }
 
 /** Both ladders, in the order they are printed, under the names an operator uses for them. */
@@ -285,33 +307,59 @@ const LADDERS: ReadonlyArray<{ mode: RatingMode; label: string }> = [
     { mode: 'team', label: 'team ladder' },
 ];
 
+/** How many players are ranked and how many still being placed, per ladder. */
+async function placementCounts(db: Db, mode: RatingMode): Promise<{ ranked: number; placing: number }> {
+    const required = placementRequired(mode);
+    const row = await db.prepare(
+        `SELECT SUM(CASE WHEN games_played >= ? THEN 1 ELSE 0 END) AS ranked,
+                SUM(CASE WHEN games_played > 0 AND games_played < ? THEN 1 ELSE 0 END) AS placing
+           FROM player_ratings WHERE mode = ?`,
+    ).bind(required, required, mode).first<{ ranked: number | null; placing: number | null }>();
+    return { ranked: row?.ranked ?? 0, placing: row?.placing ?? 0 };
+}
+
 /**
- * Perform a rating-moving change: on a snapshot when this is a dry run, on the real database
- * when it is not. Either way the operator sees the actual movement before or as it happens.
+ * Perform a rating-moving change: on a snapshot when this is a dry run, on the real database when
+ * it is not. Either way the operator sees the actual movement before or as it happens.
  *
- * <p>Diffs BOTH ladders, because `recomputeLadder` rebuilds both. A diff of the 1v1 ladder
- * alone printed "(no rating moved)" for a team decision, whose entire effect is on the other
- * ladder. Each one is printed even when nothing moved on it: "1v1 ladder: (no rating moved)"
- * after a team decision is the confirmation that it touched nothing else.</p>
+ * <p>`mutate` edits the stored rows and returns true to replay (src/elo/replay.ts rebuilds every
+ * rating from the history), or false/null to abort. Both ladders are printed even when nothing
+ * moved on one, because "(no rating moved)" is the confirmation that it touched nothing else.
+ * `after`, when given, runs on the same database once the replay is done.</p>
  */
 async function withRatingChange(
     dbPath: string,
     label: string,
-    mutate: (db: Db) => Promise<boolean>,
+    mutate: (db: Db) => Promise<boolean | null>,
+    after?: (db: Db) => Promise<void>,
+    opts: { top?: number } = {},
 ): Promise<void> {
     const run = async (db: Db, real: boolean): Promise<void> => {
-        const before: Map<string, RatingRow>[] = [];
-        for (const l of LADDERS) before.push(await readRatings(db, l.mode));
-        const ok = await mutate(db);
-        if (!ok) return;
-        const { matches } = await recomputeLadder(db);
-
-        console.log(`Ladder replayed from ${matches} rated match(es).`);
-        for (const [i, l] of LADDERS.entries()) {
-            console.log(`${l.label}:`);
-            const moved = printRatingDiff(before[i]!, await readRatings(db, l.mode));
-            if (moved === 0) console.log('  (no rating moved)');
+        const before = new Map<RatingMode, Map<string, RatingRow>>();
+        const countsBefore = new Map<RatingMode, { ranked: number; placing: number }>();
+        for (const l of LADDERS) {
+            before.set(l.mode, await readRatings(db, l.mode));
+            countsBefore.set(l.mode, await placementCounts(db, l.mode));
         }
+        const go = await mutate(db);
+        if (!go) return;
+        const { matches, refunds } = await recomputeLadder(db);
+
+        console.log(`Ladder rebuilt from the history: ${matches} rated match(es), ${refunds} refund line(s).`);
+        for (const l of LADDERS) {
+            console.log(`${l.label}:`);
+            const moved = printRatingDiff(before.get(l.mode) ?? new Map(), await readRatings(db, l.mode), opts.top ?? 0);
+            if (moved === 0) console.log('  (no rating moved)');
+            const cb = countsBefore.get(l.mode)!;
+            const ca = await placementCounts(db, l.mode);
+            console.log(`  ranked ${cb.ranked} -> ${ca.ranked}   in placement ${cb.placing} -> ${ca.placing}`);
+        }
+        const farm = await db.prepare(
+            `SELECT COUNT(*) AS n, AVG(elo_factor) AS avg FROM matches WHERE rated = 1 AND elo_factor < 1`,
+        ).bind().first<{ n: number; avg: number | null }>();
+        console.log(`Anti-farm: ${farm?.n ?? 0} rated match(es) counted for less than 100%`
+            + (farm?.avg != null ? ` (average ${Math.round(farm.avg * 100)}%)` : '') + '.');
+        if (after) await after(db);
         console.log(
             real
                 ? `Done — ${label}.`
@@ -347,7 +395,7 @@ async function cmdVersions(db: Db): Promise<void> {
     const rows = await db.prepare(
         `SELECT COALESCE(u.last_launcher_version, '') AS version, COUNT(*) AS n
            FROM users u
-          WHERE EXISTS (SELECT 1 FROM elo_ratings e WHERE e.user_id = u.id)
+          WHERE EXISTS (SELECT 1 FROM player_ratings e WHERE e.user_id = u.id)
              OR u.last_launcher_version IS NOT NULL
           GROUP BY version
           ORDER BY n DESC`,
@@ -409,15 +457,20 @@ async function cmdStatus(db: Db): Promise<void> {
     if (reasonRows.length === 0) console.log('  (none)');
     for (const r of reasonRows) console.log(`  ${pad(r.unrated_reason, 26)} ${r.n}`);
 
-    const players = await db.prepare(
-        `SELECT COUNT(*) AS n FROM elo_ratings WHERE mode = 'default' AND games_played > 0`,
-    ).bind().first<{ n: number }>();
     const banned = await db.prepare(
         `SELECT COUNT(*) AS n FROM users WHERE is_banned = 1`,
     ).bind().first<{ n: number }>();
 
+    console.log('Ladders');
+    for (const l of LADDERS) {
+        const c = await placementCounts(db, l.mode);
+        console.log(`  ${pad(l.label, 12)} ranked ${c.ranked}   in placement ${c.placing}`);
+    }
+    const alerts = await db.prepare(
+        `SELECT COUNT(*) AS n FROM admin_alerts WHERE acknowledged_at IS NULL`,
+    ).bind().first<{ n: number }>();
     console.log('Players');
-    console.log(`  with games ${players?.n ?? 0}   banned ${banned?.n ?? 0}`);
+    console.log(`  banned ${banned?.n ?? 0}   open alerts ${alerts?.n ?? 0}${(alerts?.n ?? 0) > 0 ? '  (alerts:list)' : ''}`);
 }
 
 interface LobbyRow {
@@ -579,6 +632,43 @@ async function cmdMatchShow(db: Db): Promise<void> {
     console.log(`  reported   ${m.created_at}      lobby ${m.lobby_id ?? '-'}`);
     console.log(`  rated      ${m.rated === 1 ? 'yes' : m.rated === 0 ? 'no' : 'unknown (pre-migration)'}`);
     console.log(`  reason     ${m.unrated_reason ?? '-'}        decided_by ${m.decided_by ?? '-'}`);
+    {
+        const e = await db.prepare(
+            `SELECT elo_factor, farm_streak, matchup_key, tournament_match_id, room_teams,
+                    COALESCE(rating_mode, 'default') AS mode
+               FROM matches WHERE id = ?`,
+        ).bind(m.id).first<{
+            elo_factor: number | null; farm_streak: number | null; matchup_key: string | null;
+            tournament_match_id: string | null; room_teams: string | null; mode: string;
+        }>();
+        if (e) {
+            console.log(`  ladder     ${e.mode === 'team' ? 'team' : '1v1'}`
+                + `   factor ${e.elo_factor === null ? '-' : `${Math.round(e.elo_factor * 100)}%`}`
+                + `   farm streak ${e.farm_streak ?? '-'}`
+                + (e.tournament_match_id ? `   tournament ${e.tournament_match_id}` : ''));
+            if (e.matchup_key) console.log(`  matchup    ${e.matchup_key}`);
+            if (e.room_teams) console.log(`  room teams ${e.room_teams}`);
+        }
+        const shared = await db.prepare(
+            `SELECT COUNT(*) AS n FROM (
+                 SELECT ip_hash FROM match_participants WHERE match_id = ? AND ip_hash IS NOT NULL
+                  GROUP BY ip_hash HAVING COUNT(*) > 1)`,
+        ).bind(m.id).first<{ n: number }>();
+        console.log(`  same IP    ${(shared?.n ?? 0) > 0 ? 'YES — two players shared a network (hash only)' : 'no'}`);
+        // The competitive recording in the bucket (migration 0030), if the reporter's launcher
+        // uploaded one. `replay_key IS NULL` is "never uploaded" or "expired and forgotten".
+        const rec = await db.prepare(
+            `SELECT replay_key, replay_size_bytes, replay_uploaded_at, replay_uploader_id
+               FROM matches WHERE id = ?`,
+        ).bind(m.id).first<{
+            replay_key: string | null; replay_size_bytes: number | null;
+            replay_uploaded_at: string | null; replay_uploader_id: string | null;
+        }>();
+        console.log(rec?.replay_key
+            ? `  recording  ${rec.replay_key}  (${rec.replay_size_bytes ?? '?'} bytes, `
+              + `${rec.replay_uploaded_at ?? '?'}, by ${rec.replay_uploader_id ?? '?'})`
+            : '  recording  none');
+    }
     if (m.decided_by === 'abandon') {
         console.log('             ^ decided because one player walked out, not by the recording.');
     }
@@ -724,10 +814,10 @@ async function cmdMatchDecide(dbPath: string): Promise<void> {
 
     await withRatingChange(dbPath, `match ${id} decided`, async (db) => {
         const m = await db.prepare(`SELECT * FROM matches WHERE id = ?`).bind(id).first<MatchRow>();
-        if (!m) { console.log(`No match '${id}'.`); return false; }
+        if (!m) { console.log(`No match '${id}'.`); return null; }
 
         const user = await findUser(db, winner);
-        if (!user) return false;
+        if (!user) return null;
 
         const parts = await db.prepare(
             `SELECT match_id, user_id, result FROM match_participants WHERE match_id = ?`,
@@ -739,11 +829,11 @@ async function cmdMatchDecide(dbPath: string): Promise<void> {
                 `Match has ${rows.length} participants — only a 1v1 can be decided here.`
                 + (rows.length === 4 || rows.length === 6
                     ? ' For a 2v2 or 3v3 use match:decide-team.' : ''));
-            return false;
+            return null;
         }
         if (!rows.some((p) => p.user_id === user.id)) {
             console.log(`${user.display_name} did not play in this match.`);
-            return false;
+            return null;
         }
 
         console.log(`Match ${id}: winner ${user.display_name}, was '${m.unrated_reason ?? 'rated'}'.`);
@@ -928,12 +1018,12 @@ async function cmdMatchDecideTeam(dbPath: string): Promise<void> {
         const loserIds: string[] = [];
         for (const needle of needles) {
             const user = await findUser(db, needle);
-            if (!user) return false;   // findUser has already said why.
+            if (!user) return null;   // findUser has already said why.
             loserIds.push(user.id);
         }
 
         const d = await decideTeamMatch(db, id, loserIds);
-        if (!d.ok) { console.log(d.error); return false; }
+        if (!d.ok) { console.log(d.error); return null; }
 
         const names = (ps: TeamDecisionPlayer[]): string => ps.map((p) => p.displayName).join(', ');
         const was = d.was.unratedReason
@@ -949,7 +1039,7 @@ async function cmdMatchVoid(dbPath: string): Promise<void> {
 
     await withRatingChange(dbPath, `match ${id} voided`, async (db) => {
         const m = await db.prepare(`SELECT * FROM matches WHERE id = ?`).bind(id).first<MatchRow>();
-        if (!m) { console.log(`No match '${id}'.`); return false; }
+        if (!m) { console.log(`No match '${id}'.`); return null; }
 
         console.log(`Match ${id}: voiding (was rated=${m.rated}, reason='${m.unrated_reason ?? '-'}').`);
         // The row is KEPT. It happened, and deleting it would make the history a player has
@@ -968,14 +1058,28 @@ async function cmdMatchVoid(dbPath: string): Promise<void> {
 }
 
 /**
- * Rebuild the ladder from match history.
+ * Rebuild every rating from the match history under the CURRENT rules — Glicko-2 with placement,
+ * inactivity decay and anti-farm (src/elo/glicko2.ts, src/elo/ladder.ts) — and every ban refund.
  *
- * <p>Run it with no other change to CHECK the tool: on untouched data the replay must
- * reproduce the ratings that are already there. If it moves somebody, the replay is not
- * faithful and no correction command should be trusted until that is understood.</p>
+ * <p>This is the command that moves the ladder onto the new rules after a deploy. Dry run by
+ * default, on a snapshot: it prints the biggest movers, how many players end up ranked and in
+ * placement on each ladder, and how many matches anti-farm discounted. Read that before
+ * `--apply`, and stop the service around the apply (DEPLOY.md, "Continuous ladder").</p>
+ *
+ * <p>Run again with nothing changed, it must move nobody: that is the self-check that the replay
+ * reproduces the live ladder.</p>
  */
 async function cmdEloRecompute(dbPath: string): Promise<void> {
-    await withRatingChange(dbPath, 'ladder recomputed', async () => true);
+    if (flag('from-season') !== null) {
+        console.log('Note: --from-season is ignored. There are no seasons; the whole history is rebuilt.');
+    }
+    await withRatingChange(dbPath, 'ladder recomputed', async () => true, undefined, { top: 25 });
+}
+
+/** Seasons were removed (migration 0025). Kept so an operator's old notes do not error out. */
+function cmdSeasonShow(): void {
+    console.log('Seasons were removed: there is one continuous ladder and it never resets.');
+    console.log('Use player:show, or the launcher\'s Ranking tab.');
 }
 
 async function cmdPlayerShow(db: Db): Promise<void> {
@@ -984,21 +1088,40 @@ async function cmdPlayerShow(db: Db): Promise<void> {
     const u = await findUser(db, needle);
     if (!u) return;
 
-    const r = await db.prepare(
-        `SELECT rating, rd, volatility, games_played, updated_at
-           FROM elo_ratings WHERE user_id = ? AND mode = 'default'`,
-    ).bind(u.id).first<{
-        rating: number; rd: number; volatility: number; games_played: number; updated_at: string;
-    }>();
-
     console.log(`${u.display_name}  (${u.discord_username})`);
     console.log(`  id       ${u.id}`);
     console.log(`  banned   ${u.is_banned === 1 ? `yes — ${u.ban_reason ?? 'no reason recorded'}` : 'no'}`);
-    console.log(
-        r
-            ? `  rating   ${num(r.rating, 1)}  rd ${num(r.rd, 1)}  games ${r.games_played}  (${r.updated_at})`
-            : `  rating   no row — counts as ${DEFAULT_RATING}/${DEFAULT_RD}`,
-    );
+    const ctx = { db } as unknown as AppContext;
+    const now = Date.now();
+    for (const l of LADDERS) {
+        const st = await standingFor(ctx, u.id, l.mode, now, { self: true });
+        const where = st.games_played === 0
+            ? `no rated match — counts as ${DEFAULT_RATING}/${DEFAULT_RD}`
+            : isInPlacement(st.games_played, l.mode)
+                ? `placement ${st.placement_played}/${st.placement_required}`
+                : `rank #${st.ladder_rank ?? '?'} of ${st.ladder_size ?? '?'}`;
+        console.log(
+            `  ${pad(l.label, 12)} ${num(st.rating, 1)}  rd ${num(st.rd, 1)} (now)  games ${st.games_played}  (${where})`
+            + (st.inactive ? '  INACTIVE' : ''));
+        if (st.games_played > 0) {
+            console.log(
+                `               W-L ${st.wins}-${st.losses}   streak ${st.streak_current} (best ${st.streak_best},`
+                + ` worst ${st.loss_streak_best})   last rated ${st.last_rated_at ?? '-'}`);
+            if (st.rating_peak !== null) {
+                console.log(`               peak ${num(st.rating_peak, 1)} (${st.rating_peak_at})`
+                    + `   low ${num(st.rating_low, 1)} (${st.rating_low_at})`);
+            }
+        }
+    }
+    const refunds = await db.prepare(
+        `SELECT r.mode, r.points, r.matches, b.created_at, r.seen_at
+           FROM rating_refunds r JOIN ban_refunds b ON b.id = r.refund_id
+          WHERE r.user_id = ? AND b.revoked_at IS NULL ORDER BY b.created_at DESC`,
+    ).bind(u.id).all<{ mode: string; points: number; matches: number; created_at: string; seen_at: string | null }>();
+    for (const r of refunds.results ?? []) {
+        console.log(`  refund   +${num(r.points, 1)} on ${r.mode === 'team' ? 'team' : '1v1'} for ${r.matches} match(es)`
+            + ` (${r.created_at})${r.seen_at ? '' : '  unseen'}`);
+    }
 
     const stuck = await db.prepare(
         `SELECT m.lobby_id, l.status FROM lobby_members m
@@ -1019,19 +1142,20 @@ async function cmdPlayerHistory(db: Db): Promise<void> {
     const limit = Number(flag('limit') ?? 20);
 
     const rows = await db.prepare(
-        `SELECT m.id, m.started_at, m.map_name, m.rated, m.unrated_reason,
+        `SELECT m.id, m.started_at, m.map_name, m.rated, m.unrated_reason, m.elo_factor,
                 p.result, p.rating_before, p.rating_after
            FROM match_participants p JOIN matches m ON m.id = p.match_id
           WHERE p.user_id = ? ORDER BY m.started_at DESC LIMIT ?`,
-    ).bind(u.id, limit).all<MatchRow & ParticipantRow>();
+    ).bind(u.id, limit).all<MatchRow & ParticipantRow & { elo_factor: number | null }>();
 
     const found = rows.results ?? [];
     console.log(`${found.length} match(es) for ${u.display_name}.`);
     for (const m of found) {
         const verdict = m.result === 1 ? 'win' : m.result === 0 ? 'loss' : 'draw/none';
+        const factor = m.elo_factor !== null && m.elo_factor < 1 ? ` ${Math.round(m.elo_factor * 100)}%` : '';
         console.log(
             `  ${pad(m.started_at, 20)} ${pad(m.map_name, 16)} ${pad(verdict, 10)}` +
-            ` elo ${pad(num(m.rating_before, 1), 8)} -> ${pad(num(m.rating_after, 1), 8)}` +
+            ` elo ${pad(num(m.rating_before, 1), 8)} -> ${pad(num(m.rating_after, 1), 8)}${factor}` +
             ` ${m.rated === 1 ? '' : m.unrated_reason ?? 'unrated'}`,
         );
     }
@@ -1042,20 +1166,20 @@ async function cmdPlayerReset(dbPath: string): Promise<void> {
     if (!needle) { console.log('Usage: player:reset <player> [--apply]'); return; }
 
     // Not routed through withRatingChange: this deliberately does NOT replay history, which
-    // would put the rating straight back. It is a manual override, and the next recompute
-    // will overwrite it — which is worth knowing before reaching for it.
+    // would put the rating straight back. It is a manual override, and the next recompute will
+    // undo it — which is worth knowing before reaching for it.
     const db = new Db(dbPath);
     try {
         const u = await findUser(db, needle);
         if (!u) return;
-        console.log(`  ${u.display_name}: rating -> ${DEFAULT_RATING}, rd -> ${DEFAULT_RD}, games -> 0`);
+        console.log(
+            `  ${u.display_name}: 1v1 rating forgotten -> ${DEFAULT_RATING}, rd ${DEFAULT_RD}, games 0 `
+            + '(placement again)');
         console.log('Note: this does not erase their matches, so an elo:recompute would undo it.');
         if (APPLY) {
             await db.prepare(
-                `UPDATE elo_ratings SET rating = ?, rd = ?, volatility = ?, games_played = 0,
-                        updated_at = datetime('now')
-                  WHERE user_id = ? AND mode = 'default'`,
-            ).bind(DEFAULT_RATING, DEFAULT_RD, DEFAULT_VOLATILITY, u.id).run();
+                `DELETE FROM player_ratings WHERE user_id = ? AND mode = 'default'`,
+            ).bind(u.id).run();
         }
         summarise(1, 'player');
     } finally {
@@ -1065,7 +1189,7 @@ async function cmdPlayerReset(dbPath: string): Promise<void> {
 
 async function cmdPlayerBan(db: Db, ban: boolean): Promise<void> {
     const needle = positionals()[0];
-    if (!needle) { console.log(`Usage: player:${ban ? 'ban <player> --reason "..."' : 'unban <player>'} [--apply]`); return; }
+    if (!needle) { console.log(`Usage: player:${ban ? 'ban <player> --reason "..." [--refund]' : 'unban <player> [--revoke-refunds]'} [--apply]`); return; }
     const u = await findUser(db, needle);
     if (!u) return;
 
@@ -1081,8 +1205,266 @@ async function cmdPlayerBan(db: Db, ban: boolean): Promise<void> {
     }
     if (ban) {
         console.log('Their open sockets stay up until they drop — the ban bites on the next request.');
+        console.log('Cheating? Add --refund to give their opponents back what they lost to them.');
     }
     summarise(1, 'player');
+}
+
+/** Print what a refund gave, without ever printing who it was for in a player-facing way. */
+async function printRefund(db: Db, refundId: string): Promise<void> {
+    const rows = await db.prepare(
+        `SELECT r.user_id, COALESCE(u.display_name, r.user_id) AS name, r.mode, r.points, r.matches,
+                r.rating_before, r.rating_after
+           FROM rating_refunds r LEFT JOIN users u ON u.id = r.user_id
+          WHERE r.refund_id = ? ORDER BY r.points DESC`,
+    ).bind(refundId).all<{
+        user_id: string; name: string; mode: string; points: number; matches: number;
+        rating_before: number; rating_after: number;
+    }>();
+    const list = rows.results ?? [];
+    console.log(`Refund ${refundId}: ${list.length} player(s).`);
+    if (list.length === 0) console.log('  (nobody lost rated points to them)');
+    for (const r of list) {
+        console.log(`  ${pad(r.name, 22)} ${r.mode === 'team' ? 'team' : '1v1 '}  +${pad(num(r.points, 1), 7)}`
+            + ` over ${r.matches} match(es)   ${num(r.rating_before, 1)} -> ${num(r.rating_after, 1)}`);
+    }
+}
+
+/**
+ * Ban a cheater AND give their opponents back the points they lost to them: one refund event on
+ * the rating timeline, re-derived by every replay (src/elo/ladder.ts, applyRefund). Each player
+ * gets one notice per ladder in the launcher, which never names the banned player.
+ */
+async function cmdPlayerBanWithRefund(dbPath: string): Promise<void> {
+    const needle = positionals()[0];
+    if (!needle) { console.log('Usage: player:ban <player> --reason "..." --refund [--refund-since YYYY-MM-DD] [--apply]'); return; }
+    const reason = flag('reason');
+    const sinceRaw = flag('refund-since');
+    let since: string | null = null;
+    if (sinceRaw) {
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(sinceRaw)) { console.log('--refund-since must be YYYY-MM-DD.'); return; }
+        since = `${sinceRaw} 00:00:00`;
+    }
+    let refundId = '';
+    await withRatingChange(dbPath, 'player banned and refunds given', async (db) => {
+        const u = await findUser(db, needle);
+        if (!u) return null;
+        if (u.is_banned === 1) {
+            const prior = await db.prepare(
+                `SELECT 1 FROM ban_refunds WHERE banned_user_id = ? AND revoked_at IS NULL LIMIT 1`,
+            ).bind(u.id).first();
+            if (prior) { console.log(`${u.display_name} is already banned with a refund.`); return null; }
+        }
+        console.log(`  ${u.display_name} (${u.discord_username}) -> banned: ${reason ?? 'no reason given'}`
+            + `; refunding losses against them${since ? ` since ${sinceRaw}` : ''}`);
+        refundId = uuid();
+        await db.batch([
+            db.prepare(`UPDATE users SET is_banned = 1, ban_reason = ? WHERE id = ?`).bind(reason, u.id),
+            db.prepare(
+                `INSERT INTO ban_refunds (id, banned_user_id, since, reason) VALUES (?, ?, ?, ?)`,
+            ).bind(refundId, u.id, since, reason),
+        ]);
+        return true;
+    }, async (db) => printRefund(db, refundId));
+}
+
+/** Unban, taking back the refunds the ban gave (the replay recomputes everyone without them). */
+async function cmdPlayerUnbanRevoke(dbPath: string): Promise<void> {
+    const needle = positionals()[0];
+    if (!needle) { console.log('Usage: player:unban <player> --revoke-refunds [--apply]'); return; }
+    await withRatingChange(dbPath, 'player unbanned and refunds revoked', async (db) => {
+        const u = await findUser(db, needle);
+        if (!u) return null;
+        const r = await db.prepare(
+            `UPDATE ban_refunds SET revoked_at = datetime('now')
+              WHERE banned_user_id = ? AND revoked_at IS NULL`,
+        ).bind(u.id).run();
+        await db.prepare(`UPDATE users SET is_banned = 0, ban_reason = NULL WHERE id = ?`).bind(u.id).run();
+        console.log(`  ${u.display_name}: unbanned; ${r.changes} refund(s) revoked.`);
+        return true;
+    });
+}
+
+async function cmdRefundsList(db: Db): Promise<void> {
+    const who = flag('player');
+    let userFilter: string | null = null;
+    if (who) {
+        const u = await findUser(db, who);
+        if (!u) return;
+        userFilter = u.id;
+    }
+    const refunds = await db.prepare(
+        `SELECT b.id, b.created_at, b.since, b.reason, b.revoked_at,
+                COALESCE(u.display_name, b.banned_user_id) AS banned
+           FROM ban_refunds b LEFT JOIN users u ON u.id = b.banned_user_id
+          ORDER BY b.created_at DESC`,
+    ).bind().all<{ id: string; created_at: string; since: string | null; reason: string | null;
+        revoked_at: string | null; banned: string }>();
+    const list = refunds.results ?? [];
+    if (list.length === 0) { console.log('No refunds.'); return; }
+    for (const r of list) {
+        const lines = await db.prepare(
+            `SELECT COALESCE(u.display_name, x.user_id) AS name, x.user_id, x.mode, x.points, x.matches, x.seen_at
+               FROM rating_refunds x LEFT JOIN users u ON u.id = x.user_id
+              WHERE x.refund_id = ? ORDER BY x.points DESC`,
+        ).bind(r.id).all<{ name: string; user_id: string; mode: string; points: number; matches: number; seen_at: string | null }>();
+        const rows = (lines.results ?? []).filter((x) => userFilter === null || x.user_id === userFilter);
+        if (userFilter !== null && rows.length === 0) continue;
+        console.log(`${r.id}  ${r.created_at}  banned ${r.banned}${r.revoked_at ? `  REVOKED ${r.revoked_at}` : ''}`
+            + `${r.since ? `  since ${r.since}` : ''}  ${r.reason ?? ''}`);
+        for (const x of rows) {
+            console.log(`  ${pad(x.name, 22)} ${x.mode === 'team' ? 'team' : '1v1 '} +${pad(num(x.points, 1), 7)}`
+                + ` over ${x.matches} match(es)${x.seen_at ? '' : '  (unseen)'}`);
+        }
+    }
+}
+
+async function cmdAlertsList(db: Db): Promise<void> {
+    const all = ARGV.includes('--all');
+    const kind = flag('kind');
+    const rows = await db.prepare(
+        `SELECT id, kind, matchup_key, user_ids, match_id, value, created_at, last_seen_at, acknowledged_at
+           FROM admin_alerts
+          WHERE (? = 1 OR acknowledged_at IS NULL) AND (? IS NULL OR kind = ?)
+          ORDER BY last_seen_at DESC`,
+    ).bind(all ? 1 : 0, kind, kind).all<{
+        id: string; kind: string; matchup_key: string; user_ids: string; match_id: string | null;
+        value: number; created_at: string; last_seen_at: string; acknowledged_at: string | null;
+    }>();
+    const list = rows.results ?? [];
+    if (list.length === 0) { console.log(all ? 'No alerts.' : 'No open alerts.'); return; }
+    for (const a of list) {
+        let names = a.user_ids;
+        try {
+            const ids = JSON.parse(a.user_ids) as string[];
+            const out: string[] = [];
+            for (const id of ids) {
+                const u = await db.prepare(`SELECT display_name FROM users WHERE id = ?`).bind(id)
+                    .first<{ display_name: string }>();
+                out.push(u?.display_name ?? id);
+            }
+            names = out.join(', ');
+        } catch { /* keep the raw list */ }
+        console.log(`${a.id}  ${pad(a.kind, 13)} value ${pad(a.value, 3)} last ${a.last_seen_at}`
+            + `${a.acknowledged_at ? `  acked ${a.acknowledged_at}` : ''}`);
+        console.log(`  ${names}   last match ${a.match_id ?? '-'}`);
+    }
+}
+
+async function cmdAlertsAck(db: Db): Promise<void> {
+    const id = positionals()[0];
+    if (!id) { console.log('Usage: alerts:ack <id> [--apply]'); return; }
+    const a = await db.prepare(`SELECT id, acknowledged_at FROM admin_alerts WHERE id = ?`).bind(id)
+        .first<{ id: string; acknowledged_at: string | null }>();
+    if (!a) { console.log(`No alert '${id}'.`); return; }
+    if (a.acknowledged_at) { console.log('Already acknowledged.'); return; }
+    if (APPLY) {
+        await db.prepare(`UPDATE admin_alerts SET acknowledged_at = datetime('now') WHERE id = ?`).bind(id).run();
+    }
+    summarise(1, 'alert');
+}
+
+/**
+ * Look for both alert patterns across the history, without writing anything: pairs with a long
+ * raw run of wins by the same side, and pairs with many very short matches in the window.
+ */
+async function cmdAlertsScan(db: Db): Promise<void> {
+    const cfg = loadConfig();
+    const days = Number(flag('days') ?? 30);
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().replace('T', ' ').slice(0, 19);
+
+    const keys = await db.prepare(
+        `SELECT DISTINCT matchup_key FROM matches
+          WHERE matchup_key IS NOT NULL AND rated = 1 AND created_at >= ?`,
+    ).bind(since).all<{ matchup_key: string }>();
+    let found = 0;
+    for (const { matchup_key: key } of keys.results ?? []) {
+        const rows = await db.prepare(
+            `SELECT farm_winner_key FROM matches
+              WHERE matchup_key = ? AND rated = 1 AND tournament_match_id IS NULL
+              ORDER BY created_at DESC, id DESC LIMIT 50`,
+        ).bind(key).all<{ farm_winner_key: string | null }>();
+        const streak = rawConsecutiveWins((rows.results ?? []).map((r) => r.farm_winner_key));
+        if (streak >= cfg.alertFarmStreak) {
+            found++;
+            console.log(`farm_streak    ${streak} in a row   ${key}`);
+        }
+    }
+
+    // Very short 1v1s, by pair.
+    const pairs = await db.prepare(
+        `SELECT a.user_id AS a, b.user_id AS b, m.duration_seconds AS d
+           FROM matches m
+           JOIN match_participants a ON a.match_id = m.id
+           JOIN match_participants b ON b.match_id = m.id AND b.user_id > a.user_id
+          WHERE m.created_at >= ?
+            AND (SELECT COUNT(*) FROM match_participants x WHERE x.match_id = m.id) = 2`,
+    ).bind(since).all<{ a: string; b: string; d: number }>();
+    const byPair = new Map<string, number[]>();
+    for (const r of pairs.results ?? []) {
+        const k = matchupKey('default', [[r.a], [r.b]]);
+        const list = byPair.get(k) ?? [];
+        list.push(r.d);
+        byPair.set(k, list);
+    }
+    for (const [k, durations] of byPair) {
+        const n = shortMatchCount(durations, cfg.newAccountShortMatchSeconds);
+        if (n >= cfg.alertShortMatches) {
+            found++;
+            console.log(`short_matches  ${n} under ${cfg.newAccountShortMatchSeconds}s   ${k}`);
+        }
+    }
+    console.log(found === 0 ? `Nothing found in the last ${days} day(s).` : `${found} pattern(s) found. Nothing was written.`);
+}
+
+async function cmdHighlightsShow(db: Db): Promise<void> {
+    const month = positionals()[0] ?? previousMonth(monthOf(Date.now()));
+    if (!/^\d{4}-\d{2}$/.test(month)) { console.log('Usage: highlights:show [YYYY-MM]'); return; }
+    const h = await highlightsFor({ db } as unknown as AppContext, month, Date.now());
+    console.log(JSON.stringify(h, null, 2));
+    for (const lang of ['es', 'en'] as const) {
+        console.log(`\n--- Discord (${lang}) ---`);
+        console.log(renderDiscord(h, lang) ?? '(nothing to post: no rated match that month)');
+    }
+    // What is actually posted since 2026-11-11: the card, as JSON for an embed viewer.
+    const embeds = highlightsEmbeds(h, 'both');
+    console.log('\n--- Discord card (JSON) ---');
+    console.log(embeds.length > 0 ? JSON.stringify(highlightsMessage(embeds), null, 2) : '(nothing to post)');
+}
+
+/**
+ * Post a month's highlights to the highlights webhook now. The server does this on its own early
+ * on the 1st; this is for a missed month or a re-post (--force ignores the "already posted" mark).
+ */
+async function cmdHighlightsPost(dbPath: string): Promise<void> {
+    const month = positionals()[0] ?? previousMonth(monthOf(Date.now()));
+    if (!/^\d{4}-\d{2}$/.test(month)) { console.log('Usage: highlights:post [YYYY-MM] [--force] [--apply]'); return; }
+    const db = new Db(dbPath);
+    try {
+        const kv = new KvStore(db);
+        kv.init();
+        const ctx = { db, kv, config: loadConfig() } as unknown as AppContext;
+        if (!ARGV.includes('--force') && await kv.get(`highlights:posted:${month}`)) {
+            console.log(`${month} was already posted. Use --force to post it again.`);
+            return;
+        }
+        if (ctx.config.discordHighlightsWebhookUrls.length === 0) {
+            console.log('No highlights webhook configured (DISCORD_HIGHLIGHTS_WEBHOOK_URL / DISCORD_WEBHOOK_URL).');
+            return;
+        }
+        if (!APPLY) {
+            // The exact JSON that would be posted - paste it into an embed viewer to see the card.
+            const h = await highlightsFor(ctx, month, Date.now());
+            const embeds = highlightsEmbeds(h, ctx.config.discordHighlightsLang);
+            console.log(embeds.length > 0 ? JSON.stringify(highlightsMessage(embeds), null, 2) : '(nothing to post)');
+            console.log(`\nWould post to ${ctx.config.discordHighlightsWebhookUrls.length} webhook(s). Re-run with --apply.`);
+            return;
+        }
+        const ok = await postHighlights(ctx, month, undefined, Date.now());
+        console.log(ok ? `Posted ${month}.` : `Nothing posted for ${month}.`);
+    } finally {
+        db.close();
+    }
 }
 
 /**
@@ -1116,6 +1498,223 @@ async function cmdPlayerUnstick(db: Db): Promise<void> {
     summarise(stale.length, 'membership row(s)');
 }
 
+// ---------------------------------------------------------------- replay storage
+
+/**
+ * Proves the recordings bucket works end to end, with no match and no launcher: PUT a tiny
+ * object through a presigned URL (with the size signed, exactly as a launcher uploads), HEAD
+ * it, GET it back, DELETE it. Each step prints the status the storage answered, and a failure
+ * prints the storage's own error body — `SignatureDoesNotMatch`, `NoSuchBucket`,
+ * `NotAuthorizedOrNotFound` name the cause better than anything this script could.
+ *
+ * Not dry-run like the rest of this file: it writes nothing to the database and leaves
+ * nothing in the bucket (the object is deleted at the end, and it lives under `selftest/`).
+ */
+async function cmdReplaySelftest(): Promise<void> {
+    const storage = replayStorageFromEnv();
+    if (!storage) {
+        console.log('Replay storage is not configured. Set REPLAY_S3_ENDPOINT (https), REPLAY_S3_REGION,');
+        console.log('REPLAY_S3_ACCESS_KEY, REPLAY_S3_SECRET_KEY and REPLAY_BUCKET in .env.');
+        process.exitCode = 1;
+        return;
+    }
+
+    const key = `selftest/${uuid()}.txt`;
+    const body = Buffer.from(`wol-lobby replay selftest ${new Date().toISOString()}\n`, 'utf8');
+    console.log(`Bucket ${storage.bucket} at ${storage.endpoint} (${storage.region})`);
+    console.log(`Object ${key} (${body.length} bytes)\n`);
+
+    let ok = true;
+    const report = async (label: string, res: UndiciResponse, good: boolean, note = '') => {
+        console.log(`  ${pad(label, 8)} ${res.status} ${good ? 'OK' : 'FAILED'}${note ? `  ${note}` : ''}`);
+        if (!good) {
+            ok = false;
+            const text = await res.text().catch(() => '');
+            if (text) console.log(`           ${text.slice(0, 500).replace(/\s+/g, ' ')}`);
+        }
+    };
+
+    try {
+        const put = await fetch(presignObject(storage, 'PUT', key, {
+            expiresSec: 300,
+            signedHeaders: { 'content-length': String(body.length) },
+        }), { method: 'PUT', body, headers: { 'content-type': 'application/octet-stream' } });
+        await report('PUT', put, put.ok);
+        if (!put.ok) return finish(false);
+
+        const head = await fetch(presignObject(storage, 'HEAD', key, { expiresSec: 60 }), { method: 'HEAD' });
+        const size = Number(head.headers.get('content-length') ?? '-1');
+        await report('HEAD', head, head.ok && size === body.length, `content-length ${size}`);
+
+        const get = await fetch(presignObject(storage, 'GET', key, {
+            expiresSec: 60,
+            query: { 'response-content-disposition': 'attachment; filename="selftest.txt"' },
+        }));
+        const got = get.ok ? Buffer.from(await get.arrayBuffer()) : Buffer.alloc(0);
+        await report('GET', get, get.ok && got.equals(body),
+            `same bytes: ${got.equals(body) ? 'yes' : 'no'}; disposition: ${get.headers.get('content-disposition') ?? '-'}`);
+
+        const del = await fetch(presignObject(storage, 'DELETE', key, { expiresSec: 60 }), { method: 'DELETE' });
+        await report('DELETE', del, del.ok || del.status === 204);
+    } catch (err) {
+        console.log(`  network error: ${(err as Error).message}`);
+        ok = false;
+    }
+    finish(ok);
+
+    function finish(success: boolean): void {
+        console.log(success
+            ? '\nThe bucket accepts uploads, serves downloads and deletes. Recordings will work.'
+            : '\nSomething failed — the storage error above names the cause.');
+        if (!success) process.exitCode = 1;
+    }
+}
+
+/**
+ * `replay:attach <matchId> --file=<path> [--force] [--apply]` — gives a reported match the
+ * recording its launcher could not upload.
+ *
+ * Why it exists. The launcher uploads a competitive recording after the report, and until
+ * launchers retried, one refusal lost it for good: the first match played on v1.0.16 was
+ * reported, rated, and answered `503 replays_disabled` because the bucket was not configured
+ * yet. The recording is still on the reporter's disk; this puts it where the launcher would
+ * have, under the same object key, and records it on the match exactly as
+ * `POST /replays/confirm` does — `replay_uploader_id` being the reporter, on whose behalf it is.
+ *
+ * The refusals are the upload route's (`attachRefusal`) minus "who is asking": a casual or
+ * unknown room, a match that already has a recording, a file over the cap, and a fingerprint
+ * that differs from the one the match was reported with — that last one only `--force`
+ * overrides, after you have checked by hand that it is the right game.
+ *
+ * Dry run by default: it prints the match, the file and the object key and sends nothing. The
+ * file's path must be given as `--file=<path>` or `--file <path>`.
+ */
+async function cmdReplayAttach(dbPath: string): Promise<void> {
+    const matchId = positionals()[0];
+    const file = flag('file');
+    if (!matchId || !file) {
+        console.log('Usage: replay:attach <matchId> --file=<path to the .age3Yrec> [--force] [--apply]');
+        process.exitCode = 1;
+        return;
+    }
+
+    const storage = replayStorageFromEnv();
+    if (!storage) {
+        console.log('Replay storage is not configured (REPLAY_S3_* and REPLAY_BUCKET in .env) — run replay:selftest.');
+        process.exitCode = 1;
+        return;
+    }
+
+    let bytes: Buffer;
+    try {
+        bytes = readFileSync(file);
+    } catch (err) {
+        console.log(`Could not read '${file}': ${(err as Error).message}`);
+        process.exitCode = 1;
+        return;
+    }
+    const sha = createHash('sha256').update(bytes).digest('hex');
+    const force = ARGV.includes('--force');
+
+    const db = new Db(dbPath);
+    try {
+        const match = await db.prepare(
+            `SELECT m.id, m.host_user_id, m.mod_id, m.started_at, m.replay_sha256,
+                    m.replay_key, m.replay_size_bytes, l.competitive
+               FROM matches m
+               LEFT JOIN lobbies l ON l.id = m.lobby_id
+              WHERE m.id = ?`,
+        ).bind(matchId).first<ReplayMatchRow>();
+
+        if (match) {
+            const info = await db.prepare(
+                `SELECT map_name, duration_seconds FROM matches WHERE id = ?`,
+            ).bind(match.id).first<{ map_name: string | null; duration_seconds: number | null }>();
+            const players = await db.prepare(
+                `SELECT p.user_id, p.result, u.display_name
+                   FROM match_participants p LEFT JOIN users u ON u.id = p.user_id
+                  WHERE p.match_id = ?`,
+            ).bind(match.id).all<{ user_id: string; result: number | null; display_name: string | null }>();
+
+            console.log(`Match ${match.id}`);
+            console.log(`  mod        ${match.mod_id}          map ${info?.map_name ?? '-'}`);
+            console.log(`  played     ${match.started_at}  (${info?.duration_seconds ?? '?'}s)`);
+            console.log(`  room       ${match.competitive === 1 ? 'COMPETITIVE' : match.competitive === 0 ? 'casual' : 'unknown'}`);
+            for (const p of players.results ?? []) {
+                const verdict = p.result === null ? '' : p.result >= 0.999 ? 'won' : p.result <= 0.001 ? 'lost' : 'no result';
+                const reporter = p.user_id === match.host_user_id ? '  (reported it)' : '';
+                console.log(`  player     ${pad(p.display_name ?? p.user_id, 24)} ${pad(verdict, 10)}${reporter}`);
+            }
+            console.log(`  reported   sha256 ${match.replay_sha256 ?? '- (no recording was read)'}`);
+        }
+        console.log(`  file       ${file}  (${bytes.length} bytes)`);
+        console.log(`             sha256 ${sha}`
+            + (match?.replay_sha256
+                ? (match.replay_sha256.trim().toLowerCase() === sha ? '  — the one the match was reported with' : '  — DIFFERENT from the reported one')
+                : ''));
+
+        const refused = attachRefusal({
+            match: match ?? null,
+            sizeBytes: bytes.length,
+            sha256: sha,
+            maxBytes: replayMaxBytesFromEnv(),
+            force,
+        });
+        if (refused) {
+            console.log(`\nRefused: ${refused.code} — ${refused.message}`);
+            if (refused.code === 'sha_mismatch') {
+                console.log('If you have checked that this file IS this match (map, players, date), re-run with --force.');
+            }
+            process.exitCode = 1;
+            return;
+        }
+
+        const key = objectKeyFor(match!.mod_id, match!.started_at, match!.id);
+        console.log(`  object     ${storage.bucket}/${key}`);
+        if (!APPLY) {
+            console.log('\nWould upload the file and record it on the match. Re-run with --apply to do it.');
+            return;
+        }
+
+        const put = await fetch(presignObject(storage, 'PUT', key, {
+            expiresSec: 300,
+            signedHeaders: { 'content-length': String(bytes.length) },
+        }), { method: 'PUT', body: bytes, headers: { 'content-type': 'application/octet-stream' } });
+        if (!put.ok) {
+            const text = await put.text().catch(() => '');
+            console.log(`\nThe storage refused the upload: HTTP ${put.status} ${text.slice(0, 500).replace(/\s+/g, ' ')}`);
+            process.exitCode = 1;
+            return;
+        }
+
+        const head = await fetch(presignObject(storage, 'HEAD', key, { expiresSec: 60 }), { method: 'HEAD' });
+        const size = Number(head.headers.get('content-length') ?? '-1');
+        if (!head.ok || size !== bytes.length) {
+            console.log(`\nUploaded, but the storage answers HEAD ${head.status} with ${size} bytes — not recording it on the match.`);
+            process.exitCode = 1;
+            return;
+        }
+
+        const res = await db.prepare(
+            `UPDATE matches
+                SET replay_key = ?, replay_size_bytes = ?, replay_uploaded_at = datetime('now'),
+                    replay_uploader_id = host_user_id
+              WHERE id = ? AND replay_key IS NULL`,
+        ).bind(key, bytes.length, match!.id).run();
+        if (res.changes === 0) {
+            console.log(`\nThe match was given a recording while this ran; it was left as it is. The object at ${key} is the file just uploaded.`);
+            process.exitCode = 1;
+            return;
+        }
+        console.log(`\nDone — match ${match!.id} has its recording (${bytes.length} bytes). Players can download it now.`);
+    } catch (err) {
+        console.log(`\nFailed: ${(err as Error).message}`);
+        process.exitCode = 1;
+    } finally {
+        db.close();
+    }
+}
+
 function usage(): void {
     console.log(`Operator commands. Dry run by default; add --apply to write.
 
@@ -1130,12 +1729,29 @@ function usage(): void {
                                             rate a stored 2v2/3v3 from its recordings by
                                             naming the losing side, then replay both ladders
   match:void <id>                           stop it counting, then replay the ladder
-  elo:recompute                             replay the ladder; run it alone to self-check
-  player:show <player>                      rating, ban state, stale memberships
+  elo:recompute                             rebuild every rating from the history under the
+                                            current rules (dry run prints who moves)
+  player:show <player>                      rating, placement, streaks, ban state, memberships
   player:history <player> [--limit N]
-  player:reset <player>                     one player back to ${DEFAULT_RATING}
-  player:ban <player> --reason "..."        |  player:unban <player>
+  player:reset <player>                     forget one player's 1v1 rating (back to ${DEFAULT_RATING})
+  player:ban <player> --reason "..." [--refund [--refund-since YYYY-MM-DD]]
+                                            ban; --refund gives his opponents back what they
+                                            lost to him (one notice each, never naming him)
+  player:unban <player> [--revoke-refunds]
   player:unstick <player>                   clear rows that bar them from every room
+  refunds:list [--player <p>]               refunds given, and to whom
+  alerts:list [--all] [--kind K]            open operator alerts (farm streaks, short matches)
+  alerts:ack <id>                           close one
+  alerts:scan [--days 30]                   look for both patterns in the history; writes nothing
+  highlights:show [YYYY-MM]                 a month's highlights and its Discord text
+  highlights:post [YYYY-MM] [--force]       post them to the highlights webhook
+  replay:selftest                           upload, read and delete a tiny test object in the
+                                            recordings bucket (REPLAY_S3_*); touches no database
+  replay:attach <id> --file=<path> [--force]
+                                            give a reported competitive match the recording
+                                            its launcher could not upload; --force only when
+                                            the fingerprint differs and you checked it by hand
+  season:show                               (seasons were removed; kept so old notes still run)
 
 ${tourn.TOURNAMENT_USAGE}
 
@@ -1155,10 +1771,13 @@ const KNOWN = new Set([
     'status',
     'rooms:list', 'rooms:close', 'rooms:prune',
     'match:list', 'match:show', 'match:decide', 'match:decide-team', 'match:void',
-    'elo:recompute',
+    'elo:recompute', 'season:show',
     'player:show', 'player:history', 'player:reset',
     'versions',
     'player:ban', 'player:unban', 'player:unstick',
+    'refunds:list', 'alerts:list', 'alerts:ack', 'alerts:scan',
+    'highlights:show', 'highlights:post',
+    'replay:selftest', 'replay:attach',
     ...tourn.TOURNAMENT_COMMANDS,
 ]);
 
@@ -1172,6 +1791,9 @@ async function main(): Promise<void> {
         return usage();
     }
 
+    // Talks to the bucket only, never to a database — answered before one is opened.
+    if (COMMAND === 'replay:selftest') return cmdReplaySelftest();
+
     const dbPath = resolveDbPath();
 
     // The rating commands manage their own connection: a dry run has to open a snapshot
@@ -1181,6 +1803,10 @@ async function main(): Promise<void> {
     if (COMMAND === 'match:void') return cmdMatchVoid(dbPath);
     if (COMMAND === 'elo:recompute') return cmdEloRecompute(dbPath);
     if (COMMAND === 'player:reset') return cmdPlayerReset(dbPath);
+    if (COMMAND === 'player:ban' && ARGV.includes('--refund')) return cmdPlayerBanWithRefund(dbPath);
+    if (COMMAND === 'player:unban' && ARGV.includes('--revoke-refunds')) return cmdPlayerUnbanRevoke(dbPath);
+    if (COMMAND === 'highlights:post') return cmdHighlightsPost(dbPath);
+    if (COMMAND === 'replay:attach') return cmdReplayAttach(dbPath);
 
     const db = new Db(dbPath);
     try {
@@ -1197,6 +1823,12 @@ async function main(): Promise<void> {
             case 'player:unban': return await cmdPlayerBan(db, false);
             case 'player:unstick': return await cmdPlayerUnstick(db);
             case 'versions': return await cmdVersions(db);
+            case 'season:show': return cmdSeasonShow();
+            case 'refunds:list': return await cmdRefundsList(db);
+            case 'alerts:list': return await cmdAlertsList(db);
+            case 'alerts:ack': return await cmdAlertsAck(db);
+            case 'alerts:scan': return await cmdAlertsScan(db);
+            case 'highlights:show': return await cmdHighlightsShow(db);
 
             // Tournaments and teams. The maintainer inspects and overrules; creating,
             // seeding and starting belong to whoever owns the tournament.
@@ -1206,6 +1838,7 @@ async function main(): Promise<void> {
             case 'tournament:cancel': return await tourn.cmdTournamentCancel(db, cli());
             case 'tournament:feature': return await tourn.cmdTournamentFeature(db, cli());
             case 'tournament:reap': return await tourn.cmdTournamentReap(db, cli());
+            case 'tournament:delete': return await tourn.cmdTournamentDelete(db, cli());
             case 'team:show': return await tourn.cmdTeamShow(db, cli());
             case 'team:disband': return await tourn.cmdTeamDisband(db, cli());
             case 'tournament:transfer':

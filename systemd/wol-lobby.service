@@ -8,7 +8,7 @@ Type=simple
 
 # The unit runs as a dedicated low-priv user. Create it once:
 #   sudo useradd --system --home /var/lib/wol-lobby --shell /usr/sbin/nologin wol-lobby
-#   sudo mkdir -p /var/lib/wol-lobby/replays
+#   sudo mkdir -p /var/lib/wol-lobby
 #   sudo chown -R wol-lobby:wol-lobby /var/lib/wol-lobby
 User=wol-lobby
 Group=wol-lobby
@@ -56,7 +56,7 @@ RestrictNamespaces=true
 LockPersonality=true
 MemoryDenyWriteExecute=false
 
-# The DB + replay folder are the only places we need to write.
+# The DB is the only place we need to write (recordings live in an S3 bucket).
 ReadWritePaths=/var/lib/wol-lobby
 
 [Install]

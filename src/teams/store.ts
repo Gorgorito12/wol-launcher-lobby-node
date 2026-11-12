@@ -88,6 +88,30 @@ export async function listInvitesFor(db: Db, userId: string): Promise<TeamInvite
     return r.results ?? [];
 }
 
+/** What a captain has sent and nobody has answered, with the name to draw for it. */
+export interface SentInviteRow {
+    id: string;
+    team_id: string;
+    team_name: string;
+    invited_user_id: string;
+    invited_name: string;
+    created_at: string;
+}
+
+export const SENT_INVITES_SQL =
+    `SELECT i.id, i.team_id, t.name AS team_name, i.invited_user_id, i.created_at,
+            COALESCE(NULLIF(u.display_name, ''), NULLIF(u.discord_username, ''), 'Unknown') AS invited_name
+       FROM team_invites i
+       JOIN teams t ON t.id = i.team_id
+       JOIN users u ON u.id = i.invited_user_id
+      WHERE i.invited_by = ? AND i.status = 'pending' AND t.disbanded_at IS NULL
+      ORDER BY i.created_at DESC`;
+
+export async function listInvitesSentBy(db: Db, userId: string): Promise<SentInviteRow[]> {
+    const r = await db.prepare(SENT_INVITES_SQL).bind(userId).all<SentInviteRow>();
+    return r.results ?? [];
+}
+
 export async function getInvite(db: Db, inviteId: string): Promise<TeamInviteRow | undefined> {
     return db.prepare(
         `SELECT i.*, t.name AS team_name, t.tag AS team_tag

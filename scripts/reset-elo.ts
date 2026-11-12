@@ -1,95 +1,34 @@
 /**
- * Wipe every stored rating and start the ladder over.
- * Run: `npx tsx scripts/reset-elo.ts` (stop the service first).
+ * RETIRED — this script no longer resets anything, and running it changes nothing.
  *
- * Why this exists. Until the ratability rule landed, POST /matches fed EVERY
- * reported match to Glicko — including the ones where nobody won. The launcher
- * sends 0.5 for every player when it could not read a winner, and the backend
- * processed that as a draw between everyone: ratings drifted towards each other
- * and games_played counted games that the launcher was, on screen, calling
- * "it counted towards no one's rating". Since AoE3 does not record by default,
- * almost every stored match is one of those — so the ratings in the database
- * were built mostly out of matches that never should have moved them. There is
- * nothing to salvage; they start again.
+ * It wiped every stored rating to start the ladder over. It did that once, for a good reason
+ * (see "Why it existed" below), and then rating seasons made it obsolete AND dangerous:
  *
- * What is NOT touched: `matches` and `match_participants.result`. The history is
- * the record of what was played and who won, and it stays whole. Only the
- * inferred numbers go.
+ *   * Obsolete: the ladder now restarts by itself every three months (src/elo/seasons.ts). A
+ *     new season simply has no rating rows, and every player starts it from a soft reset of the
+ *     last season they played. Nothing has to be deleted for that to happen.
+ *   * Dangerous: ratings live in `season_ratings`, one row per (player, ladder, season), and an
+ *     ENDED season's rows are its permanent record — the final places, the medals, what each
+ *     player's profile lists. Deleting them would erase every season's history at once. The old
+ *     table this script emptied, `elo_ratings`, is frozen since migration 0024 and nothing reads
+ *     it any more.
  *
- * A SCRIPT and not a migration, deliberately. A migration is remembered in the
- * _migrations table of the database it ran against — but your BACKUP predates
- * that row, so restoring the backup and starting the service would re-run the
- * migration and delete the ratings you just restored. That would make the
- * rollback destroy the thing it was for. A forgotten script leaves the ratings
- * wrong, which is recoverable; a migration here is not.
+ * To correct ratings, use the operator commands, which replay the ladder from the season a
+ * correction belongs to and leave every earlier season untouched:
+ *
+ *   tsx scripts/admin.ts match:void <id>          stop a match counting
+ *   tsx scripts/admin.ts match:decide <id> ...    settle a match by hand
+ *   tsx scripts/admin.ts elo:recompute            replay; run it alone to self-check
+ *
+ * Why it existed. Until the ratability rule landed, POST /matches fed EVERY reported match to
+ * Glicko — including the ones where nobody won — so the ratings were built mostly out of matches
+ * that never should have moved them. They were wiped and rebuilt from scratch. It was a SCRIPT
+ * and not a migration deliberately: a migration is remembered in the `_migrations` table of the
+ * database it ran against, so restoring a backup and starting the service would have re-run it
+ * and deleted the ratings just restored.
  */
-import 'dotenv/config';
-import { Db } from '../src/db';
-
-/**
- * Where the database is.
- *
- * Read straight from the environment rather than through `loadConfig()`, which was the
- * first attempt and was wrong: that function hard-fails when JWT_SIGNING_KEY,
- * DISCORD_CLIENT_ID and friends are missing, and this script has no business demanding
- * OAuth secrets in order to delete rows from a table. It also made the script unrunnable
- * by any user who cannot read the service's .env, which is exactly the user an operator
- * is logged in as.
- *
- * Order: an explicit path on the command line, then DB_PATH (from the environment or a
- * readable .env), then the same default env.ts uses.
- */
-function resolveDbPath(): string {
-    return process.argv[2] || process.env.DB_PATH || './lobby.db';
-}
-
-function main(): void {
-    const dbPath = resolveDbPath();
-    const db = new Db(dbPath);
-    const raw = db.raw();
-
-    const before = {
-        ratings: (raw.prepare('SELECT COUNT(*) AS n FROM elo_ratings').get() as { n: number }).n,
-        stamped: (raw.prepare(
-            'SELECT COUNT(*) AS n FROM match_participants WHERE rating_before IS NOT NULL',
-        ).get() as { n: number }).n,
-        matches: (raw.prepare('SELECT COUNT(*) AS n FROM matches').get() as { n: number }).n,
-    };
-
-    console.log(`Database : ${dbPath}`);
-    console.log(`Before   : ${before.ratings} rating rows, ${before.stamped} stamped participants, ` +
-                `${before.matches} matches (kept)`);
-
-    if (before.ratings === 0 && before.stamped === 0) {
-        console.log('Nothing to reset — already clean.');
-        db.close();
-        return;
-    }
-
-    // One transaction: a half-done reset would leave ratings that no longer
-    // match the deltas recorded against them.
-    const reset = raw.transaction(() => {
-        raw.prepare('DELETE FROM elo_ratings').run();
-        raw.prepare(
-            'UPDATE match_participants SET rating_before = NULL, rating_after = NULL',
-        ).run();
-    });
-    reset();
-
-    const after = {
-        ratings: (raw.prepare('SELECT COUNT(*) AS n FROM elo_ratings').get() as { n: number }).n,
-        stamped: (raw.prepare(
-            'SELECT COUNT(*) AS n FROM match_participants WHERE rating_before IS NOT NULL',
-        ).get() as { n: number }).n,
-        matches: (raw.prepare('SELECT COUNT(*) AS n FROM matches').get() as { n: number }).n,
-    };
-
-    console.log(`After    : ${after.ratings} rating rows, ${after.stamped} stamped participants, ` +
-                `${after.matches} matches (kept)`);
-    console.log('Done. Rows are recreated on the first rated match; until then every');
-    console.log('player reads as the default 1500 / rd 350, which is what they now are.');
-
-    db.close();
-}
-
-main();
+console.error('scripts/reset-elo.ts is retired and did nothing.');
+console.error('Ratings restart by themselves every season; an ended season\'s ratings are its');
+console.error('permanent record. To correct a rating use scripts/admin.ts (match:void,');
+console.error('match:decide, elo:recompute) — see the comment at the top of this file.');
+process.exit(1);

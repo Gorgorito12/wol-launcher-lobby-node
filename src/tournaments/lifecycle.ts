@@ -150,3 +150,112 @@ export function staleWhereClause(alias = ''): string {
  */
 export const CAPPED_STATUSES: readonly TournamentStatus[] =
     ['draft', 'registration', 'ready', 'running'];
+
+// ---------------------------------------------------------------- who sees an ended tournament
+
+/**
+ * How long an ended tournament stays where people see it, and what happens after
+ * (2026-11-11, the maintainer's "limpieza inteligente").
+ *
+ * | Tournament                                   | Who sees it                 | After            |
+ * |----------------------------------------------|-----------------------------|------------------|
+ * | draft                                        | its owner                   | 7 days: deleted  |
+ * | cancelled / abandoned, NO game played        | its owner, 7 days           | deleted          |
+ * | cancelled / abandoned, games played          | everybody, 7 days           | kept, unlisted   |
+ * | finished                                     | everybody, 30 days          | only who took part |
+ *
+ * A tournament with a played game is NEVER deleted: its games and the rating they moved are
+ * history. What "played" means is {@link playedSql}.
+ *
+ * Like staleness, all of this is evaluated on READ. The startup sweep deletes what is due,
+ * which is tidiness: between restarts the list already hides it.
+ */
+export const ENDED_PUBLIC_DAYS = 7;
+export const UNPLAYED_KEEP_DAYS = 7;
+export const FINISHED_PUBLIC_DAYS = 30;
+
+/**
+ * True when a game of this tournament was played: a bracket slot decided by a game, or a game
+ * reported from one of its rooms that has not moved the bracket (a team result waiting for its
+ * confirmation, a recording that did not match). Either one is a game somebody played and the
+ * ladder may have rated, so either one keeps the tournament.
+ */
+export function playedSql(alias = ''): string {
+    const id = alias ? `${alias}.id` : 'id';
+    return `(
+        EXISTS (SELECT 1 FROM tournament_matches tmp
+                 WHERE tmp.tournament_id = ${id} AND tmp.match_id IS NOT NULL)
+        OR EXISTS (SELECT 1 FROM matches mp
+                     JOIN tournament_matches tmq ON tmq.id = mp.tournament_match_id
+                    WHERE tmq.tournament_id = ${id})
+    )`;
+}
+
+/** When the tournament ended, for an ended one: cancelled, abandoned, else its last activity. */
+function endedAtSql(alias = ''): string {
+    const col = (name: string) => (alias ? `${alias}.${name}` : name);
+    return `COALESCE(${col('cancelled_at')}, ${col('abandoned_at')}, ${col('last_activity_at')})`;
+}
+
+/**
+ * The public list's rule: not a draft, alive, and an ended tournament only while its window
+ * lasts. Embeds {@link aliveWhereClause} verbatim, so the list and the creation caps cannot
+ * disagree about what is alive.
+ */
+export function publicWhereClause(alias = ''): string {
+    const col = (name: string) => (alias ? `${alias}.${name}` : name);
+    return `${col('status')} <> 'draft' AND ${aliveWhereClause(alias)}
+        AND NOT (${col('status')} IN ('cancelled','abandoned')
+                 AND (NOT ${playedSql(alias)}
+                      OR julianday('now') - julianday(${endedAtSql(alias)}) > ${ENDED_PUBLIC_DAYS}))
+        AND NOT (${col('status')} = 'finished'
+                 AND julianday('now') - julianday(COALESCE(${col('finished_at')}, ${col('last_activity_at')}))
+                     > ${FINISHED_PUBLIC_DAYS})`;
+}
+
+/**
+ * Rows the startup sweep deletes: a stale draft, and a cancelled or abandoned tournament with
+ * no game played whose week is over. Never one with a game played.
+ */
+export function dueForDeletionWhereClause(alias = ''): string {
+    const col = (name: string) => (alias ? `${alias}.${name}` : name);
+    return `(
+        (${col('status')} = 'draft'
+            AND julianday('now') - julianday(${col('created_at')}) > ${DRAFT_STALE_DAYS})
+        OR (${col('status')} IN ('cancelled','abandoned')
+            AND julianday('now') - julianday(${endedAtSql(alias)}) > ${UNPLAYED_KEEP_DAYS})
+    ) AND NOT ${playedSql(alias)}`;
+}
+
+/** The statuses an owner may delete from the launcher — and then only with no game played. */
+export const DELETABLE_STATUSES: readonly TournamentStatus[] = ['draft', 'cancelled', 'abandoned'];
+
+export interface VisibilityInput {
+    status: TournamentStatus;
+    createdAt: string;
+    lastActivityAt: string | null;
+    /** cancelled_at ?? abandoned_at, for an ended one. */
+    endedAt: string | null;
+    finishedAt: string | null;
+    played: boolean;
+}
+
+/** The JS twin of {@link publicWhereClause}, for tests and the CLI. */
+export function isPubliclyListed(t: VisibilityInput, nowMs: number): boolean {
+    if (t.status === 'draft') return false;
+    if (isStale(t, nowMs)) return false;
+    const age = (stamp: string | null) => {
+        const ms = sqliteTimestampToMs(stamp) ?? sqliteTimestampToMs(t.lastActivityAt);
+        return ms === null ? Infinity : nowMs - ms;
+    };
+    if (t.status === 'cancelled' || t.status === 'abandoned') {
+        return t.played && age(t.endedAt) <= ENDED_PUBLIC_DAYS * DAY_MS;
+    }
+    if (t.status === 'finished') return age(t.finishedAt) <= FINISHED_PUBLIC_DAYS * DAY_MS;
+    return true;
+}
+
+/** Whether its owner may delete it now. */
+export function mayDelete(t: { status: TournamentStatus; played: boolean }): boolean {
+    return DELETABLE_STATUSES.includes(t.status) && !t.played;
+}

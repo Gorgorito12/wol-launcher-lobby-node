@@ -10,10 +10,12 @@
  *
  * Pure and side-effect free — the callers do the I/O and hand in plain data.
  */
+import { modIdInList } from '../lib/modIds';
 
 /** Why a match was stored but not scored. Null means it was scored. */
 export type UnratedReason =
-    /** The mod has no ladder. See Config.rankedModIds. */
+    /** The operator narrowed RANKED_MOD_IDS and this mod is outside it. With the default
+     *  `*` nothing new is refused for this; older rows still carry it. See isRankedMod. */
     | 'mod_not_ranked'
     /** The room was not created as competitive, so nobody agreed to put rating on it. */
     | 'not_competitive'
@@ -42,7 +44,17 @@ export type UnratedReason =
     | 'game_crashed'
     /** A match the server FOUNDED from a reading (src/elo/founding.ts) that a later reading
      *  of the same game contradicted. Reverted and replayed out of the ladder. */
-    | 'contradicted_founding';
+    | 'contradicted_founding'
+    /** LEGACY, never produced any more: seasons were removed (migration 0025). Kept in the type
+     *  because rows stored before that may still carry it, and the launcher still explains it. */
+    | 'season_closed'
+    /** A team game whose sides in the RECORDING differ from the teams chosen in the room
+     *  (`lobbies.teams_at_start`). Stored, shown with both line-ups, not rated: the room promised
+     *  one match and the game played another. */
+    | 'teams_mismatch'
+    /** An account younger than seven days, a very short match, and an opponent on the same
+     *  network (src/elo/newAccount.ts). Stored and shown, not rated. */
+    | 'new_account_short';
 
 /**
  * A win and a loss, as the stored `result` encodes them.
@@ -82,18 +94,6 @@ export function compareReadings(reported: number, confirmed: number): ReadingAgr
     const confirmedWon = confirmed >= WIN_AT;
     return reportedWon === confirmedWon ? 'agree' : 'disagree';
 }
-
-/**
- * Rating deviation above which Glicko is still finding a player's level.
- *
- * Mirrors MatchOutcomeView.ProvisionalRd in the launcher, which uses it to decide
- * whether a rating may be shown at all — a number the server handed out for free
- * must never be painted as if it had been earned. The leaderboard applies the same
- * line: a ladder that mixes settled ratings with three-game ones is sorting noise.
- * The launcher compares with a strict >, so exactly 110 counts as settled on both
- * sides.
- */
-export const PROVISIONAL_RD = 110;
 
 /**
  * A match shorter than this was not a match. The launcher already refuses to
@@ -199,14 +199,32 @@ export function timingIsPlausible(input: RatabilityInput): boolean {
     return true;
 }
 
+/** The entry in RANKED_MOD_IDS that means "every mod". */
+export { ALL_MODS } from '../lib/modIds';
+
+/**
+ * Whether a mod's matches may move the ladder. THE one place this is decided — the room
+ * clamp, the founding path, the tournament echo and ratability all ask here, because four
+ * inline copies of `some(m => m === mod)` is how `*` came to mean "no mod at all".
+ *
+ * <p>There is ONE ladder per mode and it is shared by every mod: a single match is always
+ * on one mod (the fingerprint gate keeps the players of different mods apart), and the
+ * rating measures the player across all of them. `*` (the default) ranks every mod,
+ * including ones added to the catalog later, with no change here; a list of ids narrows it.
+ * Ids compare trimmed and case-insensitively, like the list itself is parsed. The list
+ * rule itself is `modIdInList`, shared with the Discord announcement filter.</p>
+ */
+export function isRankedMod(rankedModIds: readonly string[], modId: string | null | undefined): boolean {
+    return modIdInList(rankedModIds, modId);
+}
+
 /**
  * The order of the checks is the order of the answers: the least specific cause
- * wins, so a team game on an unranked mod reports the mod, which is the thing the
- * player would have to change first.
+ * wins, so a team game on a mod outside a narrowed list reports the mod, which is
+ * the thing the player would have to change first.
  */
 export function ratabilityReason(input: RatabilityInput): UnratedReason | null {
-    const mod = (input.modId || '').trim().toLowerCase();
-    if (!input.rankedModIds.some((m) => m === mod)) return 'mod_not_ranked';
+    if (!isRankedMod(input.rankedModIds, input.modId)) return 'mod_not_ranked';
 
     // Second, because it is the next most fundamental fact and the one the host chose.
     // Note the `=== false`: see RatabilityInput.roomIsCompetitive for why null falls

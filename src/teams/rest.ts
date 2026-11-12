@@ -66,7 +66,10 @@ export function registerTeamsRest(app: FastifyInstance, ctx: AppContext): void {
             members: (await store.listMembers(ctx.db, t.id)).map(memberView),
         })));
         const invites = (await store.listInvitesFor(ctx.db, userId)).map(inviteView);
-        return { teams: withMembers, invites };
+        // Sent as well as received. `decline` already withdraws one for the captain who sent it;
+        // what was missing was any way to see them.
+        const sentInvites = await store.listInvitesSentBy(ctx.db, userId);
+        return { teams: withMembers, invites, sent_invites: sentInvites };
     });
 
     app.get('/teams/:id', async (req) => {

@@ -3,6 +3,7 @@ import type { Db } from './db';
 import type { KvStore } from './kv';
 import type { LobbyRoomRegistry } from './lobbies/LobbyRoom';
 import type { GlobalChatRoom } from './global/GlobalChatRoom';
+import type { Matchmaker } from './matchmaking/Matchmaker';
 
 /**
  * Dependency container handed to every route and middleware. The Worker
@@ -18,4 +19,6 @@ export interface AppContext {
     rooms: LobbyRoomRegistry;
     /** The single process-wide global chat room (see /global/ws). */
     globalChat: GlobalChatRoom;
+    /** The quick-match queue. Optional so contexts built by tests need not supply one. */
+    matchmaker?: Matchmaker;
 }

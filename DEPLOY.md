@@ -33,7 +33,7 @@ sudo apt-get install -y nodejs nginx certbot python3-certbot-nginx \
 
 # 2. Create the service user + data dir
 sudo useradd --system --home /var/lib/wol-lobby --shell /usr/sbin/nologin wol-lobby
-sudo mkdir -p /var/lib/wol-lobby/replays
+sudo mkdir -p /var/lib/wol-lobby
 sudo chown -R wol-lobby:wol-lobby /var/lib/wol-lobby
 
 # 3. Drop the repo at /opt/wol-lobby (clone or scp)
@@ -49,10 +49,12 @@ cp .env.example .env
 #   - HOST=127.0.0.1                          (Fastify listens local; nginx proxies in)
 #   - PORT=8080
 #   - DB_PATH=/var/lib/wol-lobby/lobby.db
-#   - REPLAYS_DIR=/var/lib/wol-lobby/replays
+#   - (optional) REPLAY_S3_ENDPOINT / REPLAY_S3_REGION / REPLAY_S3_ACCESS_KEY /
+#     REPLAY_S3_SECRET_KEY / REPLAY_BUCKET — the competitive-recordings bucket.
+#     See "Replay storage" below; leave empty to run without recordings.
 #   - PUBLIC_BASE_URL=https://wol-lobby.duckdns.org
 #                                              (Match the Redirect URI registered in Discord exactly.)
-#   - JWT_SIGNING_KEY=$(openssl rand -hex 32)
+#   - JWT_SIGNING_KEY=$(openssl rand -hex 32)   ← FIRST SETUP ONLY. See the warning below.
 #   - DISCORD_CLIENT_ID=...                   (from discord.com/developers/applications)
 #   - DISCORD_CLIENT_SECRET=...
 #   - (optional) GLOBAL_CHAT_MSGS_PER_MIN / GLOBAL_CHAT_HISTORY /
@@ -71,6 +73,55 @@ journalctl -u wol-lobby -n 50 --no-pager     # check startup logs
 # 6. Smoke-test from the VM itself (no nginx yet)
 curl http://127.0.0.1:8080/health
 # → {"ok":true,"version":"0.1.0", ... }
+```
+
+> **⚠ NEVER CHANGE `JWT_SIGNING_KEY` ON A RUNNING SERVER.** It is set once, at first setup, and
+> left alone. Every player's session is a token signed with it, and the server checks against ONE
+> key (`src/lib/jwt.ts`, no previous-key fallback). Change it and every session in every launcher
+> is dead at once: the global chat answers `invalid_token`, presence and the chat go blank, and
+> every player has to sign in with Discord again. (From v1.0.16b the launcher signs the player out
+> with a message when that happens; older launchers just sit on "Connecting…" until the player
+> signs out by hand.) It also changes `IP_HASH_SECRET` when that is empty, since the hash is
+> derived from the key — set `IP_HASH_SECRET` explicitly if you ever must rotate.
+>
+> Back `.env` up before editing it (`sudo cp .env .env.bak.$(date +%F)`): `sed -i` and `nano`
+> keep no copy, and a key that is lost cannot be recovered from anywhere else.
+
+### Sessions renew themselves (`POST /auth/refresh`)
+
+A session token still lasts **7 days** (`SESSION_TTL_SECONDS`, `src/lib/jwt.ts`). Until this route,
+nothing renewed it, so every player who stayed signed in was signed out 7 days after his last Discord
+sign-in — usually noticed at the next reconnect, and a deploy reconnects everybody at once, which
+looked like a mass logout. Now the launcher trades a token with **under three days left** for a fresh
+one (`src/auth/session.ts`):
+
+- `POST /auth/refresh` with `Authorization: Bearer <token>` and no body answers **200** with the same
+  body as a completed sign-in (`token`, `expires_at`, `user`, `config`). The new token carries the
+  player's current Discord name and the time of his ORIGINAL sign-in (claim `sat`).
+- **401** for no token / expired / another key / garbage (a dead token is never revived), **403
+  `user_banned`** for a banned account.
+- **403 `session_too_old`** once the Discord sign-in is **90 days** old (`SESSION_MAX_AGE_SECONDS`). Not
+  a 401 on purpose: the launcher signs out on a 401, and the token it holds still runs out its 7 days
+  — so a session lasts at most ~97 days, then the player signs in with Discord again. A token minted
+  before this existed has no `sat` and counts from its `iat`.
+- Rate limit `refresh-u`: 6 a minute, 60 a day per user. The launcher asks at most every 30 minutes
+  while a renewal is due, so honest use is one request every few days.
+- Launchers without the renewal client keep signing in every 7 days; nothing breaks for them.
+- **Nothing to configure.** Deploy is the usual update. Check it after the restart:
+
+```bash
+curl -s -X POST https://wol-lobby.duckdns.org/auth/refresh                 # -> 401 unauthorized
+curl -s -X POST https://wol-lobby.duckdns.org/auth/refresh      -H "Authorization: Bearer <a token from launcher-config.json>"        # -> 200 with a new token
+```
+
+**Why a session ended, from the journal.** A route that needs a user and answers 401 to a request that
+SENT a token logs `session token refused` with the reason: `expired` (the lifetime ran out),
+`bad_signature` on a token whose `exp` is still ahead (the signing key changed — see above),
+`malformed` or `bad_payload` (not a token at all). The client still gets the same `unauthorized` for
+every cause. The WebSocket hellos (`/global/ws`, the room socket) do not log their refusals yet.
+
+```bash
+journalctl -u wol-lobby --since "2 days ago" | grep -E "session token refused|session renewed|session renewal refused"
 ```
 
 ## nginx + Let's Encrypt
@@ -172,9 +223,39 @@ sudo systemctl status wol-lobby --no-pager   # → active (running)
 curl http://127.0.0.1:8080/health            # → {"ok":true, ...}
 ```
 
+### The launcher redesign (design_base_launcher_2): what this server adds, and the order
+
+Code only: no dependency, no migration (`started_at` is migration 0021, already applied), no
+nginx edit. Every field is added beside the old ones and the one new route answers 404 on an
+older server, so **deploy the server first**; launchers already in players' hands ignore all of it.
+
+1. **The server.** It brings:
+   - `GET /lobbies/radmin` (signed-in only, `Limits.HostRadminUser`): each public room host's
+     Radmin address, for the rooms list's per-host ping. Without it the launcher draws no PING
+     column at all.
+   - `started_at` on an in-game room ("In game · 14 min") and `tournament_id` on the room of a
+     bracket match (its header).
+   - `my_entries` in `GET /tournaments` for a signed-in caller ("your turn" in the list), and
+     `max_capacity` and `owner_name` on tournaments.
+   - `sent_invites` in `GET /teams/mine` (My teams' invitations a captain sent).
+   - Tournaments of 32 and 64 places (`src/tournaments/capacity.ts`).
+2. **Before the first tournament of 32 or 64**, raise `MAX_ACTIVE_GAMES`: their first rounds open
+   16 and 32 rooms at once (see "How many rooms the server allows").
+3. **Then the launcher.** Against an older server it hides what needs the new data: no PING
+   column, 16 places at most, no sent-invitations block, the plain header in a bracket room.
+
+One thing to watch: an older launcher shown a tournament of 32 or 64 places created from a new
+one. Its bracket is laid out from the matches it receives, so it should draw, but nobody has
+looked at one past 16 places. Until most players have updated, keep such tournaments for a group
+that has.
+
 Most launcher-feature backends are **code-only** changes: no new deps, no
 migration, no nginx edit — `git pull` + `systemctl restart` is the whole
-deploy. Example: the recent multiplayer features — **host migration**,
+deploy. The `matches_changed` frame is one: whenever a match is stored or its result,
+rating or civilizations change, `notifyMatchesChanged` (`src/matches/rest.ts`) clears the
+stats memos and tells every launcher on `/global/ws`, batched per second, so the Rooms
+block, the ranking, Ranking › Matches and the history refresh within seconds instead of
+on their next minute (or the next tab switch). Launchers older than v1.0.16b ignore it. Example: the recent multiplayer features — **host migration**,
 the **abort-grace window**, **kick** (`handleKick`) and the per-player ping
 plumbing (`set_radmin_ip` → `member_net`) — all live in
 `src/lobbies/LobbyRoom.ts` + `src/lobbies/rest.ts` over the existing
@@ -217,49 +298,171 @@ The one thing a rollback leaves behind is rows the older code has no name for �
 correction path refuses anything but `unrated_reason = 'no_decided_result'`, so an unknown value
 is inert rather than dangerous.
 
-## Resetting the ratings
+## Discord room announcements: which mods each webhook shows
 
-Only ever needed on purpose — this throws every player's ELO away. It exists
-because the ratings built before the ratability rule landed were mostly made of
-matches nobody won: `POST /matches` used to feed EVERY report to Glicko, and
-since AoE3 does not record by default almost every stored match has no winner.
+Each webhook in `DISCORD_WEBHOOK_URL` has its own mod filter in `DISCORD_WEBHOOK_MOD_IDS`, one
+slot per webhook **in the same order** — the same positional rule as `DISCORD_PLAYERS_ROLE_ID`.
+A slot is a mod id or several joined with `+`; an empty slot or `*` is every mod. **A webhook with
+no slot announces every mod**, so a webhook appended to the END of `DISCORD_WEBHOOK_URL` later
+shows everything without touching the filter. Unset, every webhook announces every mod.
 
-The match history is NOT touched: `matches` and `match_participants.result` stay
-whole. Only `elo_ratings` and the per-participant `rating_before`/`rating_after`
-go.
+| `DISCORD_WEBHOOK_MOD_IDS` with three webhooks | webhook 0 | webhook 1 | webhook 2 |
+|---|---|---|---|
+| (unset) | every mod | every mod | every mod |
+| `wol,wol` | WoL | WoL | every mod (no slot) |
+| `wol,*,wol+improvement-mod` | WoL | every mod | WoL + Improvement Mod |
+
+To keep the webhooks registered today on Wars of Liberty only, put one `wol` per current webhook:
+`DISCORD_WEBHOOK_MOD_IDS=wol,wol,…`. **Insert a new webhook in the middle and the filters shift
+onto the wrong channels** — append it. The filter is applied once, in `announceLobbyCreated`
+(`src/lobbies/discordAnnounce.ts`); a webhook that skipped a room never got a message, so the
+live edits and the close leave it alone. Rooms a webhook skips are still created and still show
+in the launcher (the in-app toast is not a webhook).
+
+The startup log lists each webhook (its public id, never the token) with its filter:
 
 ```bash
-sudo systemctl stop wol-lobby
-
-# Back up all THREE files, not just the .db. The database runs in WAL mode, so the
-# -wal sidecar can hold committed transactions the .db does not yet contain, and
-# copying the .db alone can capture a state that never existed. With the service
-# stopped nothing is writing, so copying the set together is consistent — and
-# unlike `sqlite3 .backup` it needs no extra package installed. (sqlite3 is NOT
-# part of this install: the service reaches SQLite through better-sqlite3 and
-# never shells out to it.)
-BK=/var/lib/wol-lobby/backup-$(date +%F)
-sudo mkdir -p "$BK"
-sudo cp -a /var/lib/wol-lobby/lobby.db* "$BK"/
-sudo ls -l "$BK"          # confirm there is something there before continuing
-
-# As the SERVICE's user, and with the tsx that is already installed — not npx.
-# Running it as your own login user fails twice over: it cannot read the service's
-# .env, and it cannot write the database.
-cd /opt/wol-lobby
-sudo -u wol-lobby ./node_modules/.bin/tsx scripts/reset-elo.ts
-
-sudo systemctl start wol-lobby
+journalctl -u wol-lobby -n 50 --no-pager | grep "Discord announce"
+#   → {"webhook":0,"webhookId":"…","mods":["wol"]} Discord announce: webhook mod filter …
 ```
 
-The script needs no secrets — only the database path, which it takes from `DB_PATH`
-(the environment, or the service's `.env`), or from an explicit first argument:
-`sudo -u wol-lobby ./node_modules/.bin/tsx scripts/reset-elo.ts /var/lib/wol-lobby/lobby.db`
+## Continuous ladder and rating rules
 
-To roll back, copy the files out of that backup directory and start the service. This is
-deliberately a script and not a migration: a migration is remembered in the
-`_migrations` table of the database it ran against, so restoring the backup and
-starting up would re-run it and delete the ratings you had just restored.
+There are **no seasons** any more: one continuous ladder per mode (1v1, and teams for 2v2 + 3v3)
+that never resets. The rules, and where each one lives:
+
+- **Glicko-2, Lichess-style** (`src/elo/glicko2.ts`, our own implementation — the npm `glicko2`
+  package always added a rating period per match and could not rate a team by its mean). τ 0.75;
+  a new player starts at 1500 / RD 500 / volatility 0.09; RD stays within [45, 500], volatility
+  at most 0.1. **Uncertainty grows with time without playing**: before each match the deviation
+  is grown by 0.21436 rating periods per idle day (φ* = √(φ² + t·σ²)), and no extra period is
+  added per match. The rating never drops below **400**, and one match never moves it by more
+  than **±700**.
+- **Placement** (`src/elo/placement.ts`): 10 rated matches in 1v1, 5 in teams, against anyone,
+  counting the ones already played. Until then a player is listed at the end of the table with
+  his progress, with no position and no badge.
+- **A rating still being placed goes to its owner only** (`src/elo/placementPrivacy.ts`): every
+  payload that carries another player's number withholds it while he is placing on that ladder —
+  the rooms list's host, presence, `room_state` (built per recipient), `member_joined`, the
+  placement rows of `/stats/community`, `/matches/elo/:id` for anybody but him, the participants
+  of the history / `GET /matches` / `recent_matches`, and `match_reported` + the host's response
+  (one frame per recipient). The progress stays public. A room with anybody placing on its ladder
+  sends no odds (`hidden_reason: 'placement'`). Decided by the CURRENT state, so finishing
+  placement shows his old matches too. Keys are OMITTED, never null, where launchers read plain
+  numbers. **Deploy the server only after the launcher release that handles it**: an older
+  launcher (up to 1.0.16f) draws "0?" on every placement row of the Ranking, his own included, and
+  shows no number elsewhere; `MIN_LAUNCHER_VERSION` does not prevent it (stats stay open). Frame-level
+  check: `npx tsx scripts/test-placement-privacy.ts`.
+- **The ladder's PEAK column** (`src/stats/ratingPeaks.ts`, called from `ladder()`): every row of
+  `leaderboard` and `leaderboard_team` in `/stats/community` carries `rating_peak` and
+  `rating_peak_at` — the same figure and date as the peak on that player's profile, because it is
+  the profile's own `peakAndLow` over the same rated matches and unrevoked refunds (null where the
+  player has none). Two queries per page, inside the 60-s stats cache. Additive, so either order of
+  deploy is safe: an older launcher ignores the fields, and a newer one draws the column only when
+  some row has a peak. Check against a real database: `npx tsx scripts/test-rating-peaks.ts`.
+- **Teams, team against team**: each player is rated with his team's mean rating against the
+  other team's mean and combined deviation (root mean square); his own deviation decides how far
+  he moves.
+- **Teams chosen in the room**: in a 2v2/3v3 each player picks Team 1 or Team 2 (the host may move
+  anybody). A competitive room cannot start until it is full, every player has a team and the
+  teams are even — the team checks apply only when every launcher in the room understands them.
+  A recording whose sides differ from the room's is stored `teams_mismatch`.
+- **Anti-farm** (`src/elo/antifarm.ts`): consecutive wins of the same side over the same opponent
+  (the exact same matchup in teams) are worth 100 % for the 1st and 2nd, then 90 % … down to 20 %
+  from the 10th, for BOTH players. Back to 100 % when the other side wins; +10 % per full 24 h
+  without the pair playing. Also during placement; never in tournaments.
+- **New accounts** (`src/elo/newAccount.ts`): an account younger than 7 days, a match shorter
+  than `NEW_ACCOUNT_SHORT_MATCH_SECONDS` (default 600) and an opponent on the same network
+  → stored `new_account_short`, not rated.
+- **Refunds on a cheating ban**: `player:ban --refund` gives every opponent back the points he
+  lost to the banned player, one notice per player and ladder, never naming him.
+- **Inactive**: 30 days without a rated match on a ladder. The player keeps his place and is
+  flagged `inactive`.
+- **Monthly highlights** (`src/stats/highlights.ts`): on the launcher's Rooms page, and posted to
+  Discord early on the 1st (month boundary 06:00 UTC) by a lazy trigger — no timer.
+
+### Deploying it (once)
+
+1. Deploy as usual (`git pull`, restart). Migrations 0025-0029 apply themselves; 0025 copies Season
+   1 into the new `player_ratings` table as an **interim** ladder so nothing looks broken.
+2. Look at what the new rules do to the ladder, on a snapshot:
+   ```bash
+   sudo -u wol-lobby ./node_modules/.bin/tsx scripts/admin.ts elo:recompute
+   ```
+   It prints the 25 biggest movers per ladder, how many players end up ranked and in placement,
+   and how many matches anti-farm discounted. **Expect many players to go back into placement**:
+   nobody with fewer than 10 rated 1v1s (5 team) is ranked any more.
+3. Apply it with the service stopped — the replay runs in one transaction, and a report landing in
+   the middle would be rated against a half-built ladder:
+   ```bash
+   sudo systemctl stop wol-lobby
+   sudo -u wol-lobby ./node_modules/.bin/tsx scripts/admin.ts elo:recompute --apply
+   sudo systemctl start wol-lobby
+   ```
+4. Run `elo:recompute` once more (dry run): it must print "(no rating moved)" on both ladders.
+
+### Rolling back
+
+`season_ratings` is frozen by 0025 (nothing reads or writes it; a guard test fails if anything
+does) and still holds Season 1 as it was. An older build reads it, so a rollback is: check out the
+previous commit, restart, and run that build's own `elo:recompute --apply` so it rates everything
+stored meanwhile. **Mind that an older build starts Season 2 on 1 December 2026** — roll forward
+before then, or accept the reset it brings.
+
+### Configuration
+
+| Variable | Default | What |
+|---|---|---|
+| `IP_HASH_SECRET` | derived from `JWT_SIGNING_KEY` | secret for the one-way IP hashes |
+| `NEW_ACCOUNT_SHORT_MATCH_SECONDS` | 600 | "very short" for the new-account rule and the alerts |
+| `ALERT_FARM_STREAK` | 5 | alert after this many wins in a row by the same side |
+| `ALERT_SHORT_MATCHES` / `ALERT_SHORT_WINDOW_DAYS` | 3 / 7 | alert after this many short matches of a pair in the window |
+| `DISCORD_ADMIN_WEBHOOK_URL` | (none) | operator-only channel for alerts; nothing is posted without it |
+| `DISCORD_HIGHLIGHTS_WEBHOOK_URL` | first `DISCORD_WEBHOOK_URL` | where the monthly highlights go |
+| `DISCORD_HIGHLIGHTS_LANG` | `es` | `es`, `en` or `both` |
+| `HIGHLIGHTS_POST_WINDOW_DAYS` | 3 | a month is posted only within this many days after it ends |
+
+### IP hashes and privacy
+
+For the new-account rule the server keeps, per room, an HMAC of the address each member connected
+from (`lobby_member_ips`, and a copy on `match_participants.ip_hash`). The raw address is never
+stored; the hash is meaningless outside this server; rows older than 30 days are pruned inline (no
+timer). `admin.ts match:show` says whether two players of a match shared a network and never prints
+the hash. The address is read from `X-Real-IP` (set by nginx to `$remote_addr`), never from the
+first entry of `X-Forwarded-For`, which a client controls.
+
+### Alerts
+
+When a match is stored the server checks the pair behind it: a long run of wins by the same side
+(counted raw, without the daily recovery — one win a day is never slowed by the factor, and this is
+what catches it) or a string of very short matches. Each new alert is a warn line in the journal,
+a row in `admin_alerts` and, if configured, a message to `DISCORD_ADMIN_WEBHOOK_URL`.
+`alerts:list`, `alerts:ack <id>` and `alerts:scan` (history, writes nothing) manage them. Nothing
+here changes a rating.
+
+### Monthly highlights
+
+Posted once per month, early on the 1st, the first time the server starts, stores a match or
+recomputes the community stats after the boundary (within `HIGHLIGHTS_POST_WINDOW_DAYS`). A month
+that ended before migration 0029 ran is never posted on its own. `highlights:show [YYYY-MM]` prints
+a month and its message; `highlights:post [YYYY-MM] [--force] --apply` posts it by hand.
+
+What `/stats/community` sends in `monthly_highlights` (each null when nobody qualifies): biggest
+climb and best streak per ladder, most matches, and — launcher only, not in the Discord post —
+most wins (a tie goes to fewer matches), best win rate (at least 10 rated matches in the month),
+civilization of the month (per mod and civ, at least 3 picks) and biggest upset (side averages
+before the match; every participant past placement). Nothing needs a migration: the civilization
+and the mod come from `match_participants.civ` and `matches.mod_id`.
+
+The top five of every one of those (`leaders`) are served apart, by `GET /stats/highlights` —
+the launcher's Ranking › Highlights view, fetched only when it opens. It shares the five-minute
+memo with `/stats/community` (one computation for both) and has its own rate-limit scope,
+`statsh` (20/min · 600/day per IP). `/stats/community` sends the singular fields only, which are
+the first entry of each list.
+
+### `scripts/reset-elo.ts` is retired
+
+It refuses to run. To correct ratings, use the operator commands.
 
 ## Reading the match confirmations
 
@@ -329,9 +532,127 @@ The same lines are in the service log as they happen:
 journalctl -u wol-lobby | grep 'match confirmation compared'
 ```
 
+## Replay storage (Oracle Object Storage)
+
+Recordings (`.age3Yrec`) of **competitive** matches live in a private S3-compatible bucket.
+**The bytes never pass through this server**: the launcher of the player who reported the match
+asks `POST /replays/upload-url` for a presigned PUT, uploads straight to the bucket, and calls
+`POST /replays/confirm`, which HEAD-checks the object and only then records it on the match
+(`matches.replay_key`, migration 0030). Any signed-in player gets a 10-minute download link from
+`GET /matches/:id/replay-url`. Every match list (the history, `/stats/community`'s
+`recent_matches` and `GET /matches`) carries `has_replay`, `replay_expires_at` and
+`replay_size_bytes` from one rule, `replayView` in `src/replays/rules.ts`: a recording expires
+365 days after its upload (`REPLAY_RETENTION_DAYS`, which must match the bucket's lifecycle
+rule), and a match whose key was cleared still reads as expired because `replay_uploaded_at`
+is kept.
+
+`GET /matches` (public, `MatchesBrowseIp` 30/min, 1500/day) is the launcher's Ranking › Matches
+view: every community match, newest first, `?limit=` (default 30, max 50), `?q=` (a player
+name, 2-32 characters), `?replay=1` (only matches with a live recording), `?mod=`,
+`?sort=oldest` (oldest first), `?days=1|7|30` (a window ending now), `?kind=competitive|casual`
+(from `lobbies.competitive`; a match whose lobby row is gone is in neither), `?decided=1`
+(somebody won), and `?cursor=` (the previous page's `next_cursor`). It pages by keyset on
+`(created_at, id)` and sends `total` on the first page only. An oldest-first cursor is bound to
+that order — sent with the other one it is a `400 bad_cursor`. Every page carries
+`filters: ["sort","days","kind","decided"]`, which is how the launcher knows this server applies
+them: against a server without it, it hides those controls instead of pretending to filter.
+**Deploy this before the launcher release that shows them.**
+
+Rules the server enforces (`src/replays/rules.ts`, every one tested): the match must exist, have
+been played in a competitive room, and the caller must be the one who reported it; the size is
+declared up front, capped by `REPLAY_MAX_BYTES` (20 MiB) and **signed into the upload URL**, so
+the bucket refuses any other size; a `sha256` that differs from the one the match was reported
+with is refused; one recording per match.
+
+Presigning is hand-rolled SigV4 (`src/replays/presign.ts`, pinned by AWS's published test
+vector) rather than the AWS SDK: recent SDKs add checksum parameters to presigned PUTs that
+Oracle's S3 layer refuses, and this way a deploy needs no new dependency.
+
+### One-time setup in the Oracle console
+
+1. **Bucket** `wol-replays`, Standard tier, **Private** (never public, no pre-authenticated
+   requests), in the tenancy's home region. Note its **Namespace**.
+2. **A dedicated user** (Identity → Domains → Default → Users) with only the *Customer secret
+   keys* capability, in a group `wol-replays-writers`, and a root-compartment policy:
+   ```
+   Allow group wol-replays-writers to read buckets in tenancy where target.bucket.name = 'wol-replays'
+   Allow group wol-replays-writers to manage objects in tenancy where target.bucket.name = 'wol-replays'
+   ```
+   The key inherits that user's permissions, so a leaked `.env` reaches this bucket and
+   nothing else.
+3. **Customer secret key** for that user → the Access key and the Secret (shown once).
+4. **Lifecycle rule** on the bucket (Policies tab): Objects → Delete after **365** days. It needs
+   `Allow service objectstorage-<region> to manage object-family in tenancy` (the console offers
+   to add it). The download route HEAD-checks first, so an expired recording reads as "no
+   recording" and the match stops offering it.
+
+### Configuration
+
+| Variable | Example | What |
+|---|---|---|
+| `REPLAY_S3_ENDPOINT` | `https://<namespace>.compat.objectstorage.us-ashburn-1.oraclecloud.com` | S3 compatibility endpoint (https, no trailing path) |
+| `REPLAY_S3_REGION` | `us-ashburn-1` | region identifier, used in the signature |
+| `REPLAY_S3_ACCESS_KEY` | | the customer secret key's Access key |
+| `REPLAY_S3_SECRET_KEY` | | its Secret |
+| `REPLAY_BUCKET` | `wol-replays` | bucket name |
+| `REPLAY_MAX_BYTES` | `20971520` | largest recording accepted |
+
+All five `REPLAY_S3_*`/`REPLAY_BUCKET` must be set, or the feature is off: the routes answer
+`503 replays_disabled`, the launcher logs it and moves on, and nothing else changes. The service
+log says which at startup (`Replay storage: bucket …` / `Replay storage: disabled`).
+
+### Deploying it
+
+```bash
+cd /opt/wol-lobby && git pull                       # as ubuntu: the checkout is ubuntu's (no npm install needed)
+sudo systemctl restart wol-lobby                    # migration 0030 applies itself
+sleep 5; journalctl -u wol-lobby --since "2 min ago" --no-pager | grep 'Replay storage'
+sudo -u wol-lobby ./node_modules/.bin/tsx scripts/admin.ts replay:selftest
+```
+
+`git pull` runs as the user that OWNS the checkout (`ubuntu` on this VM). `sudo -u wol-lobby git
+pull` stops with *"detected dubious ownership"* — don't add a `safe.directory` exception to get
+past it, pull as the owner. The `sleep` is there because `systemctl restart` returns before Node
+has booted: grepping straight away finds nothing even when the line is about to be written.
+
+**Editing `.env`:** if it was copied from `.env.example`, the five `REPLAY_*` lines are already
+there, EMPTY. Fill those in rather than appending a second set — `grep -n '^REPLAY_' .env` shows
+them. Keep the file `chmod 600` and owned by the user the service and the admin script run as.
+
+`replay:selftest` uploads, reads back and deletes a tiny object under `selftest/` through
+presigned URLs, exactly as a launcher would, and prints each status. A failure prints the
+storage's own error (`SignatureDoesNotMatch` = wrong key/secret/region, `NoSuchBucket` = wrong
+namespace or bucket, `NotAuthorizedOrNotFound` = the policy). `match:show <id>` prints the
+recording a match has, if any.
+
+### A match whose recording never arrived
+
+Launchers keep a recording they could not upload and try again for 7 days (the server was
+unreachable, the storage was off). A match reported before that existed — or one whose 7 days ran
+out — can still be given its recording from the reporter's file:
+
+```bash
+# from your PC: copy the reporter's .age3Yrec to the VM
+scp "Record Game 1.age3Yrec" <user>@<vm>:/tmp/match.age3Yrec
+
+# on the VM: dry run first — prints the match, the players, the file's sha256 and the object key
+sudo chmod 644 /tmp/match.age3Yrec
+sudo -u wol-lobby ./node_modules/.bin/tsx scripts/admin.ts replay:attach <matchId> --file=/tmp/match.age3Yrec
+sudo -u wol-lobby ./node_modules/.bin/tsx scripts/admin.ts replay:attach <matchId> --file=/tmp/match.age3Yrec --apply
+sudo -u wol-lobby ./node_modules/.bin/tsx scripts/admin.ts match:show <matchId>
+rm /tmp/match.age3Yrec
+```
+
+It refuses a casual (or unknown) room, a match that already has a recording, a file over
+`REPLAY_MAX_BYTES`, and a file whose sha256 differs from the one the match was reported with —
+that last one only `--force` overrides, after checking by hand (map, players, date) that it is the
+right game. The upload is the launcher's: same object key, size signed into the PUT, HEAD-checked
+before the match is updated, and `replay_uploader_id` is the reporter, on whose behalf it is.
+
 ## Backups
 
-The whole world fits in one folder:
+Recordings are not on the VM any more (they are in the bucket, which Oracle keeps). The rest of
+the world fits in one folder:
 
 ```bash
 sudo tar -czf wol-lobby-backup-$(date +%F).tar.gz \
@@ -360,7 +681,7 @@ cd /opt/wol-lobby
 sudo -u wol-lobby ./node_modules/.bin/tsx scripts/admin.ts help
 ```
 
-Run it as the **service user**, exactly like `reset-elo.ts`: as your own login user it can
+Run it as the **service user**: as your own login user it can
 read neither the service's `.env` nor the database. (`npm run admin -- <command>` is the same
 thing, if you are already that user.)
 
@@ -378,12 +699,22 @@ match:decide-team <id> --losers <a,b[,c]>
                                           rate a stored 2v2/3v3 from its recordings by
                                           naming the losing side, then replay both ladders
 match:void <id>                           stop it counting, then replay the ladder
-elo:recompute                             replay the ladder; run it alone to self-check
-player:show <player>                      rating, ban state, stale memberships
+elo:recompute                             rebuild every rating from the history under the
+                                          current rules; run it alone to self-check
+player:show <player>                      rating, placement, streaks, peak/low, refunds,
+                                          ban state, stale memberships
 player:history <player> [--limit N]
-player:reset <player>                     one player back to 1500
-player:ban <player> --reason "..."   |    player:unban <player>
+player:reset <player>                     forget one player's 1v1 rating (placement again)
+player:ban <player> --reason "..." [--refund [--refund-since YYYY-MM-DD]]
+player:unban <player> [--revoke-refunds]
 player:unstick <player>                   clear rows that bar them from every room
+refunds:list [--player <p>]               refunds given, and to whom
+alerts:list [--all] [--kind K]            open operator alerts
+alerts:ack <id>                           close one
+alerts:scan [--days 30]                   look for both alert patterns; writes nothing
+highlights:show [YYYY-MM]                 a month's highlights and its Discord text
+highlights:post [YYYY-MM] [--force]       post them (with --apply)
+season:show                               seasons were removed; prints a note
 ```
 
 A player is matched by internal id, Discord username or display name; an ambiguous name
@@ -403,15 +734,15 @@ is memory-only, so a restart is still the only way.
 
 ### The corrections, and why they are safe
 
-`applyMatch` has no inverse and nothing snapshots a player's prior rating, so "undo this
+A rating update has no inverse and nothing snapshots a player's prior rating, so "undo this
 match" cannot be subtracted. `match:decide`, `match:decide-team` and `match:void` instead
-change the row and **replay the whole ladder** (both of them, 1v1 and team) from match
-history, in report order. The result is the ladder as though the match had always read the
-way it now reads.
+change the row and **replay the ladder** (both of them, 1v1 and team) from the whole match
+history, in report order, with every ban refund in its place on the timeline. The result is the
+ladder as though the match had always read the way it now reads.
 
-That also repairs a corruption nothing else detects: if anything throws after `applyMatch`
+That also repairs a corruption nothing else detects: if anything throws after rating
 inside the late-reading path, the rollback there restores the match and participant rows but
-**not** `elo_ratings` — both players keep the points and the match becomes eligible to be
+**not** the rating rows — both players keep the points and the match becomes eligible to be
 rated again. A replay cannot express that state.
 
 **Check the tool before trusting it.** On untouched data a replay must reproduce the ratings
@@ -419,13 +750,13 @@ already stored:
 
 ```bash
 sudo -u wol-lobby ./node_modules/.bin/tsx scripts/admin.ts elo:recompute
-# → "(no rating moved)" under both the 1v1 and the team ladder. Anything else means the
+# → "(no rating moved)" under both ladders. Anything else means the
 #   replay is not faithful; stop and work out why before using match:decide,
 #   match:decide-team or match:void.
 ```
 
 The dry run of a rating command does the real work on a `VACUUM INTO` snapshot and prints the
-actual movement on both ladders, so what you see is what `--apply` will do.
+actual movement, ladder by ladder, so what you see is what `--apply` will do.
 
 ### Rating a team match by hand
 
@@ -516,6 +847,11 @@ a mod outside `RANKED_MOD_IDS` **and for any size other than 2, 4 or 6 seats**, 
 casual room instead and echoing what it actually made on the 201. That echo is what lets the
 launcher explain the downgrade without holding its own copy of the ranked-mod list.
 
+`RANKED_MOD_IDS` defaults to `*`: **every mod shares one ladder per mode** (1v1 and Teams), the
+base game (`aoe3-tad`) included, and a mod added to the catalog is ranked the moment it exists.
+A list of ids narrows it. Every check goes through `isRankedMod` in `src/elo/ratability.ts` —
+before it existed, a literal `*` matched no mod at all and would have ranked nothing.
+
 The size rule is not cosmetic: a competitive room's seat count is what NAMES its format —
 2 is 1v1, 4 is 2v2, 6 is 3v3 — so a competitive room of 8 would leave a match whose format
 nothing could name. The clamp lives on the server because the client is what an attacker
@@ -552,6 +888,8 @@ recording afterwards. `ratabilityReason` answers `not_competitive` for the rest.
 sudo -u wol-lobby ./node_modules/.bin/tsx scripts/admin.ts match:show <matchId>
 #   room mode  casual (never scores)      <- there is your answer
 ```
+
+**A tournament can now take 32 or 64 entrants** (`src/tournaments/capacity.ts`). Their first rounds are 16 and 32 rooms, so before running one raise `MAX_ACTIVE_GAMES`: a room that finds the server full gets the 409 and can try again when a match ends, and until then other players cannot open rooms either.
 
 ### Walking out counts as a loss
 
@@ -749,7 +1087,7 @@ loss per day, on record in `lobby_game_exits` with the signals that produced it.
 
 ```
 COMPETITIVE_ABANDON_SECONDS=300     # how far into a match a walkout must be to forfeit
-RANKED_MOD_IDS=wol                  # which mods have a ladder at all
+RANKED_MOD_IDS=*                    # which mods score: * = all of them (default); a list narrows it
 CRASH_VOID_PER_WINDOW=1             # verified crashes forgiven per player per window
 CRASH_VOID_WINDOW_SECONDS=86400     # the window
 ```
@@ -882,3 +1220,109 @@ cd /opt/wol-lobby
 npx tsx scripts/upgrade-pending.ts            # lists what it would decide, writes nothing
 npx tsx scripts/upgrade-pending.ts --apply    # writes
 ```
+
+## Team tournaments: sides, corroboration and line-ups
+
+What changed, in one place (the code says why at each site):
+
+- **A tournament room seats every player on his entrant's side** (entrant 1 → Team 1) and
+  refuses any change, the host's included (`tournament_side_locked`). `room_state` carries
+  `teams_locked: true` there; a launcher that predates it simply sees its side change refused.
+- **A team tournament match moves the bracket only once the OTHER side has corroborated it**
+  (`src/tournaments/reportVerdict.ts`) — the same evidence that rates it. `teams_mismatch`
+  never moves it, and neither does a game whose players are not the two full line-ups. A 1v1
+  is unchanged. The tournament detail says why a played slot has not moved (`pending_report`).
+- **Seeding and starting refuse while any entrant's line-up is short**
+  (`tournament_roster_incomplete`) — a draft tournament whose teams were never formed.
+- **A tournament room's title** may be up to 160 characters and never cuts an entrant's name;
+  it can no longer be renamed (`tournament_room_title`).
+- **`GET /users/search?q=`** (signed in, own rate limit) finds a player by name for a team
+  invitation or a line-up.
+
+**Deploy the backend first.** Old launchers keep working against it. Before restarting, look
+for team brackets already running with a line-up that is not full — they can never finish, and
+the owner should cancel them:
+
+```bash
+sqlite3 /var/lib/wol-lobby/lobby.db "
+SELECT t.id, t.name FROM tournaments t
+ WHERE t.format <> '1v1' AND t.status = 'running'
+   AND EXISTS (SELECT 1 FROM tournament_entrants e
+                WHERE e.tournament_id = t.id AND e.status = 'confirmed'
+                  AND (SELECT COUNT(*) FROM tournament_entrant_members m WHERE m.entrant_id = e.id)
+                      <> CAST(substr(t.format, 1, 1) AS INTEGER));"
+```
+
+## Ended tournaments: who sees them, deleting, faces and badges (2026-11-11)
+
+What changed (the code says why at each site; `src/tournaments/lifecycle.ts` holds the table):
+
+| Tournament                                | Who sees it            | Afterwards                          |
+|-------------------------------------------|------------------------|-------------------------------------|
+| Draft                                     | its owner              | untouched 7 days: **deleted**       |
+| Cancelled / abandoned, no game played     | its owner, 7 days      | **deleted**                         |
+| Cancelled / abandoned, games played       | everybody, 7 days      | off the list, kept in the database  |
+| Finished                                  | everybody, 30 days     | only who played, organised or helped |
+
+- **A tournament with a game played is never deleted** — not by its owner, not by the sweep.
+- **`POST /tournaments/:id/delete`** (owner only): a draft, cancelled or abandoned tournament
+  with no game. A live one has to be cancelled first.
+- **`GET /tournaments` carries `mine`** (signed in): the caller's own cancelled ones without
+  games, and old finished ones they took part in. Its presence is how a launcher knows this
+  server can delete. List rows and the detail carry `has_games`.
+- **The startup sweep deletes what is due** before it archives the stale live ones, so a
+  forgotten draft no longer becomes a public 'abandoned' row.
+- **The detail carries each player's `avatar_url`** (entrants, co-organisers, `owner_avatar_url`)
+  and their place on the tournament's ladder (`ladder_rank` for a 1v1, `ladder_rank_team` for a
+  2v2/3v3; nothing for a player still being placed).
+- **`lobbies_changed`** goes out on `/global/ws`, batched per second, whenever a room is created
+  (private ones too, with no data), closed, started, renamed, or gains or loses a player. An open
+  Rooms page asks `/lobbies` at once. **Every such change also drops the 3-s memo of `/lobbies`**
+  (`onLobbiesChanged`): without that the woken launchers read the answer from before the change.
+  Measured with two launchers against a local server: a quick match that met in 21 s now meets in
+  about 2.
+
+All additive: an older launcher ignores every new field and frame.
+
+**To remove the test tournaments now** (dry run first; `--force` only for one with games, whose
+games keep their ratings):
+
+```bash
+npm run admin -- tournament:list --all
+npm run admin -- tournament:delete <id>          # shows what it would do
+npm run admin -- tournament:delete <id> --apply
+```
+
+After a restart the sweep removes, on its own, every draft older than a week and every cancelled
+or abandoned tournament without games whose week is over.
+
+### Room announcements: Wars of Liberty only
+
+No code: each webhook's mod filter already exists (see "Each webhook in `DISCORD_WEBHOOK_URL`"
+above). In the VM's `.env`, one entry per webhook, in the same order:
+
+```bash
+DISCORD_WEBHOOK_MOD_IDS=wol          # one webhook
+DISCORD_WEBHOOK_MOD_IDS=wol,wol      # two webhooks
+sudo systemctl restart wol-lobby
+journalctl -u wol-lobby -n 50 | grep -i "webhook"   # startup says which mods each one announces
+```
+
+### Monthly highlights: a card, in English by default
+
+The monthly post is now ONE Discord card (embed) instead of plain text: gold bar, the month and
+its count, the biggest climber's picture, three podiums in a row (biggest climb, most matches,
+best streak), then most wins, best win rate and civilization of the month, and the biggest upset
+when there was one. A category with nobody is left out; a month with no rated match posts
+nothing, as before. Names are trimmed and their markdown escaped; there are still no mentions.
+
+`DISCORD_HIGHLIGHTS_LANG` now defaults to **`en`** (`es` and `both` still work; `both` is two
+cards in one message). See the card before it goes out:
+
+```bash
+npm run admin -- highlights:show 2026-10      # the numbers, the old text, and the card's JSON
+npm run admin -- highlights:post 2026-10      # dry run: prints the exact JSON it would post
+```
+
+Paste that JSON into any Discord embed viewer to see it. `--apply` posts; nothing is posted by
+the dry run.

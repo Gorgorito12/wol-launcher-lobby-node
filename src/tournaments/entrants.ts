@@ -10,6 +10,8 @@
  * That is what lets one bracket, one advancement rule and one screen serve both.
  */
 
+import { DEFAULT_RATING, DEFAULT_RD } from '../elo/glicko2';
+
 /** The shapes a tournament can be played in. A 4v4 is impossible — see `rosterSizeFor`. */
 export type TournamentFormat = '1v1' | '2v2' | '3v3';
 
@@ -52,7 +54,9 @@ export type RosterRefusal =
     /** Already in another entrant of this same tournament. */
     | 'already_entered'
     /** Banned, or otherwise not allowed to play. */
-    | 'member_not_eligible';
+    | 'member_not_eligible'
+    /** A registered team's captain named somebody who is not in that team. */
+    | 'not_team_member';
 
 export interface RosterInput {
     format: TournamentFormat;
@@ -92,18 +96,111 @@ export function validateRoster(input: RosterInput): RosterRefusal | null {
     return null;
 }
 
+/**
+ * Who plays for a REGISTERED team: the captain's choice when he made one, otherwise the first
+ * members in the team's own order (captain first, then earliest joined) — which is what every
+ * launcher older than the choice gets, unchanged.
+ *
+ * A team may carry up to six members, so the choice is the only way a captain with reserves
+ * decides who takes the field. Only membership is checked here; the size, duplicates and
+ * "already in this tournament" are `validateRoster`'s, and "the captain plays" is the route's.
+ */
+export function chooseRegisteredLineup(
+    teamMemberIds: readonly string[],
+    requested: readonly string[] | null,
+    format: TournamentFormat,
+): { memberIds: string[]; refusal: Extract<RosterRefusal, 'not_team_member'> | null } {
+    if (requested === null) {
+        return { memberIds: teamMemberIds.slice(0, rosterSizeFor(format)), refusal: null };
+    }
+    const team = new Set(teamMemberIds);
+    if (!requested.every((id) => team.has(id))) {
+        return { memberIds: [], refusal: 'not_team_member' };
+    }
+    return { memberIds: [...requested], refusal: null };
+}
+
+/**
+ * The entrants that cannot take a seat in a bracket of this format: their frozen line-up is
+ * not the format's size.
+ *
+ * It is a draft tournament's normal state until the owner forms the teams — everybody signs
+ * up alone — and drawing a bracket from it puts one player into a room that needs four or six,
+ * which can never start. Seeding and starting refuse while this is not empty.
+ */
+export function incompleteRosters(
+    format: TournamentFormat,
+    entrants: readonly { entrantId: string; memberIds: readonly string[] }[],
+): string[] {
+    const size = rosterSizeFor(format);
+    return entrants.filter((e) => e.memberIds.length !== size).map((e) => e.entrantId);
+}
+
+export type MergeRefusal =
+    /** Not exactly one side's worth of entrants. */
+    | 'wrong_count'
+    /** The same entrant listed twice. */
+    | 'duplicate_entrant'
+    /** No such entrant in this tournament. */
+    | 'unknown_entrant'
+    /** Already a team. */
+    | 'not_solo'
+    /** No longer holds a place — withdrawn, rejected, or already merged into a team. */
+    | 'not_available';
+
+/**
+ * Whether these solo entrants may be folded into one team (draft mode), and if not, why.
+ *
+ * `not_available` is the one that was missing: a solo entrant already merged is `withdrawn`
+ * but still `solo`, so without it the same player could be merged into a second team and
+ * would then be on both sides of the bracket.
+ */
+export function mergeRefusal(
+    format: TournamentFormat,
+    ids: readonly string[],
+    picked: readonly ({ kind: 'solo' | 'team'; status: EntrantStatus } | undefined)[],
+): MergeRefusal | null {
+    if (ids.length !== rosterSizeFor(format)) return 'wrong_count';
+    if (new Set(ids).size !== ids.length) return 'duplicate_entrant';
+    if (picked.some((e) => !e)) return 'unknown_entrant';
+    if (picked.some((e) => e!.kind !== 'solo')) return 'not_solo';
+    if (picked.some((e) => !occupiesTournament(e!.status))) return 'not_available';
+    return null;
+}
+
+/**
+ * The seats a draft merge gives back and whether the new team keeps one, from how many of its
+ * pieces held a confirmed place.
+ *
+ * The team KEEPS one of its pieces' seats rather than giving them all back and claiming one
+ * again: a claim only succeeds while registration is open, and closing the list is exactly
+ * when an organiser forms the teams — so the old way put every team formed then on the
+ * waitlist, where it could never play.
+ */
+export function mergedSeat(confirmedPieces: number): { release: number; keeps: boolean } {
+    const n = Math.max(0, Math.floor(confirmedPieces));
+    return { release: Math.max(0, n - 1), keeps: n > 0 };
+}
+
 // ---------------------------------------------------------------- seeding
 
 /**
  * The strength a seeding is sorted by.
  *
- * `rating - 2 * rd` is the CONSERVATIVE Glicko estimate, and it is used here because it
- * is already what orders the public ladder (`stats/rest.ts`). Using the raw rating
- * instead would let somebody with two games and a huge deviation outrank a settled
- * player, and seeding is exactly where that misleads: the top seed gets the bye.
+ * `rating - 2 * rd` is the CONSERVATIVE Glicko estimate. The public ladder no longer orders
+ * by it (since rating v3 it orders by the plain rating, because placement keeps players
+ * with few games off the table), but a tournament has no placement filter: anybody may
+ * enter after one match. So here the deviation term does the job placement does on the
+ * ladder. Using the raw rating would let somebody with two games and a huge deviation
+ * outrank a settled player, and seeding is exactly where that misleads: the top seed gets
+ * the bye.
+ *
+ * The defaults for a player with no rating row are the ladder's own (`elo/glicko2`,
+ * re-exported here), so an unplayed player is as uncertain here as the ladder treats him
+ * before his first match. They used to be a local 1500/350 — v1's starting deviation —
+ * which since v3 put an unplayed player ABOVE somebody with one rated match.
  */
-export const DEFAULT_RATING = 1500;
-export const DEFAULT_RD = 350;
+export { DEFAULT_RATING, DEFAULT_RD };
 
 export interface RatingRow {
     rating: number;
@@ -130,8 +227,8 @@ export interface SeedableEntrant {
  * and not by its best player. A captain-only rule would let a strong player carry two
  * novices to the top seed, and a best-player rule would do the same more quietly.
  *
- * A player with no rating row counts as an unplayed 1500/350, i.e. the bottom of the
- * list rather than the middle — the same answer the ladder gives someone with no games.
+ * A player with no rating row counts as an unplayed 1500/500 — the largest deviation the
+ * ladder allows — i.e. the bottom of the list rather than the middle.
  */
 export function seedByRating(
     entrants: readonly SeedableEntrant[],

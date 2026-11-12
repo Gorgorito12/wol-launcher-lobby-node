@@ -26,7 +26,7 @@ import type { Db } from '../src/db';
 import { voidMatch, type BracketMatch } from '../src/tournaments/bracket';
 import {
     getTournament, listEntrants, loadRosters, loadBracket,
-    applyMatchUpdates, openLobbiesForTournament,
+    applyMatchUpdates, openLobbiesForTournament, deleteTournament, hasGames, unlinkRooms,
 } from '../src/tournaments/store';
 import { staleWhereClause, isStale } from '../src/tournaments/lifecycle';
 
@@ -274,6 +274,49 @@ export async function cmdTournamentReap(db: Db, cli: CliCtx): Promise<void> {
     console.log(`Done — ${list.length} archived.`);
 }
 
+/**
+ * Delete a tournament outright - for the test tournaments nobody should see again.
+ *
+ * Without games it is what the owner can do from the launcher, for any status: rooms still
+ * bound are closed first. With games it refuses unless --force, and even then the GAMES stay:
+ * they keep their ratings and their `tournament_match_id`, so the anti-farm rule goes on
+ * treating them as tournament games. Only the bracket, the entrants and the tournament go.
+ */
+export async function cmdTournamentDelete(db: Db, cli: CliCtx): Promise<void> {
+    const id = cli.positionals[0];
+    if (!id) { console.log('Usage: tournament:delete <id> [--force]'); return; }
+    const force = process.argv.includes('--force');
+    const t = await getTournament(db, id);
+    if (!t) { console.log(`No tournament '${id}'.`); return; }
+
+    const played = await hasGames(db, id);
+    const rooms = await openLobbiesForTournament(db, id);
+    console.log(`Would delete '${t.name}' (${t.status})${played ? ' - GAMES WERE PLAYED' : ''}`
+        + ` and close ${rooms.length} bound room(s).`);
+    if (played && !force) {
+        console.log('Refused: its games are history. Add --force to delete the tournament anyway;');
+        console.log('the games keep their ratings and stay marked as tournament games.');
+        return;
+    }
+    if (!cli.apply) { console.log('Re-run with --apply to write.'); return; }
+
+    for (const lobbyId of rooms) {
+        await db.batch([
+            db.prepare(`UPDATE lobbies SET status='closed', closed_at=datetime('now') WHERE id = ?`).bind(lobbyId),
+            db.prepare(`DELETE FROM lobby_members WHERE lobby_id = ?`).bind(lobbyId),
+        ]);
+    }
+    if (!played && ['draft', 'cancelled', 'abandoned'].includes(t.status)) {
+        console.log(await deleteTournament(db, id) ? 'Done.' : 'Not deleted (it changed meanwhile).');
+        return;
+    }
+    const slots = await db.prepare(`SELECT id FROM tournament_matches WHERE tournament_id = ?`)
+        .bind(id).all<{ id: string }>();
+    await db.prepare(`DELETE FROM tournaments WHERE id = ?`).bind(id).run();
+    await unlinkRooms(db, (slots.results ?? []).map((s) => s.id));
+    console.log(`Done. Restart the service so its list memo forgets it (or wait a minute).`);
+}
+
 // ---------------------------------------------------------------- teams
 
 export async function cmdTeamShow(db: Db, cli: CliCtx): Promise<void> {
@@ -313,7 +356,7 @@ export async function cmdTeamDisband(db: Db, cli: CliCtx): Promise<void> {
 /** Names for `admin.ts`'s KNOWN set, so an unknown command is refused before opening a db. */
 export const TOURNAMENT_COMMANDS = [
     'tournament:list', 'tournament:show', 'tournament:void', 'tournament:cancel',
-    'tournament:transfer', 'tournament:feature', 'tournament:reap',
+    'tournament:transfer', 'tournament:feature', 'tournament:reap', 'tournament:delete',
     'team:show', 'team:disband',
 ] as const;
 
@@ -325,6 +368,7 @@ export const TOURNAMENT_USAGE = `
   tournament:transfer <id> --to <player>    hand it over when the owner has vanished
   tournament:feature <id> [--off]           allow the Discord announcement
   tournament:reap                           archive the stale ones without a restart
+  tournament:delete <id> [--force]          delete it (with games only with --force; games stay)
   team:show <teamId>                        |  team:disband <teamId>`;
 
 export type { BracketMatch };
