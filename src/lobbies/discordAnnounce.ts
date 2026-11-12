@@ -661,3 +661,81 @@ function buildEmbed(state: RoomAnnounceState): Record<string, unknown> {
 
     return embed;
 }
+
+// ---------- quick-match searchers --------------------------------------------
+
+/**
+ * "X is looking for a 1v1": posted when a quick-match search has waited a while with nobody.
+ *
+ * It replaces the room embed the old quick match produced as a side effect — with a server
+ * queue there is no room until two people are matched, so nothing told the community somebody
+ * was waiting. Same webhooks, same per-mod filter and the same role ping as a room. The
+ * message is DELETED when the search ends (matched, cancelled, timed out), so the channel
+ * never shows a searcher who is gone. In memory only: a restart empties the queue, and the
+ * few messages left behind say "searching" with a timestamp that ages visibly.
+ */
+const searching = new Map<string, { url: string; messageId: string }[]>();
+
+export interface Searcher {
+    ticketId: string;
+    modId: string;
+    playerName: string;
+    playerAvatar: string | null;
+    competitive: boolean;
+    queuedAt: number;
+}
+
+export async function announceSearching(s: Searcher): Promise<void> {
+    const chosen = webhookUrls()
+        .map((url, i) => ({ url, i }))
+        .filter((w) => webhookAnnounces(w.i, s.modId));
+    if (chosen.length === 0) return;
+    searching.set(s.ticketId, []);
+    const author: Record<string, unknown> = { name: s.playerName || 'Player' };
+    if (s.playerAvatar) author.icon_url = s.playerAvatar;
+    const embed = {
+        author,
+        title: `🔎 Looking for a 1v1 · ${modLabel(s.modId)}`,
+        color: COLOR_OPEN,
+        fields: [
+            { name: 'Mod', value: modLabel(s.modId), inline: true },
+            { name: 'Mode', value: s.competitive ? '⚔️ Ranked' : 'Casual', inline: true },
+            { name: 'Searching since', value: `<t:${Math.floor(s.queuedAt / 1000)}:R>`, inline: true },
+        ],
+        thumbnail: { url: `${MOD_ICON_BASE}/${encodeURIComponent(s.modId)}/icon.png` },
+        footer: { text: 'AoE3 Mod Launcher · Multiplayer › Rooms › Play' },
+    };
+    await Promise.allSettled(chosen.map(async ({ url, i }) => {
+        const payload: Record<string, unknown> = { embeds: [embed] };
+        const roleId = roleIdFor(i);
+        if (roleId) {
+            payload.content = `<@&${roleId}>`;
+            payload.allowed_mentions = { parse: [], roles: [roleId] };
+        }
+        try {
+            const resp = await fetch(`${url}?wait=true`, {
+                method: 'POST', headers: jsonHeaders(), body: JSON.stringify(payload),
+            });
+            if (!resp.ok) { log?.warn({ status: resp.status }, 'Discord searcher announce failed'); return; }
+            const msg = (await resp.json().catch(() => null)) as { id?: string } | null;
+            const list = searching.get(s.ticketId);
+            if (msg?.id && list) list.push({ url, messageId: msg.id });
+            else if (msg?.id) await deleteMessage(url, msg.id); // withdrawn while posting
+        } catch (err) {
+            log?.warn({ err }, 'Discord searcher announce threw');
+        }
+    }));
+}
+
+export async function withdrawSearching(ticketId: string): Promise<void> {
+    const list = searching.get(ticketId);
+    searching.delete(ticketId);
+    if (!list) return;
+    await Promise.allSettled(list.map((t) => deleteMessage(t.url, t.messageId)));
+}
+
+async function deleteMessage(url: string, messageId: string): Promise<void> {
+    try {
+        await fetch(`${url}/messages/${encodeURIComponent(messageId)}`, { method: 'DELETE', headers: jsonHeaders() });
+    } catch { /* best-effort */ }
+}

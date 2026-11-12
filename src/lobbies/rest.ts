@@ -53,6 +53,8 @@ interface LobbyRow {
     competitive: number;
     /** The bracket slot this room plays out, or null. Written only by the tournament route. */
     tournament_match_id: string | null;
+    /** The quick-match proposal this room plays out, or null. Written only by the Matchmaker. */
+    matchmaking_match_id: string | null;
 }
 
 /** The tournament a room's bracket slot belongs to, for a window that opens with no other way to
@@ -99,7 +101,7 @@ interface JoinLobbyBody {
 export const LOBBY_LIST_SQL =
     `SELECT l.id, l.host_user_id, l.title, l.mod_id, l.mod_combined_hash,
             l.max_players, l.spectator_slots, l.current_players, l.is_private,
-            l.status, l.competitive, l.tournament_match_id,
+            l.status, l.competitive, l.tournament_match_id, l.matchmaking_match_id,
             ${ROOM_TOURNAMENT_ID_SQL} AS tournament_id,
             -- Counted rather than denormalised, unlike current_players. This is read
             -- once per row on a list capped at 100 and covered by lobby_members' own
@@ -158,6 +160,7 @@ async function buildLobbyList(ctx: AppContext): Promise<unknown> {
         status: 'open' | 'locked' | 'in_game';
         competitive: number;
         tournament_match_id: string | null;
+        matchmaking_match_id: string | null;
         tournament_id: string | null;
         created_at: string;
         started_at: string | null;
@@ -216,6 +219,9 @@ async function buildLobbyList(ctx: AppContext): Promise<unknown> {
             tournament_match_id: r.tournament_match_id ?? null,
             // Additive, like every field here: an older launcher ignores it.
             tournament_id: r.tournament_id ?? null,
+            // A room the queue opened for two matched players. The launcher shows the QUICK
+            // MATCH chip and no Join, since only those two may enter. Additive.
+            matchmaking: r.matchmaking_match_id != null,
             created_at: r.created_at,
             // When the match under way began, for the row's "In game · 14 min". Only while it
             // is under way: started_at is kept after a cancelled game (migration 0021).
@@ -345,6 +351,9 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
         // route can open a room by exactly these rules rather than growing a second copy
         // of them — see the header of ./create.ts for what "exactly these rules" covers.
         const body = (req.body ?? {}) as CreateLobbyBody;
+        // Opening a room by hand ends a quick-match search: one cannot wait in a room and in
+        // the queue at once, and the room is the thing he just chose.
+        ctx.matchmaker?.leave(req.userId!, 'in_room');
         const created = await createLobby(ctx, req.userId!, {
             title: body.title,
             modId: body.mod_id,
@@ -398,6 +407,7 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
             competitive: lobby.competitive === 1,
             tournament_match_id: lobby.tournament_match_id ?? null,
             tournament_id: await tournamentIdOf(ctx, lobby.tournament_match_id),
+            matchmaking: lobby.matchmaking_match_id != null,
             host_user_id: lobby.host_user_id,
             members: (members.results ?? []).map((m) => ({
                 id: m.user_id,
@@ -441,6 +451,13 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
         if (lobby.tournament_match_id) {
             const mine = await isEntrantMember(ctx.db, lobby.tournament_match_id, userId);
             if (!mine) throw Errors.NotTournamentParticipant();
+        }
+        // A room the queue opened is for the two it matched, by the same rule.
+        if (lobby.matchmaking_match_id) {
+            const row = await ctx.db.prepare(
+                `SELECT 1 AS ok FROM matchmaking_match_players WHERE match_id = ? AND user_id = ?`,
+            ).bind(lobby.matchmaking_match_id, userId).first<{ ok: number }>();
+            if (!row) throw Errors.NotMatchParticipant();
         }
         // Seats fill by ROLE, not by total. A room of five with one watching seat has four
         // player seats and one observer seat, and they run out independently: checking only
@@ -515,6 +532,9 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
 
         // Where they joined from, hashed (src/lib/ipHash.ts). Best-effort.
         await recordIpHash(ctx, lobbyId, userId, requestIpHash(ctx, req));
+        // Entering somebody's room by hand ends a quick-match search — after the join landed,
+        // so a refused attempt does not cost the player his place in the queue.
+        if (!lobby.matchmaking_match_id) ctx.matchmaker?.leave(userId, 'in_room');
 
         const joinToken = uuid();
         await ctx.kv.put(
