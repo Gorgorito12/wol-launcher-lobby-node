@@ -95,7 +95,19 @@ test('the public list follows the table', async () => {
     insert(db, 'cancelledOld', 'cancelled', 10, true);
     insert(db, 'finishedNew', 'finished', 5, true);
     insert(db, 'finishedOld', 'finished', 40, true);
-    assert.deepEqual(ids(await listTournaments(db, 50)), ['cancelledPlayed', 'finishedNew', 'live']);
+    assert.deepEqual(ids(await listTournaments(db, 50)),
+        ['cancelledPlayed', 'finishedNew', 'finishedOld', 'live']);
+});
+
+test('a finished tournament stays on the public list for good, behind every live one', async () => {
+    const db = freshDb();
+    insert(db, 'finishedAncient', 'finished', 400, true);
+    insert(db, 'finishedYesterday', 'finished', 1, true);
+    insert(db, 'liveQuiet', 'registration', 20);
+    const rows = (await listTournaments(db, 50)).map((r) => r.id);
+    assert.deepEqual(rows, ['liveQuiet', 'finishedYesterday', 'finishedAncient']);
+    // And a full page of history cannot push the live one off it.
+    assert.deepEqual((await listTournaments(db, 1)).map((r) => r.id), ['liveQuiet']);
 });
 
 test('the owner sees their cancelled one without games; nobody else does', async () => {
@@ -109,12 +121,11 @@ test('the owner sees their cancelled one without games; nobody else does', async
     assert.deepEqual(ids(await listOwnDrafts(db, 'stranger')), []);
 });
 
-test('an old finished tournament stays with who took part', async () => {
+test('an old PUBLIC finished tournament is not repeated in "mine": the public list has it', async () => {
     const db = freshDb();
     insert(db, 'finishedOld', 'finished', 40, true);
-    assert.deepEqual(ids(await listMine(db, 'player')), ['finishedOld']);
-    assert.deepEqual(ids(await listMine(db, 'owner')), ['finishedOld']);
-    assert.deepEqual(ids(await listMine(db, 'stranger')), []);
+    assert.deepEqual(ids(await listMine(db, 'player')), []);
+    assert.deepEqual(ids(await listTournaments(db, 50)), ['finishedOld']);
 });
 
 test('deleting takes the entrants, rosters and bracket with it', async () => {

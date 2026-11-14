@@ -22,8 +22,8 @@ import type { BracketMatch, BracketUpdate, Slot } from './bracket';
 import type { EntrantStatus, TournamentFormat, TeamSource } from './entrants';
 import {
     aliveWhereClause, CAPPED_STATUSES, DELETABLE_STATUSES, dueForDeletionWhereClause,
-    FINISHED_PUBLIC_DAYS, playedSql, publicWhereClause, UNPLAYED_KEEP_DAYS,
-    type TournamentStatus,
+    listedWhereClause, memberOfSql, playedSql, publicWhereClause, UNPLAYED_KEEP_DAYS,
+    type TournamentStatus, type TournamentVisibility,
 } from './lifecycle';
 
 // ---------------------------------------------------------------- row shapes
@@ -50,6 +50,10 @@ export interface TournamentRow {
     finished_at: string | null;
     cancelled_at: string | null;
     abandoned_at: string | null;
+    /** 'public' unless made private (migration 0032). */
+    visibility: TournamentVisibility;
+    /** Set only on a private tournament. Never put in a payload a stranger can read. */
+    invite_code: string | null;
 }
 
 export interface EntrantRow {
@@ -424,13 +428,14 @@ export interface TournamentListRow {
     pending_count: number;
     /** 1 when a game of it was played - what keeps it from ever being deleted. */
     has_games: number;
+    visibility: TournamentVisibility;
     created_at: string;
     last_activity_at: string;
 }
 
 export const LIST_COLUMNS = `
     t.id, t.name, t.mod_id, t.owner_user_id, t.format, t.team_source, t.entry_mode,
-    t.status, t.capacity, t.confirmed_count, t.created_at, t.last_activity_at,
+    t.status, t.capacity, t.confirmed_count, t.created_at, t.last_activity_at, t.visibility,
     (SELECT ${USER_DISPLAY_NAME_SQL} FROM users u WHERE u.id = t.owner_user_id) AS owner_name,
     (SELECT COUNT(*) FROM tournament_entrants e
       WHERE e.tournament_id = t.id
@@ -446,13 +451,22 @@ export const LIST_COLUMNS = `
     -- with no game, and the server refuses the rest anyway.
     CASE WHEN ${playedSql('t')} THEN 1 ELSE 0 END AS has_games`;
 
-/** The public list: newest activity first, drafts excluded, stale ones already gone. */
+/**
+ * The ORDER of every list: live tournaments first, then ended ones, newest activity first within
+ * each. Finished tournaments stay listed for good (2026-11-13), so without the first key a busy
+ * history would push a tournament taking registrations off the 50-row page.
+ */
+export const LIST_ORDER =
+    `ORDER BY CASE WHEN t.status IN ('finished','cancelled','abandoned') THEN 1 ELSE 0 END,
+              t.last_activity_at DESC`;
+
+/** The public list: live first, drafts and private ones excluded, stale ones already gone. */
 export async function listTournaments(db: Db, limit: number): Promise<TournamentListRow[]> {
     const r = await db.prepare(
         `SELECT ${LIST_COLUMNS}
            FROM tournaments t
            ${TOURNAMENT_LIST_WHERE}
-          ORDER BY t.last_activity_at DESC
+          ${LIST_ORDER}
           LIMIT ?`,
     ).bind(limit).all<TournamentListRow>();
     return r.results ?? [];
@@ -478,10 +492,16 @@ export async function listOwnDrafts(db: Db, userId: string): Promise<TournamentL
 }
 
 /**
- * The ended tournaments only the caller still sees (2026-11-11): their own cancelled or
- * abandoned ones with no game played, for the week before the sweep deletes them, and the
- * finished ones past the public month that they played in, organised or helped run. Capped
- * at 20, and outside the anonymous memo for the reason `listOwnDrafts` is.
+ * The tournaments only the caller sees, outside the anonymous memo for the reason
+ * `listOwnDrafts` is:
+ *
+ * - their own cancelled or abandoned ones with no game played, for the week before the sweep
+ *   deletes them (2026-11-11);
+ * - every PRIVATE tournament they own, help run or are entered in (2026-11-13), under the same
+ *   windows the public list applies (`listedWhereClause`) - so a finished private one stays with
+ *   them for good, exactly as a finished public one stays with everybody.
+ *
+ * A finished PUBLIC tournament is no longer here: it never leaves the public list now.
  *
  * Binds: the user id four times.
  */
@@ -493,16 +513,11 @@ export const MINE_SQL =
              AND NOT ${playedSql('t')}
              AND julianday('now') - julianday(COALESCE(t.cancelled_at, t.abandoned_at, t.last_activity_at))
                  <= ${UNPLAYED_KEEP_DAYS})
-         OR (t.status = 'finished'
-             AND julianday('now') - julianday(COALESCE(t.finished_at, t.last_activity_at)) > ${FINISHED_PUBLIC_DAYS}
-             AND (t.owner_user_id = ?
-                  OR EXISTS (SELECT 1 FROM tournament_managers mg
-                              WHERE mg.tournament_id = t.id AND mg.user_id = ?)
-                  OR EXISTS (SELECT 1 FROM tournament_entrant_members em
-                               JOIN tournament_entrants ee ON ee.id = em.entrant_id
-                              WHERE ee.tournament_id = t.id AND em.user_id = ?)))
-      ORDER BY t.last_activity_at DESC
-      LIMIT 20`;
+         OR (t.visibility = 'private'
+             AND ${listedWhereClause('t')}
+             AND ${memberOfSql('t')})
+      ${LIST_ORDER}
+      LIMIT 50`;
 
 export async function listMine(db: Db, userId: string): Promise<TournamentListRow[]> {
     const r = await db.prepare(MINE_SQL).bind(userId, userId, userId, userId).all<TournamentListRow>();
@@ -729,14 +744,52 @@ export interface NewTournament {
     teamSource: TeamSource;
     entryMode: 'open' | 'approval';
     capacity: number;
+    /** Absent = public. */
+    visibility?: TournamentVisibility;
+    /** Required for a private tournament, ignored for a public one. */
+    inviteCode?: string | null;
 }
 
 export async function insertTournament(db: Db, t: NewTournament): Promise<void> {
     await db.prepare(
         `INSERT INTO tournaments (id, name, mod_id, owner_user_id, format, team_source,
-                                  entry_mode, capacity, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'draft')`,
-    ).bind(t.id, t.name, t.modId, t.ownerUserId, t.format, t.teamSource, t.entryMode, t.capacity).run();
+                                  entry_mode, capacity, status, visibility, invite_code)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)`,
+    ).bind(
+        t.id, t.name, t.modId, t.ownerUserId, t.format, t.teamSource, t.entryMode, t.capacity,
+        t.visibility === 'private' ? 'private' : 'public',
+        t.visibility === 'private' ? (t.inviteCode ?? null) : null,
+    ).run();
+}
+
+/** Whether the user is the tournament's owner, a co-organiser or one of its entrants. */
+export async function isMemberOf(db: Db, tournamentId: string, userId: string): Promise<boolean> {
+    const row = await db.prepare(
+        `SELECT 1 AS ok FROM tournaments t WHERE t.id = ? AND ${memberOfSql('t')}`,
+    ).bind(tournamentId, userId, userId, userId).first<{ ok: number }>();
+    return !!row;
+}
+
+/** The private tournament an invite code opens, or undefined. Codes compare exactly. */
+export async function getByInviteCode(db: Db, code: string): Promise<TournamentRow | undefined> {
+    return db.prepare(
+        `SELECT * FROM tournaments WHERE invite_code = ? AND visibility = 'private'`,
+    ).bind(code).first<TournamentRow>();
+}
+
+/**
+ * Whether one tournament may be shown to this caller: a public one to anybody, a private one to
+ * its members and to whoever brings its invite code.
+ */
+export async function maySee(
+    db: Db,
+    t: Pick<TournamentRow, 'id' | 'visibility' | 'invite_code'>,
+    userId: string | undefined,
+    code: string | undefined,
+): Promise<boolean> {
+    if (t.visibility !== 'private') return true;
+    if (code && t.invite_code && code === t.invite_code) return true;
+    return !!userId && await isMemberOf(db, t.id, userId);
 }
 
 export interface NewEntrant {

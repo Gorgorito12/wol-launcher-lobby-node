@@ -41,6 +41,8 @@ for (const entrants of [17, 32, 33, 64]) {
 
 test('a list row and the detail both say the limit', () => {
     const rest = readFileSync('src/tournaments/rest.ts', 'utf8');
-    assert.match(rest, /payload = \{ tournaments: rows\.map\(listView\), max_capacity: MAX_CAPACITY \}/);
-    assert.equal((rest.match(/max_capacity: MAX_CAPACITY,/g) ?? []).length, 2);
+    // The list payload also says the server knows private tournaments (2026-11-13).
+    assert.match(rest, /payload = \{ tournaments: rows\.map\(listView\), max_capacity: MAX_CAPACITY, private_tournaments: true \}/);
+    // The list payload, every list row and the detail.
+    assert.equal((rest.match(/max_capacity: MAX_CAPACITY,/g) ?? []).length, 3);
 });

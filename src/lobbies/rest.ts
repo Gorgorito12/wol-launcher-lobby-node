@@ -118,6 +118,11 @@ export const LOBBY_LIST_SQL =
      -- No rating join: the hosts' ratings are read below through effectiveRatings. A host
      -- with no rating row would need the join LEFT or his room would vanish.
      WHERE l.status IN ('open', 'locked', 'in_game')
+       -- The room of a PRIVATE tournament's match is nobody else's business (2026-11-13): its
+       -- players reach it from the bracket, and its title names the tournament.
+       AND NOT EXISTS (SELECT 1 FROM tournament_matches tmv
+                         JOIN tournaments tv ON tv.id = tmv.tournament_id
+                        WHERE tmv.id = l.tournament_match_id AND tv.visibility = 'private')
      ORDER BY l.created_at DESC
      LIMIT 100`;
 
