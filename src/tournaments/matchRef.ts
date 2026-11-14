@@ -18,10 +18,16 @@ export const TOURNAMENT_REF_COLUMNS =
     `t.id AS tournament_id, t.name AS tournament_name,
      tm.round AS tournament_round, t.bracket_size AS tournament_bracket_size`;
 
-/** LEFT, both: an ordinary match has no bracket slot and must still be listed. */
+/**
+ * LEFT, both: an ordinary match has no bracket slot and must still be listed.
+ *
+ * A PRIVATE tournament is never named here (2026-11-13): every list built on this join is public
+ * (`/stats/community`, `GET /matches`, anybody's history), so a game of a private bracket shows
+ * as the ordinary competitive game it also is, and the tournament's name goes nowhere.
+ */
 export const TOURNAMENT_REF_JOIN =
     `LEFT JOIN tournament_matches tm ON tm.id = m.tournament_match_id
-     LEFT JOIN tournaments t ON t.id = tm.tournament_id`;
+     LEFT JOIN tournaments t ON t.id = tm.tournament_id AND t.visibility = 'public'`;
 
 export interface TournamentRef {
     id: string;

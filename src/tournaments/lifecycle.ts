@@ -155,14 +155,23 @@ export const CAPPED_STATUSES: readonly TournamentStatus[] =
 
 /**
  * How long an ended tournament stays where people see it, and what happens after
- * (2026-11-11, the maintainer's "limpieza inteligente").
+ * (2026-11-11, the maintainer's "limpieza inteligente"; finished ones stay for good since
+ * 2026-11-13).
  *
  * | Tournament                                   | Who sees it                 | After            |
  * |----------------------------------------------|-----------------------------|------------------|
  * | draft                                        | its owner                   | 7 days: deleted  |
  * | cancelled / abandoned, NO game played        | its owner, 7 days           | deleted          |
  * | cancelled / abandoned, games played          | everybody, 7 days           | kept, unlisted   |
- * | finished                                     | everybody, 30 days          | only who took part |
+ * | finished                                     | everybody, always           | -                |
+ *
+ * "Everybody" means everybody for a PUBLIC tournament. A PRIVATE one follows the same windows
+ * but only for its owner, co-organisers and entrants ({@link memberOfSql}); nobody else ever
+ * lists it.
+ *
+ * A finished tournament used to leave the public list after 30 days and stay only with who took
+ * part. The maintainer wants the record of a played tournament visible to everybody, so it stays;
+ * the list puts live ones first, so an old finished one can never push a live one off the page.
  *
  * A tournament with a played game is NEVER deleted: its games and the rating they moved are
  * history. What "played" means is {@link playedSql}.
@@ -172,7 +181,9 @@ export const CAPPED_STATUSES: readonly TournamentStatus[] =
  */
 export const ENDED_PUBLIC_DAYS = 7;
 export const UNPLAYED_KEEP_DAYS = 7;
-export const FINISHED_PUBLIC_DAYS = 30;
+
+/** Who may see a tournament. */
+export type TournamentVisibility = 'public' | 'private';
 
 /**
  * True when a game of this tournament was played: a bracket slot decided by a game, or a game
@@ -198,19 +209,44 @@ function endedAtSql(alias = ''): string {
 }
 
 /**
- * The public list's rule: not a draft, alive, and an ended tournament only while its window
- * lasts. Embeds {@link aliveWhereClause} verbatim, so the list and the creation caps cannot
- * disagree about what is alive.
+ * Whether a tournament is listed at all, whoever may see it: not a draft, alive, and a cancelled
+ * or abandoned one only while its week lasts and only with a game played. Embeds
+ * {@link aliveWhereClause} verbatim, so the list and the creation caps cannot disagree about
+ * what is alive. Visibility is NOT in here — see {@link publicWhereClause}.
  */
-export function publicWhereClause(alias = ''): string {
+export function listedWhereClause(alias = ''): string {
     const col = (name: string) => (alias ? `${alias}.${name}` : name);
     return `${col('status')} <> 'draft' AND ${aliveWhereClause(alias)}
         AND NOT (${col('status')} IN ('cancelled','abandoned')
                  AND (NOT ${playedSql(alias)}
-                      OR julianday('now') - julianday(${endedAtSql(alias)}) > ${ENDED_PUBLIC_DAYS}))
-        AND NOT (${col('status')} = 'finished'
-                 AND julianday('now') - julianday(COALESCE(${col('finished_at')}, ${col('last_activity_at')}))
-                     > ${FINISHED_PUBLIC_DAYS})`;
+                      OR julianday('now') - julianday(${endedAtSql(alias)}) > ${ENDED_PUBLIC_DAYS}))`;
+}
+
+/**
+ * The public list's rule: {@link listedWhereClause} for a PUBLIC tournament. A private one is
+ * never in it, in any state — the anonymous memo is served to everybody.
+ */
+export function publicWhereClause(alias = ''): string {
+    const col = (name: string) => (alias ? `${alias}.${name}` : name);
+    return `${col('visibility')} = 'public' AND ${listedWhereClause(alias)}`;
+}
+
+/**
+ * True when the user bound to its THREE `?` is the tournament's owner, a co-organiser, or a
+ * member of one of its entrants that was not rejected and did not withdraw. That is who sees a
+ * private tournament. A disqualified entrant stays a member: they played in it.
+ */
+export function memberOfSql(alias = ''): string {
+    const col = (name: string) => (alias ? `${alias}.${name}` : name);
+    return `(
+        ${col('owner_user_id')} = ?
+        OR EXISTS (SELECT 1 FROM tournament_managers mv
+                    WHERE mv.tournament_id = ${col('id')} AND mv.user_id = ?)
+        OR EXISTS (SELECT 1 FROM tournament_entrant_members emv
+                     JOIN tournament_entrants eev ON eev.id = emv.entrant_id
+                    WHERE eev.tournament_id = ${col('id')} AND emv.user_id = ?
+                      AND eev.status NOT IN ('rejected','withdrawn'))
+    )`;
 }
 
 /**
@@ -232,6 +268,8 @@ export const DELETABLE_STATUSES: readonly TournamentStatus[] = ['draft', 'cancel
 
 export interface VisibilityInput {
     status: TournamentStatus;
+    /** Absent = public, which is every tournament made before private ones existed. */
+    visibility?: TournamentVisibility;
     createdAt: string;
     lastActivityAt: string | null;
     /** cancelled_at ?? abandoned_at, for an ended one. */
@@ -242,6 +280,7 @@ export interface VisibilityInput {
 
 /** The JS twin of {@link publicWhereClause}, for tests and the CLI. */
 export function isPubliclyListed(t: VisibilityInput, nowMs: number): boolean {
+    if ((t.visibility ?? 'public') !== 'public') return false;
     if (t.status === 'draft') return false;
     if (isStale(t, nowMs)) return false;
     const age = (stamp: string | null) => {
@@ -251,7 +290,6 @@ export function isPubliclyListed(t: VisibilityInput, nowMs: number): boolean {
     if (t.status === 'cancelled' || t.status === 'abandoned') {
         return t.played && age(t.endedAt) <= ENDED_PUBLIC_DAYS * DAY_MS;
     }
-    if (t.status === 'finished') return age(t.finishedAt) <= FINISHED_PUBLIC_DAYS * DAY_MS;
     return true;
 }
 

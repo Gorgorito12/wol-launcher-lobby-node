@@ -65,6 +65,7 @@ import {
 } from './cache';
 import { ladderRanks } from '../stats/rest';
 import { mayDelete } from './lifecycle';
+import { readCode } from './inviteCode';
 
 // ---------------------------------------------------------------- bounds
 
@@ -100,6 +101,15 @@ function paramId(req: { params: unknown }, key: string): string {
     return (req.params as Record<string, string | undefined>)[key] ?? '';
 }
 
+/** A code no other tournament holds. 32^8 makes a clash rare; the unique index makes it safe. */
+async function freshInviteCode(ctx: AppContext): Promise<string> {
+    for (let i = 0; i < 5; i++) {
+        const code = shortId(8);
+        if (!await store.getByInviteCode(ctx.db, code)) return code;
+    }
+    throw Errors.Conflict('Could not mint an invite code; try again.');
+}
+
 export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): void {
     // ------------------------------------------------------------ public reads
 
@@ -113,7 +123,10 @@ export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): 
             const rows = await store.listTournaments(ctx.db, LIST_LIMIT);
             // max_capacity tells a launcher what it may offer, so a new limit needs no new launcher
             // and a launcher against an older server, which sends none, keeps asking for 16.
-            payload = { tournaments: rows.map(listView), max_capacity: MAX_CAPACITY };
+            // private_tournaments: this server understands `visibility` and invite codes, so a
+            // launcher may offer them. Absent on an older server, which would make a private
+            // request public in silence.
+            payload = { tournaments: rows.map(listView), max_capacity: MAX_CAPACITY, private_tournaments: true };
             writeListCache(payload, now);
         }
 
@@ -144,16 +157,42 @@ export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): 
         preHandler: [ipRateLimit(ctx, Limits.TournamentsIp)],
     }, async (req, reply) => {
         const id = paramId(req, 'id');
-        const cached = readDetailCache(id);
-        if (cached) {
-            reply.header('Cache-Control', 'public, max-age=60');
-            return cached;
+        const code = readCode((req.query as Record<string, unknown> | undefined)?.code);
+
+        // A private tournament answers 404 to a stranger - not 403, which would confirm that it
+        // exists. One cheap read decides it before any cache is consulted.
+        const row = await store.getTournament(ctx.db, id);
+        if (!row) throw Errors.NotFound('Tournament');
+        if (!await store.maySee(ctx.db, row, req.userId, code)) throw Errors.NotFound('Tournament');
+
+        let payload = readDetailCache(id);
+        if (!payload) {
+            payload = await buildDetail(ctx, id);
+            writeDetailCache(id, payload);
         }
 
-        const payload = await buildDetail(ctx, id);
-        writeDetailCache(id, payload);
+        if (row.visibility === 'private') {
+            // Never cacheable by anything between us and the player, and the code only for the
+            // people who hand it out.
+            reply.header('Cache-Control', 'private, max-age=0');
+            const runsIt = !!req.userId && (row.owner_user_id === req.userId
+                || await store.isManager(ctx.db, id, req.userId));
+            return runsIt ? { ...(payload as object), invite_code: row.invite_code } : payload;
+        }
         reply.header('Cache-Control', 'public, max-age=60');
         return payload;
+    });
+
+    // Which private tournament an invite code opens. Answers only the id and the name, the two
+    // things a launcher needs to open it; the detail route then checks the same code again.
+    app.get('/tournaments/by-code/:code', {
+        preHandler: [ipRateLimit(ctx, Limits.TournamentsIp)],
+    }, async (req, reply) => {
+        const code = readCode(paramId(req, 'code'));
+        const t = code ? await store.getByInviteCode(ctx.db, code) : undefined;
+        if (!t) throw Errors.NotFound('Tournament');
+        reply.header('Cache-Control', 'private, max-age=0');
+        return { id: t.id, name: t.name, status: t.status };
     });
 
     // ------------------------------------------------------------ create
@@ -164,7 +203,7 @@ export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): 
         const userId = req.userId!;
         const body = (req.body ?? {}) as {
             name?: unknown; mod_id?: unknown; format?: unknown;
-            team_source?: unknown; entry_mode?: unknown; capacity?: unknown;
+            team_source?: unknown; entry_mode?: unknown; capacity?: unknown; visibility?: unknown;
         };
 
         const name = typeof body.name === 'string' ? body.name.trim().slice(0, NAME_MAX) : '';
@@ -177,6 +216,7 @@ export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): 
         const teamSource = readEnum<TeamSource>(
             body.team_source ?? 'solo', ['solo', 'registered', 'adhoc', 'draft'], 'team_source');
         const entryMode = readEnum(body.entry_mode ?? 'open', ['open', 'approval'] as const, 'entry_mode');
+        const visibility = readEnum(body.visibility ?? 'public', ['public', 'private'] as const, 'visibility');
 
         if (!teamSourceAllowed(format, teamSource)) {
             throw Errors.BadRequest(`team_source ${teamSource} is not valid for a ${format}`);
@@ -199,11 +239,16 @@ export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): 
         await store.insertTournament(ctx.db, {
             id, name, modId, ownerUserId: userId,
             format, teamSource, entryMode, capacity: clampCapacity(body.capacity),
+            visibility, inviteCode: visibility === 'private' ? await freshInviteCode(ctx) : null,
         });
         invalidate(id);
 
         const created = await store.getTournament(ctx.db, id);
-        return { ...listView(created as unknown as store.TournamentListRow), ranked };
+        return {
+            ...listView(created as unknown as store.TournamentListRow), ranked,
+            // The creator is the one person who must see it at once, to hand it out.
+            ...(created?.invite_code ? { invite_code: created.invite_code } : {}),
+        };
     });
 
     // ------------------------------------------------------------ entrant actions
@@ -216,11 +261,15 @@ export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): 
 
         const t = await store.getTournament(ctx.db, id);
         if (!t) throw Errors.NotFound('Tournament');
-        if (t.status !== 'registration') throw Errors.TournamentClosed();
 
         const body = (req.body ?? {}) as {
-            member_ids?: unknown; display_name?: unknown; team_id?: unknown;
+            member_ids?: unknown; display_name?: unknown; team_id?: unknown; invite_code?: unknown;
         };
+        // Same 404 a stranger gets from the detail: entering is not a way to learn it exists.
+        if (!await store.maySee(ctx.db, t, userId, readCode(body.invite_code))) {
+            throw Errors.NotFound('Tournament');
+        }
+        if (t.status !== 'registration') throw Errors.TournamentClosed();
 
         // The three ways a line-up comes to exist. All three end in the same frozen copy —
         // what differs is only where the names came from.
@@ -934,6 +983,8 @@ function listView(t: store.TournamentListRow): Record<string, unknown> {
         pending_count: t.pending_count ?? 0,
         // Additive. A launcher offers Delete only on one without games.
         has_games: !!t.has_games,
+        // Additive (2026-11-13). Absent from an older server, which only had public ones.
+        visibility: t.visibility ?? 'public',
         created_at: t.created_at,
         last_activity_at: t.last_activity_at,
     };
@@ -1089,6 +1140,7 @@ async function buildDetail(ctx: AppContext, id: string): Promise<unknown> {
         team_source: t.team_source,
         entry_mode: t.entry_mode,
         status: t.status,
+        visibility: t.visibility ?? 'public',
         capacity: t.capacity,
         max_capacity: MAX_CAPACITY,
         confirmed_count: t.confirmed_count,

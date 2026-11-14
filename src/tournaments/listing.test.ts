@@ -15,7 +15,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { TOURNAMENT_LIST_WHERE, LIST_COLUMNS, MY_ENTRIES_SQL } from './store';
 import {
-    aliveWhereClause, DRAFT_STALE_DAYS, ENDED_PUBLIC_DAYS, FINISHED_PUBLIC_DAYS, LIVE_STALE_DAYS,
+    aliveWhereClause, DRAFT_STALE_DAYS, ENDED_PUBLIC_DAYS, LIVE_STALE_DAYS,
 } from './lifecycle';
 
 test('a list row names its owner with the shared naming rule', () => {
@@ -42,7 +42,8 @@ test('the fragment is aliased throughout, or it breaks the moment it is joined',
     assert.match(TOURNAMENT_LIST_WHERE, /t\.status/);
     // No bare column may survive: in a join a bare `status` is ambiguous or wrong.
     const masked = TOURNAMENT_LIST_WHERE
-        .replace(/t\.status/g, 'X').replace(/t\.created_at/g, 'X').replace(/t\.last_activity_at/g, 'X');
+        .replace(/t\.status/g, 'X').replace(/t\.created_at/g, 'X').replace(/t\.last_activity_at/g, 'X')
+        .replace(/t\.visibility/g, 'X');
     assert.equal(/[^.\w]status\b/.test(masked), false);
     assert.equal(/[^.\w]created_at\b/.test(masked), false);
     assert.equal(/[^.\w]last_activity_at\b/.test(masked), false);
@@ -59,13 +60,18 @@ test('both staleness horizons reach the list', () => {
     assert.ok(TOURNAMENT_LIST_WHERE.includes(String(LIVE_STALE_DAYS)));
 });
 
-test('an ended tournament is listed only for its window', () => {
-    // Terminal rows are alive-by-definition in `aliveWhereClause`; what takes them off the list
-    // is the window of publicWhereClause (2026-11-11): a week for a cancelled one with a game,
-    // a month for a finished one. cleanup.test.ts runs the real query.
-    assert.match(TOURNAMENT_LIST_WHERE, /status IN \('finished','cancelled','abandoned'\)/);
+test('a cancelled tournament is listed only for its week; a finished one for good', () => {
+    // Terminal rows are alive-by-definition in `aliveWhereClause`; what takes a cancelled or
+    // abandoned one off the list is the window of listedWhereClause (2026-11-11). A finished one
+    // has no window since 2026-11-13. cleanup.test.ts runs the real query.
+    assert.match(TOURNAMENT_LIST_WHERE, /status IN \('cancelled','abandoned'\)/);
     assert.ok(TOURNAMENT_LIST_WHERE.includes(String(ENDED_PUBLIC_DAYS)));
-    assert.ok(TOURNAMENT_LIST_WHERE.includes(String(FINISHED_PUBLIC_DAYS)));
+    assert.equal(/finished_at/.test(TOURNAMENT_LIST_WHERE), false,
+        'nothing may age a finished tournament off the public list');
+});
+
+test('THE ONE THAT MATTERS: the public list never holds a private tournament', () => {
+    assert.match(TOURNAMENT_LIST_WHERE, /t\.visibility = 'public'/);
 });
 
 test('a list row says whether a game was played, without a bound parameter', () => {
