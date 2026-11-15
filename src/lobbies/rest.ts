@@ -330,7 +330,7 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
         return payload;
     });
 
-    // GET /lobbies/radmin — the Radmin address of each public room's host, for the rooms list's
+    // GET /lobbies/radmin — the Radmin address of each room's host (password rooms included), for the rooms list's
     // per-host ping. Separate from /lobbies on purpose: that body is one anonymous memo, and an
     // address must only reach a signed-in player, who could read it anyway by joining the room.
     // See ./hostRadmin.ts for every refusal.
@@ -339,7 +339,7 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
     }, async (_req, reply) => {
         const rows = await ctx.db.prepare(HOST_RADMIN_SQL).bind().all<HostRadminRow>();
         reply.header('Cache-Control', 'private, no-store');
-        return { hosts: hostRadminIps(rows.results ?? [], (id) => ctx.rooms.get(id)) };
+        return { hosts: hostRadminIps(rows.results ?? [], (id) => ctx.rooms.get(id)), private_rooms: true };
     });
 
     // POST /lobbies — create.

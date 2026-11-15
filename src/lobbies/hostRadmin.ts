@@ -4,15 +4,16 @@
  * the viewer's own internet latency, the same on every row.
  *
  * <p>The address is not new information to anybody who could ask: any signed-in player can join
- * a public room and read every member's `radminIp` in `room_state`. So the rule is the same as
- * for joining — public rooms only — and the route that serves it requires a session, unlike the
- * anonymous `/lobbies` memo.</p>
+ * a public room and read every member's `radminIp` in `room_state`. A room behind a PASSWORD is
+ * included too (2026-11-14, the maintainer's call): its ping is the one thing a player needs to
+ * decide whether to ask for the password, and the address is the host's VPN identity, not the
+ * room's. The route that serves it requires a session, unlike the anonymous `/lobbies` memo, and
+ * the response says `private_rooms: true` so a launcher knows this server includes them.</p>
  *
  * <p>Every clause is a refusal, and the refusals are the point:
- * a private room (behind a password: its members chose who sees them), a tournament room (only
- * its entrants may enter), a room no longer alive, a room with no live instance in memory (the
- * address is only ever held there), and a host who has not reported an address in Radmin's
- * 26.0.0.0/8 range.</p>
+ * a tournament room (only its entrants may enter, and the tournament may be private), a room no
+ * longer alive, a room with no live instance in memory (the address is only ever held there), and
+ * a host who has not reported an address in Radmin's 26.0.0.0/8 range.</p>
  */
 
 /** 26.0.0.0/8 — the Radmin VPN range. The same check `LobbyRoom` applies when it is reported. */
@@ -36,7 +37,7 @@ export interface HostRadminRoom {
 const ALIVE = new Set(['open', 'locked', 'in_game']);
 
 /**
- * The host's Radmin address of every public, live room whose host has reported one, keyed by
+ * The host's Radmin address of every live, non-tournament room whose host has reported one, keyed by
  * lobby id. Pure: the caller hands it the rows and a way to find each live room.
  */
 export function hostRadminIps(
@@ -46,7 +47,6 @@ export function hostRadminIps(
     const hosts: Record<string, string> = {};
     for (const r of rows) {
         if (!ALIVE.has(r.status)) continue;
-        if (r.is_private === 1) continue;
         if (r.tournament_match_id) continue;
         const room = roomOf(r.id);
         if (!room) continue;
@@ -65,6 +65,5 @@ export const HOST_RADMIN_SQL = `
     SELECT id, host_user_id, status, is_private, tournament_match_id
       FROM lobbies
      WHERE status IN ('open', 'locked', 'in_game')
-       AND is_private = 0
        AND tournament_match_id IS NULL
      LIMIT 200`;
