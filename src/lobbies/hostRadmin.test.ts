@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { hostRadminIps, type HostRadminRoom, type HostRadminRow } from './hostRadmin';
+import { HOST_RADMIN_SQL, hostRadminIps, type HostRadminRoom, type HostRadminRow } from './hostRadmin';
 
 /**
  * The rooms list's per-host ping. The address may only reach a player who could have read it by
@@ -27,8 +27,13 @@ test('a public room whose host is on Radmin gives his address', () => {
     assert.deepEqual(got, { A: '26.1.2.3' });
 });
 
-test('a private room never gives its host away', () => {
-    assert.deepEqual(hostRadminIps([row('A', { is_private: 1 })], () => room('26.1.2.3')), {});
+test('a room behind a password gives its host too (2026-11-14)', () => {
+    assert.deepEqual(hostRadminIps([row('A', { is_private: 1 })], () => room('26.1.2.3')), { A: '26.1.2.3' });
+});
+
+test('the query no longer leaves password rooms out, and still leaves tournaments out', () => {
+    assert.doesNotMatch(HOST_RADMIN_SQL, /is_privates*=/);
+    assert.match(HOST_RADMIN_SQL, /tournament_match_id IS NULL/);
 });
 
 test('a tournament room never gives its host away', () => {
