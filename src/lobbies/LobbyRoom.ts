@@ -13,6 +13,7 @@ import { ladderRanks } from '../stats/rest';
 import { normalizeBadgeMode } from '../users/badgeMode';
 import { recordIpHash } from '../lib/ipHash';
 import { ORDINARY_TITLE_MAX } from './create';
+import { applyLanAuto, readLanAuto } from './lanAuto';
 import {
     parseTeam, roomOdds, startRefusal, teamsAtStart, teamsEnforcedFor, validateTeamChange,
     type RoomOdds, type TeamNo,
@@ -155,6 +156,9 @@ interface MemberEntry {
      * map then refuses and the match is reported with no teams, exactly as before.
      */
     ingameName?: string;
+    /** Whether this member's game enters the LAN game by itself (src/lobbies/lanAuto.ts).
+     *  Undefined until announced, and from any launcher older than the frame. */
+    lanAuto?: boolean;
     /** The member's Discord avatar URL, so the roster can show their real photo
      * (read from users.avatar_url on join). Undefined when unknown. */
     avatarUrl?: string;
@@ -398,6 +402,9 @@ class LobbyRoom {
             case 'set_ingame_name':
                 this.handleSetInGameName(attached, f);
                 break;
+            case 'set_lan_auto':
+                this.handleSetLanAuto(attached, f);
+                break;
             case 'set_team':
                 await this.handleSetTeam(ws, ctx, attached, attached.userId, f.team);
                 break;
@@ -563,6 +570,7 @@ class LobbyRoom {
             login,
             radminIp: existing?.radminIp,
             ingameName: existing?.ingameName,
+            lanAuto: existing?.lanAuto,
             avatarUrl: avatarUrl ?? existing?.avatarUrl,
             rating,
             rd,
@@ -846,6 +854,21 @@ class LobbyRoom {
             type: 'member_ingame_name',
             user_id: attached.userId,
             ingame_name: name,
+        }, null);
+    }
+
+    /** A member says whether his game enters the LAN room by itself; see src/lobbies/lanAuto.ts. */
+    private handleSetLanAuto(
+        attached: AttachedSocket,
+        frame: { type: string } & Record<string, unknown>,
+    ): void {
+        const auto = readLanAuto(frame);
+        if (auto === null) return;
+        if (!applyLanAuto(this.members[attached.userId], auto)) return;
+        this.broadcast({
+            type: 'member_lan_auto',
+            user_id: attached.userId,
+            lan_auto: auto,
         }, null);
     }
 
