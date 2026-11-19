@@ -64,6 +64,12 @@ export interface MmStore {
     closeRoom(lobbyId: string): Promise<void>;
     announceSearching(ticket: MmTicket, profile: MmProfile): void;
     withdrawSearching(ticketId: string): void;
+    /**
+     * What a ranked match between the two would be worth to each, as `room_stake` carries it
+     * (src/elo/stake.ts), already hidden where a rating is. Optional: a store without it (the
+     * tests' fakes) proposes exactly as before.
+     */
+    stakes?(a: string, b: string): Promise<Map<string, object>>;
 }
 
 export interface MmTransport {
@@ -420,6 +426,22 @@ export class Matchmaker {
         }
         this.log(`mm: proposed ${p.id} ${players.map((m) => m.userId).join(' vs ')} (${kind}${challenge ? ', challenge' : ''})`);
         this.searchersChanged();
+        // The points at stake follow mm_found in a frame of their own, so proposing stays
+        // synchronous; a launcher that does not know the frame ignores it.
+        if (kind === 'ranked' && this.store.stakes) void this.sendStakes(p);
+    }
+
+    private async sendStakes(p: Proposal): Promise<void> {
+        try {
+            const stakes = await this.store.stakes!(p.players[0]!.userId, p.players[1]!.userId);
+            if (p.settled) return;
+            for (const m of p.players) {
+                const s = stakes.get(m.userId);
+                if (s) this.transport.sendTo(m.userId, { type: 'mm_stake', match_id: p.id, stake: s });
+            }
+        } catch (err) {
+            this.log(`mm: stake for ${p.id} not sent: ${(err as Error).message}`);
+        }
     }
 
     private async resolveDeclined(p: Proposal, decliners: Set<string>, reason: 'declined' | 'timeout' | 'player_left'): Promise<void> {

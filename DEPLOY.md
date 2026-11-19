@@ -251,6 +251,24 @@ All additive, so **deploy the server first**:
   above it, 4-64): 16 by default. **For 32 or 64 places set `MAX_ACTIVE_GAMES=32` or `64`**; an
   existing bigger tournament keeps its size.
 
+### Points at stake, badge progress, the active table, tournament performance (2026-11-18)
+
+Migration **0035** (`match_participants.win_expected`, `rd_before`, both nullable) is applied by
+the restart. Older matches simply have no "why these points" line and use RD 0 in a performance.
+
+- **Points at stake**: `room_stake` frames (only to launchers that announce the `room_stake` hello
+  feature) and `mm_stake` after `mm_found`. Computed by the same function that rates the match
+  (`src/elo/outcome.ts`). Additive: an older launcher never asks for them.
+- **Badge progress**: `next_badge` in the standing. Additive.
+- **Tournament performance**: `performance` on each entrant of the tournament detail, once his run
+  is over. Additive.
+- **The public table lists ACTIVE players only.** Settings: `LADDER_HIDE_INACTIVE` (default
+  `true`), `LADDER_INACTIVE_DAYS` (30), `LADDER_INACTIVE_DAYS_TEAM` (30). **The day this goes live
+  every place and every badge shifts** (the table shrinks to the players with a rated match in the
+  last 30 days), and the badges of the inactive disappear. Release the launcher a day or two FIRST:
+  an older launcher still works, but it explains nothing (no "off the table" card, no hidden count).
+  To undo it at once without a deploy: `LADDER_HIDE_INACTIVE=false` and restart.
+
 ### The launcher redesign (design_base_launcher_2): what this server adds, and the order
 
 Code only: no dependency, no migration (`started_at` is migration 0021, already applied), no

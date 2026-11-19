@@ -20,7 +20,10 @@ import { isInactive, placementRequired } from '../elo/placement';
 import { streakSummary } from '../elo/streaks';
 import { normaliseSqliteTimestamp, sqliteTimestampToMs } from '../lib/time';
 import type { RatingMode } from '../elo/glicko2';
-import { ladderRanks, ladderSize } from './rest';
+import { ladderRanks, ladderSize, ladderRatingAt } from './rest';
+import { nextAgeTarget, type RankAge } from '../elo/ages';
+import { isOffTable } from './ladderActivity';
+import { isRatingPrivate } from '../elo/ratingPrivacy';
 
 /** How many opponents the head-to-head list carries; `head_to_head_total` says how many exist. */
 export const HEAD_TO_HEAD_LIMIT = 50;
@@ -66,6 +69,24 @@ export interface LadderStanding {
     rating_low_at: string | null;
     head_to_head: HeadToHead[];
     head_to_head_total: number;
+    /**
+     * How far this player is from the next badge (2026-11-18): the age one step up, the last place
+     * of it, the places between, and the rating whoever holds that place has now. Only for a
+     * player ON the table, below the top age, and only when the place could be read; omitted
+     * otherwise. Ages are a share of the table, so the threshold is a rating only the server
+     * knows: the launcher draws "N points to Imperial" as `floor_rating + 1 − his rating`, level
+     * on rating not being ahead.
+     */
+    next_badge?: NextBadge;
+    /** 'inactive': placed, but off the public table for want of a rated match (2026-11-18). */
+    off_table?: 'inactive';
+}
+
+export interface NextBadge {
+    age: RankAge;
+    at_rank: number;
+    places: number;
+    floor_rating: number;
 }
 
 export interface RatedRow {
@@ -206,6 +227,21 @@ export async function standingFor(
         })),
         head_to_head_total: h2hTotal?.n ?? 0,
     };
+    if (rank === undefined && eff.games_played >= required && !isRatingPrivate(userId)
+        && isOffTable(sqliteTimestampToMs(last), nowMs, mode)) {
+        standing.off_table = 'inactive';
+    }
+    if (rank && rank > 0 && size) {
+        const target = nextAgeTarget(rank, size);
+        if (target) {
+            const floor = await ladderRatingAt(ctx, mode, target.atRank);
+            if (floor != null) {
+                standing.next_badge = {
+                    age: target.age, at_rank: target.atRank, places: target.places, floor_rating: floor,
+                };
+            }
+        }
+    }
     if (opts.self) {
         standing.placement_results = rows.slice(0, required).map((r) => ({
             match_id: r.match_id,

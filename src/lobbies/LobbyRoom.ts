@@ -9,6 +9,8 @@ import { DEFAULT_RATING, DEFAULT_RD } from '../elo/glicko2';
 import { effectiveRatings } from '../elo/ladder';
 import { isInPlacement } from '../elo/placement';
 import { membersFor, publicRatingsFor } from '../elo/placementPrivacy';
+import { previewOutcomes } from '../elo/ladder';
+import { matchStakes, roomStakeFor, type RoomStake } from '../elo/stake';
 import { ladderRanks } from '../stats/rest';
 import { normalizeBadgeMode } from '../users/badgeMode';
 import { recordIpHash } from '../lib/ipHash';
@@ -292,6 +294,14 @@ class LobbyRoom {
     } | null = null;
     /** The IP hash each socket arrived with, recorded once its hello proves who it is. */
     private pendingIp = new Map<WebSocket, string | null>();
+    /**
+     * The points at stake (src/elo/stake.ts): every recompute bumps this, and an answer that
+     * arrives after a newer one began is dropped, so a slow read never overwrites a fresher one.
+     */
+    private stakeSeq = 0;
+    /** What each player was told at Start (`final`), sent again to a socket that reconnects
+     * mid-match instead of a figure recomputed with the clock moved on. */
+    private stakeAtStart: Map<string, RoomStake> | null = null;
 
     constructor(lobbyId: string, hostUserId: string) {
         this.lobbyId = lobbyId;
@@ -341,6 +351,7 @@ class LobbyRoom {
             this.broadcast({ type: 'member_left', user_id: attached.userId }, ws);
             // One player fewer changes the odds (and may empty a team).
             this.broadcastOdds();
+            if (this.startedAtMs === null) void this.refreshStakes(ctx);
             // An abrupt close (crash / alt-F4 / dropped connection) never hits
             // REST /leave, so do the DB bookkeeping here that /leave normally
             // does — for ANYONE, not just the host: a leftover lobby_members row
@@ -632,6 +643,10 @@ class LobbyRoom {
             team,
         }), ws);
         this.broadcastOdds(ws);
+        // The points at stake: recomputed for everybody while the room waits, the frozen figure
+        // for somebody reconnecting into a match.
+        if (this.startedAtMs === null) void this.refreshStakes(ctx);
+        else this.sendFrozenStake(ws, userId);
     }
 
     // ---------- room teams -----------------------------------------
@@ -685,6 +700,90 @@ class LobbyRoom {
     /** Everyone hears the odds again; called whenever a player arrives, leaves or moves. */
     private broadcastOdds(exclude: WebSocket | null = null): void {
         this.broadcast({ type: 'room_odds', ...this.currentOdds() }, exclude);
+    }
+
+    /**
+     * The two sides a stake can be computed for, or null: a casual room, a 1v1 without exactly
+     * two players, or a team room whose sides are not both full (the figures would change with
+     * every arrival, and the launcher says "once both teams are complete").
+     */
+    private stakeSides(): { mode: 'default' | 'team'; a: string[]; b: string[] } | null {
+        if (!this.info?.competitive) return null;
+        const players = this.playersInRoom();
+        const seats = this.info.playingSeats;
+        if (seats === 2) {
+            if (players.length !== 2) return null;
+            const ids = players.map((p) => p.id).sort();
+            return { mode: 'default', a: [ids[0]!], b: [ids[1]!] };
+        }
+        if (seats !== 4 && seats !== 6) return null;
+        const half = seats / 2;
+        const sideOf = (no: number) => players
+            .filter((p) => (this.info?.sides ? this.info.sides[p.id] : p.team) === no)
+            .map((p) => p.id).sort();
+        const a = sideOf(1);
+        const b = sideOf(2);
+        return a.length === half && b.length === half ? { mode: 'team', a, b } : null;
+    }
+
+    /**
+     * Recompute the points at stake and send each PLAYER his own (`room_stake`), only to sockets
+     * whose launcher announced `room_stake` — an older launcher costs nothing and receives
+     * nothing. Never throws, never blocks: a failed read leaves the launcher on the odds alone.
+     * With `final` (at Start) the figures are kept for the match.
+     */
+    private async refreshStakes(ctx: AppContext, opts: { final?: boolean } = {}): Promise<void> {
+        const seq = ++this.stakeSeq;
+        const sockets = [...this.attached.entries()].filter(([, a]) => a.features.has('room_stake'));
+        if (sockets.length === 0) return;
+        try {
+            await this.loadInfo(ctx);
+            const sides = this.stakeSides();
+            if (!sides) {
+                // Not computable is not hidden: a bare frame clears what the launcher holds.
+                if (seq !== this.stakeSeq) return;
+                for (const [ws] of sockets) this.send(ws, { type: 'room_stake', mode: 'default', seq });
+                return;
+            }
+            const isTournament = !!this.info?.tournamentMatchId;
+            const p = await previewOutcomes(ctx.db, sides.mode, sides.a, sides.b, isTournament);
+            if (seq !== this.stakeSeq) return;
+            const stakes = matchStakes({
+                mode: sides.mode, sideA: p.sideA, sideB: p.sideB, prev: p.prev, atMs: Date.now(), isTournament,
+            });
+            // Hide by the stricter of the join snapshot and the fresh count: fewer games is the
+            // side that hides (still in placement).
+            const players = [...sides.a, ...sides.b].map((id) => {
+                const m = this.members[id];
+                const snap = sides.mode === 'team' ? m?.gamesPlayedTeam : m?.gamesPlayed;
+                const fresh = p.games.get(id);
+                const games = typeof snap === 'number' && typeof fresh === 'number' ? Math.min(snap, fresh) : fresh ?? snap;
+                return { id, gamesPlayed: games };
+            });
+            const opts2 = { tournament: isTournament, final: opts.final, seq };
+            for (const [ws, a] of sockets) {
+                const s = roomStakeFor(a.userId, stakes, players, sides.mode, opts2);
+                this.send(ws, { type: 'room_stake', ...(s ?? { mode: sides.mode, seq }) });
+            }
+            if (opts.final) {
+                const frozen = new Map<string, RoomStake>();
+                for (const { id } of players) {
+                    const s = roomStakeFor(id, stakes, players, sides.mode, opts2);
+                    if (s) frozen.set(id, s);
+                }
+                this.stakeAtStart = frozen;
+            }
+        } catch (err) {
+            console.warn('room stake: could not compute', this.lobbyId, err);
+        }
+    }
+
+    /** A socket that reconnects mid-match gets what its player was told at Start. */
+    private sendFrozenStake(ws: WebSocket, userId: string): void {
+        const a = this.attached.get(ws);
+        if (!a?.features.has('room_stake')) return;
+        const s = this.stakeAtStart?.get(userId);
+        if (s) this.send(ws, { type: 'room_stake', ...s });
     }
 
     /** Whether every PLAYER in the room is connected with a launcher that announced `room_teams`. */
@@ -747,6 +846,7 @@ class LobbyRoom {
         }
         this.broadcast({ type: 'member_team', user_id: targetId, team: team ?? null, by: attached.userId }, null);
         this.broadcastOdds();
+        if (this.startedAtMs === null) void this.refreshStakes(ctx);
     }
 
     private async handleChat(
@@ -986,6 +1086,9 @@ class LobbyRoom {
                                 ended_at = NULL, roster_at_start = ?, teams_at_start = ?
              WHERE id = ?`,
         ).bind(rosterAtStart, teams ? JSON.stringify(teams) : null, this.lobbyId).run();
+        // The figures each player goes in with, BEFORE the countdown: what the result card will
+        // show (src/elo/stake.ts). Never blocks Start: refreshStakes cannot throw.
+        await this.refreshStakes(ctx, { final: true });
         this.startedAtMs = Date.now();
         const startsAtMs = this.startedAtMs + LobbyRoom.COUNTDOWN_MS;
         this.broadcast({
@@ -1020,6 +1123,8 @@ class LobbyRoom {
             return;
         }
         this.startedAtMs = null;
+        this.stakeAtStart = null;
+        void this.refreshStakes(ctx);
         // `started_at` is KEPT — see migration 0021. Every later question about the match
         // (a walkout's verdict, a guest's late `game_exited`) needs it; `ended_at` is what
         // says the match is over, and handleStart clears it when the room starts again.
@@ -1054,6 +1159,8 @@ class LobbyRoom {
         }
         if (this.startedAtMs == null) return;   // no match running — nothing to reset
         this.startedAtMs = null;
+        this.stakeAtStart = null;
+        void this.refreshStakes(ctx);
         // `started_at` is KEPT — see migration 0021 and handleCancelGame.
         await ctx.db.prepare(
             `UPDATE lobbies SET status = 'open', ended_at = datetime('now') WHERE id = ?`,

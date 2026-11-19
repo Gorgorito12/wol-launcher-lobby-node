@@ -251,12 +251,16 @@ export interface ResultParticipant {
 export function resultParticipantsFor<T extends ResultParticipant>(list: readonly T[], recipientId: string | null): T[] {
     return list.map((p) => {
         if (recipientId != null && recipientId === p.user_id) return p;
-        if (isRatingPrivate(p.user_id)) return without(p, ['rating_before', 'rating_after', 'rd_before', 'rd_after']);
+        // The pre-match percentage (win_expected) is its owner's alone: ratingExtras only ever
+        // adds it when nobody else was hidden, and here it never reaches anybody else.
+        if (isRatingPrivate(p.user_id)) return without(p, ['rating_before', 'rating_after', 'rd_before', 'rd_after', 'win_expected']);
         const played = p.placement_played;
         const required = p.placement_required;
         const placing = typeof played === 'number' && typeof required === 'number'
             && played > 0 && played < required;
-        return placing ? without(p, ['rating_before', 'rating_after', 'rd_before', 'rd_after']) : p;
+        return without(p, placing
+            ? ['rating_before', 'rating_after', 'rd_before', 'rd_after', 'win_expected']
+            : ['win_expected']);
     });
 }
 

@@ -19,12 +19,12 @@
 import type { Db } from '../db';
 import { sqliteTimestampToMs } from '../lib/time';
 import {
-    applyLimits, decayRd, DEFAULT_RATING, DEFAULT_RD, DEFAULT_VOLATILITY, rateSides,
+    decayRd, DEFAULT_RATING, DEFAULT_RD, DEFAULT_VOLATILITY,
     type RatingMode, type SidePlayer,
 } from './glicko2';
-import { antifarmStep, matchupKey, sideKey, type FarmLink } from './antifarm';
+import { type FarmLink } from './antifarm';
 import { refundTotals, type RefundLossRow } from './refunds';
-import { WIN_AT } from './ratability';
+import { matchupOf, rateOutcome } from './outcome';
 
 /** What a player is worth on one ladder at one instant. */
 export interface EffectiveRating {
@@ -106,6 +106,8 @@ export interface PlayerChange {
     rdAfter: number;
     /** Rated matches on this ladder INCLUDING this one. */
     gamesAfter: number;
+    /** His side's chance of winning, 1-99, from the ratings before the match. */
+    winExpected: number | null;
 }
 
 export interface RatedMatch {
@@ -142,14 +144,35 @@ export function sidesOf(
     return [a!, b!];
 }
 
+/**
+ * Which earlier matches the anti-farm chain reads — ONE filter, shared by the engine
+ * ({@link PREV_MATCHUP_SQL}) and the pre-match stake ({@link LATEST_MATCHUP_SQL}) so the two
+ * cannot drift. Binds: the matchup key.
+ */
+export const MATCHUP_CHAIN_WHERE =
+    `matchup_key = ? AND rated = 1 AND elo_factor IS NOT NULL AND tournament_match_id IS NULL`;
+
 /** The previous rated, non-tournament match of the same matchup, strictly before this one. */
 export const PREV_MATCHUP_SQL =
     `SELECT created_at, farm_streak, farm_winner_key FROM matches
-      WHERE matchup_key = ? AND rated = 1 AND elo_factor IS NOT NULL
-        AND tournament_match_id IS NULL AND id <> ?
+      WHERE ${MATCHUP_CHAIN_WHERE} AND id <> ?
         AND (created_at < ? OR (created_at = ? AND id < ?))
       ORDER BY created_at DESC, id DESC
       LIMIT 1`;
+
+/** The latest one: what a match played NOW would follow (the stake). */
+export const LATEST_MATCHUP_SQL =
+    `SELECT created_at, farm_streak, farm_winner_key FROM matches
+      WHERE ${MATCHUP_CHAIN_WHERE}
+      ORDER BY created_at DESC, id DESC
+      LIMIT 1`;
+
+type ChainRow = { created_at: string; farm_streak: number | null; farm_winner_key: string | null };
+
+function farmLinkOf(row: ChainRow | null | undefined): FarmLink | null {
+    const at = sqliteTimestampToMs(row?.created_at ?? null);
+    return row && at !== null ? { atMs: at, streak: row.farm_streak ?? 0, winnerKey: row.farm_winner_key } : null;
+}
 
 export const UPSERT_RATING_SQL =
     `INSERT INTO player_ratings
@@ -192,58 +215,83 @@ export async function rateStoredMatch(db: Db, matchId: string, mode: RatingMode)
     const current = await effectiveRatings(db, ids, mode, atMs);
 
     const [sideA, sideB] = sides;
-    const scoreA = sideA[0]!.result;
-    const scoreB = sideB[0]!.result;
-    const keyA = sideKey(sideA.map((p) => p.user_id));
-    const keyB = sideKey(sideB.map((p) => p.user_id));
-    const winnerKey = scoreA >= WIN_AT ? keyA : scoreB >= WIN_AT ? keyB : null;
-    const mKey = matchupKey(mode, [sideA.map((p) => p.user_id), sideB.map((p) => p.user_id)]);
     const isTournament = !!match.tournament_match_id;
-
-    let prev: FarmLink | null = null;
-    if (!isTournament) {
-        const row = await db.prepare(PREV_MATCHUP_SQL)
-            .bind(mKey, matchId, match.created_at, match.created_at, matchId)
-            .first<{ created_at: string; farm_streak: number | null; farm_winner_key: string | null }>();
-        const prevAt = sqliteTimestampToMs(row?.created_at ?? null);
-        if (row && prevAt !== null) {
-            prev = { atMs: prevAt, streak: row.farm_streak ?? 0, winnerKey: row.farm_winner_key };
-        }
-    }
-    const farm = antifarmStep(prev, { atMs, winnerKey, isTournament });
-
     const toSide = (rows: ParticipantRow[]): SidePlayer[] => rows.map((p) => {
         const e = current.get(p.user_id)!;
         return { id: p.user_id, rating: e.rating, rd: e.rd, volatility: e.volatility };
     });
-    const raw = rateSides(
-        { players: toSide(sideA), score: scoreA },
-        { players: toSide(sideB), score: scoreB },
-    );
+    const playersA = toSide(sideA);
+    const playersB = toSide(sideB);
+    const mKey = matchupOf(mode, playersA, playersB);
+
+    let prev: FarmLink | null = null;
+    if (!isTournament) {
+        prev = farmLinkOf(await db.prepare(PREV_MATCHUP_SQL)
+            .bind(mKey, matchId, match.created_at, match.created_at, matchId)
+            .first<ChainRow>());
+    }
+
+    // The pure core, shared with the pre-match stake (src/elo/outcome.ts, src/elo/stake.ts).
+    const outcome = rateOutcome({
+        mode, sideA: playersA, sideB: playersB,
+        scoreA: sideA[0]!.result, scoreB: sideB[0]!.result,
+        prev, atMs, isTournament,
+    });
 
     const perPlayer = new Map<string, PlayerChange>();
     const writes = [];
     for (const id of ids) {
         const e = current.get(id)!;
-        const r = raw.get(id)!;
-        const after = applyLimits(e.rating, r.rating, farm.factor);
+        const o = outcome.perPlayer.get(id)!;
         perPlayer.set(id, {
-            before: e.rating, after, rdBefore: e.rd, rdAfter: r.rd, gamesAfter: e.games_played + 1,
+            before: o.before, after: o.after, rdBefore: o.rdBefore, rdAfter: o.rdAfter,
+            gamesAfter: e.games_played + 1, winExpected: o.winExpected,
         });
         writes.push(db.prepare(UPSERT_RATING_SQL)
-            .bind(id, mode, after, r.rd, r.volatility, match.created_at));
+            .bind(id, mode, o.after, o.rdAfter, o.volatilityAfter, match.created_at));
         writes.push(db.prepare(
-            `UPDATE match_participants SET rating_before = ?, rating_after = ?
+            `UPDATE match_participants SET rating_before = ?, rating_after = ?, win_expected = ?, rd_before = ?
               WHERE match_id = ? AND user_id = ?`,
-        ).bind(e.rating, after, matchId, id));
+        ).bind(o.before, o.after, o.winExpected, o.rdBefore, matchId, id));
     }
     writes.push(db.prepare(
         `UPDATE matches SET elo_factor = ?, farm_streak = ?, farm_winner_key = ?, matchup_key = ?
           WHERE id = ?`,
-    ).bind(farm.factor, farm.streak, winnerKey, mKey, matchId));
+    ).bind(outcome.factor, outcome.streak, outcome.winnerKey, mKey, matchId));
     await db.batch(writes);
 
-    return { eloFactor: farm.factor, farmStreak: farm.streak, matchupKey: mKey, perPlayer };
+    return { eloFactor: outcome.factor, farmStreak: outcome.streak, matchupKey: mKey, perPlayer };
+}
+
+/**
+ * What a match between these two sides would do to each player if it were played NOW, both ways
+ * (src/elo/stake.ts). Reads only — fresh effective ratings (RD grown to now, volatility included)
+ * and the anti-farm chain with the engine's own filter — and takes no ladder lock, like every
+ * other reader.
+ */
+export async function previewOutcomes(
+    db: Db,
+    mode: RatingMode,
+    sideAIds: readonly string[],
+    sideBIds: readonly string[],
+    isTournament: boolean,
+    atMs: number = Date.now(),
+): Promise<{ sideA: SidePlayer[]; sideB: SidePlayer[]; prev: FarmLink | null; games: Map<string, number> }> {
+    const current = await effectiveRatings(db, [...sideAIds, ...sideBIds], mode, atMs);
+    const toSide = (ids: readonly string[]): SidePlayer[] => ids.map((id) => {
+        const e = current.get(id)!;
+        return { id, rating: e.rating, rd: e.rd, volatility: e.volatility };
+    });
+    const sideA = toSide(sideAIds);
+    const sideB = toSide(sideBIds);
+    let prev: FarmLink | null = null;
+    if (!isTournament) {
+        prev = farmLinkOf(await db.prepare(LATEST_MATCHUP_SQL)
+            .bind(matchupOf(mode, sideA, sideB)).first<ChainRow>());
+    }
+    const games = new Map<string, number>();
+    for (const [id, e] of current) games.set(id, e.games_played);
+    return { sideA, sideB, prev, games };
 }
 
 // ---------------------------------------------------------------- ban refunds

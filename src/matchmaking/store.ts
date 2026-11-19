@@ -3,7 +3,8 @@
  * and Discord. Kept apart from Matchmaker.ts so that file can be driven by a test with a fake.
  */
 import type { AppContext } from '../context';
-import { effectiveRatings } from '../elo/ladder';
+import { effectiveRatings, previewOutcomes } from '../elo/ladder';
+import { matchStakes, roomStakeFor } from '../elo/stake';
 import { isInPlacement } from '../elo/placement';
 import { isRankedMod } from '../elo/ratability';
 import { badgeModes } from '../users/badgeMode';
@@ -24,6 +25,19 @@ export function matchedRoomTitle(names: readonly string[], kind: MmPlayKind): st
 
 export function dbStore(ctx: AppContext): MmStore {
     return {
+        async stakes(a: string, b: string): Promise<Map<string, object>> {
+            const p = await previewOutcomes(ctx.db, 'default', [a], [b], false);
+            const stakes = matchStakes({
+                mode: 'default', sideA: p.sideA, sideB: p.sideB, prev: p.prev, atMs: Date.now(), isTournament: false,
+            });
+            const players = [a, b].map((id) => ({ id, gamesPlayed: p.games.get(id) }));
+            const out = new Map<string, object>();
+            for (const id of [a, b]) {
+                const s = roomStakeFor(id, stakes, players, 'default', { tournament: false });
+                if (s) out.set(id, s);
+            }
+            return out;
+        },
         async playerState(userId: string): Promise<MmPlayerState> {
             const row = await ctx.db.prepare(
                 `SELECT l.status AS status FROM lobby_members m JOIN lobbies l ON l.id = m.lobby_id

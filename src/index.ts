@@ -21,6 +21,7 @@ import { registerDiscordAuth } from './auth/discord';
 import { registerSessionRefresh } from './auth/session';
 import { registerLobbiesRest } from './lobbies/rest';
 import { configure as configureDiscordAnnounce } from './lobbies/discordAnnounce';
+import { configureLadderActivity } from './stats/ladderActivity';
 import { scheduleOrphanLobbySweep } from './lobbies/orphanSweep';
 import { registerMatchesRest } from './matches/rest';
 import { registerMatchesBrowse } from './matches/browse';
@@ -75,6 +76,9 @@ async function main(): Promise<void> {
     // The db is what lets it rehydrate an announcement posted by a PREVIOUS
     // process (see discordAnnounce's ensureState).
     configureDiscordAnnounce(config, app.log, db);
+    configureLadderActivity({
+        hide: config.ladderHideInactive, days: config.ladderInactiveDays, daysTeam: config.ladderInactiveDaysTeam,
+    });
 
     // The quick-match queue (src/matchmaking). Its frames ride the global socket; its log lines
     // go to the server log so a match that never formed can be traced.

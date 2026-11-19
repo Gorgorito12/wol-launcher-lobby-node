@@ -95,7 +95,7 @@ export async function recomputeLadder(db: Db, _opts: ReplayOptions = {}): Promis
 
         await db.prepare(`DELETE FROM player_ratings`).bind().run();
         await db.prepare(
-            `UPDATE match_participants SET rating_before = NULL, rating_after = NULL`,
+            `UPDATE match_participants SET rating_before = NULL, rating_after = NULL, win_expected = NULL, rd_before = NULL`,
         ).bind().run();
         // Clearing elo_factor is what makes the anti-farm lookup see ONLY matches already
         // replayed: it asks for `elo_factor IS NOT NULL`.

@@ -11,7 +11,7 @@
  */
 import type { AppContext } from '../context';
 import { placementRequired } from '../elo/placement';
-import { LADDER_WHERE } from '../stats/rest';
+import { LADDER_WHERE, ladderBinds } from '../stats/rest';
 
 export const BADGE_MODES = ['highest', '1v1', 'team'] as const;
 export type BadgeMode = (typeof BADGE_MODES)[number];
@@ -63,7 +63,7 @@ export function teamBadgeEligibleSql(): string {
 
 export async function hasTeamPlace(ctx: AppContext, userId: string): Promise<boolean> {
     const row = await ctx.db.prepare(teamBadgeEligibleSql())
-        .bind('team', placementRequired('team'), userId)
+        .bind(...ladderBinds('team'), userId)
         .first<{ ok: number }>();
     return !!row;
 }
