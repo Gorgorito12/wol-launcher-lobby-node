@@ -1,3 +1,4 @@
+import { ACTIVITY_CLAUSE, activityBinds, inactiveDays, ladderActivity } from './ladderActivity';
 import type { FastifyInstance } from 'fastify';
 import { chargeIpQuota, ipRateLimit, userRateLimit, Limits } from '../middleware/rateLimit';
 import { requireAuth } from '../middleware/auth';
@@ -68,11 +69,37 @@ export const LADDER_ORDER_BY = 'e.rating DESC, e.user_id ASC';
 export const LADDER_WHERE = `WHERE e.mode = ?
            AND u.is_banned = 0
            AND u.rating_private = 0
-           AND e.games_played >= ?`;
+           AND e.games_played >= ?
+           AND ${ACTIVITY_CLAUSE}`;
 
-/** The two values {@link LADDER_WHERE} binds, for one ladder. */
-export function ladderBinds(mode: 'default' | 'team'): [string, number] {
-    return [mode, placementRequired(mode)];
+/**
+ * The values {@link LADDER_WHERE} binds, for one ladder: the mode, its placement requirement,
+ * then the activity rule's two (src/stats/ladderActivity.ts). Every ranked query spreads THIS, so
+ * a place, the table and its size cannot filter differently.
+ */
+export function ladderBinds(mode: 'default' | 'team'): [string, number, number, string] {
+    return [mode, placementRequired(mode), ...activityBinds(mode)];
+}
+
+/**
+ * Placed players hidden from a ladder's table for inactivity right now — the "· 12 inactive,
+ * not shown" of the table's summary. 0 when hiding is off.
+ */
+export async function inactiveHiddenCount(ctx: AppContext, mode: 'default' | 'team'): Promise<number> {
+    if (!ladderActivity().hide) return 0;
+    try {
+        const row = await ctx.db.prepare(
+            `SELECT COUNT(*) AS n
+               FROM player_ratings e
+               JOIN users u ON u.id = e.user_id
+              WHERE e.mode = ? AND u.is_banned = 0 AND u.rating_private = 0
+                AND e.games_played >= ?
+                AND NOT ${ACTIVITY_CLAUSE}`,
+        ).bind(mode, placementRequired(mode), ...activityBinds(mode)).first<{ n: number }>();
+        return row?.n ?? 0;
+    } catch {
+        return 0;
+    }
 }
 
 /**
@@ -118,8 +145,14 @@ export async function ladderRanks(
         const rows = await ctx.db.prepare(ladderRankSql(unique.length))
             .bind(...ladderBinds(mode), ...unique)
             .all<{ user_id: string; ladder_pos: number }>();
-        // A private rating has no place and no badge, not the lowest one: absent, never 0.
-        for (const id of unique) if (!isRatingPrivate(id)) out.set(id, 0);
+        // A placed player who is NOT on the table — inactive (2026-11-18) — has no place and no
+        // badge, not the lowest one: absent, like a private rating. 0 stays "below the entry bar".
+        const ids = unique.map(() => '?').join(', ');
+        const placed = await ctx.db.prepare(
+            `SELECT user_id FROM player_ratings WHERE mode = ? AND games_played >= ? AND user_id IN (${ids})`,
+        ).bind(mode, placementRequired(mode), ...unique).all<{ user_id: string }>();
+        const placedIds = new Set((placed.results ?? []).map((r) => r.user_id));
+        for (const id of unique) if (!isRatingPrivate(id) && !placedIds.has(id)) out.set(id, 0);
         for (const r of rows.results ?? []) out.set(r.user_id, r.ladder_pos);
     } catch {
         out.clear();
@@ -694,8 +727,9 @@ async function placementLadder(ctx: AppContext, mode: 'default' | 'team', limit:
            FROM player_ratings e
            JOIN users u ON u.id = e.user_id
           WHERE e.mode = ? AND u.is_banned = 0
-            AND e.games_played > 0 AND e.games_played < ?`,
-    ).bind(...ladderBinds(mode)).all<{
+            AND e.games_played > 0 AND e.games_played < ?
+            AND ${ACTIVITY_CLAUSE}`,
+    ).bind(mode, placementRequired(mode), ...activityBinds(mode)).all<{
         user_id: string; discord_username: string; display_name: string; avatar_url: string | null;
         games_played: number; last_rated_at: string | null;
     }>();
@@ -721,8 +755,9 @@ async function placementLadder(ctx: AppContext, mode: 'default' | 'team', limit:
 async function placementSize(ctx: AppContext, mode: 'default' | 'team'): Promise<number> {
     const row = await ctx.db.prepare(
         `SELECT COUNT(*) AS n FROM player_ratings e JOIN users u ON u.id = e.user_id
-          WHERE e.mode = ? AND u.is_banned = 0 AND e.games_played > 0 AND e.games_played < ?`,
-    ).bind(...ladderBinds(mode)).first<{ n: number }>();
+          WHERE e.mode = ? AND u.is_banned = 0 AND e.games_played > 0 AND e.games_played < ?
+            AND ${ACTIVITY_CLAUSE}`,
+    ).bind(mode, placementRequired(mode), ...activityBinds(mode)).first<{ n: number }>();
     return row?.n ?? 0;
 }
 
@@ -741,6 +776,32 @@ async function cachedHighlights(nowMs: number): Promise<{ current: Highlights; p
         ]);
         highlightsCache = { at: nowMs, current, payload: { current: cur, previous: prev } };
         return highlightsCache.payload;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * The rating of whoever stands at a 1-based place on a ladder, by the list's own WHERE and order,
+ * or null when the place is empty or the read fails. What "N points to the next badge" is measured
+ * against (src/stats/standing.ts).
+ */
+export async function ladderRatingAt(
+    ctx: AppContext,
+    mode: 'default' | 'team',
+    position: number,
+): Promise<number | null> {
+    if (!(position >= 1)) return null;
+    try {
+        const row = await ctx.db.prepare(
+            `SELECT e.rating AS rating
+             FROM player_ratings e
+             JOIN users u ON u.id = e.user_id
+             ${LADDER_WHERE}
+             ORDER BY ${LADDER_ORDER_BY}
+             LIMIT 1 OFFSET ?`,
+        ).bind(...ladderBinds(mode), position - 1).first<{ rating: number }>();
+        return row?.rating ?? null;
     } catch {
         return null;
     }
@@ -858,7 +919,8 @@ export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
             // throw on the whole payload.
             const [leaderboard, leaderboard_team, ranked_players, ranked_players_team,
                 leaderboard_placement, leaderboard_team_placement,
-                placement_players, placement_players_team] =
+                placement_players, placement_players_team,
+                inactive_hidden, inactive_hidden_team] =
                 await Promise.all([
                     ladder(ctx, 'default', limit),
                     ladder(ctx, 'team', limit),
@@ -868,6 +930,8 @@ export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
                     placementLadder(ctx, 'team', MAX_LIMIT),
                     placementSize(ctx, 'default'),
                     placementSize(ctx, 'team'),
+                    inactiveHiddenCount(ctx, 'default'),
+                    inactiveHiddenCount(ctx, 'team'),
                 ]);
             // Without the top lists: every launcher asks for this payload once a minute, and only
             // the ranking's Highlights view needs them (GET /stats/highlights).
@@ -1054,6 +1118,12 @@ export function registerStatsRest(app: FastifyInstance, ctx: AppContext): void {
                 // reads these; a launcher older than them shows the rank alone.
                 ranked_players,
                 ranked_players_team,
+                // Placed players hidden for inactivity (2026-11-18), and after how many days.
+                // Omitted while hiding is off, so the launcher says nothing.
+                ...(ladderActivity().hide ? {
+                    inactive_hidden, inactive_hidden_team,
+                    inactive_days: inactiveDays('default'), inactive_days_team: inactiveDays('team'),
+                } : {}),
                 // The players still being placed, most matches first, then by name. Never their
                 // results: other players see only their progress.
                 leaderboard_placement,

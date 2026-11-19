@@ -8,7 +8,10 @@ import { Matchmaker, type MmClock, type MmPenalty, type MmStore, type MmTranspor
 
 interface Frame { type: string; [k: string]: unknown }
 
-function harness(opts: { ratings?: Record<string, number>; placing?: string[]; inRoom?: string[]; unranked?: string[] } = {}) {
+function harness(opts: {
+    ratings?: Record<string, number>; placing?: string[]; inRoom?: string[]; unranked?: string[];
+    stakes?: (a: string, b: string) => Promise<Map<string, object>>;
+} = {}) {
     let now = 1_000_000;
     let seq = 0;
     const timers = new Map<number, { at: number; fn: () => void }>();
@@ -67,6 +70,7 @@ function harness(opts: { ratings?: Record<string, number>; placing?: string[]; i
         closeRoom: async (id) => { const r = rooms.find((x) => x.lobbyId === id); if (r) r.status = 'closed'; },
         announceSearching: (t) => { announced.push(t.userId); },
         withdrawSearching: (id) => { withdrawn.push(id); },
+        ...(opts.stakes ? { stakes: opts.stakes } : {}),
     };
     const mm = new Matchmaker(store, transport, clock);
     const last = (u: string, type: string) => [...(inbox.get(u) ?? [])].reverse().find((f) => f.type === type);
@@ -262,4 +266,49 @@ test('everybody who speaks the feature hears that the list changed', async () =>
     const f = h.broadcasts.at(-1)!;
     assert.equal(f.type, 'mm_searchers_changed');
     assert.equal((f.searchers as unknown[]).length, 1);
+});
+
+test('a ranked match sends each player his own stake right after mm_found', async () => {
+    const asked: string[] = [];
+    const h = harness({
+        stakes: async (a, b) => {
+            asked.push(`${a}|${b}`);
+            return new Map<string, object>([[a, { mode: 'default', before: 1500, win_after: 1510, loss_after: 1490 }],
+                [b, { mode: 'default', hidden_reason: 'placement' }]]);
+        },
+    });
+    await h.join('a');
+    await h.join('b');
+    await h.flush();
+    const fa = h.last('a', 'mm_found')!;
+    const sa = h.last('a', 'mm_stake')!;
+    const sb = h.last('b', 'mm_stake')!;
+    assert.equal(sa.match_id, fa.match_id);
+    assert.equal((sa.stake as { win_after?: number }).win_after, 1510);
+    assert.equal((sb.stake as { hidden_reason?: string }).hidden_reason, 'placement');
+    assert.equal(asked.length, 1);
+});
+
+test('a casual match, or a store without stakes, sends no stake and proposes as before', async () => {
+    const h = harness({ stakes: async () => new Map([['a', { mode: 'default' }]]) });
+    await h.join('a', { kind: 'casual' });
+    await h.join('b', { kind: 'casual' });
+    await h.flush();
+    assert.ok(h.last('a', 'mm_found'));
+    assert.equal(h.last('a', 'mm_stake'), undefined);
+
+    const plain = harness();
+    await plain.join('a');
+    await plain.join('b');
+    assert.ok(plain.last('a', 'mm_found'), 'proposed at once');
+    assert.equal(plain.last('a', 'mm_stake'), undefined);
+});
+
+test('a stake that fails to compute never stops the proposal', async () => {
+    const h = harness({ stakes: async () => { throw new Error('db down'); } });
+    await h.join('a');
+    await h.join('b');
+    await h.flush();
+    assert.ok(h.last('a', 'mm_found'));
+    assert.equal(h.last('a', 'mm_stake'), undefined);
 });

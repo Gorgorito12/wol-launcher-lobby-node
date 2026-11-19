@@ -39,6 +39,7 @@
  * is short, and a team match moves the bracket only once the other side has corroborated it
  * (see advance.ts and reportVerdict.ts).
  */
+import { entrantPerformances } from './performanceDetail';
 import type { FastifyInstance } from 'fastify';
 import { Errors, HttpError } from '../lib/errors';
 import { uuid, shortId } from '../lib/ids';
@@ -1141,6 +1142,8 @@ async function buildDetail(ctx: AppContext, id: string): Promise<unknown> {
     const owner = await ctx.db.prepare(
         `SELECT avatar_url FROM users WHERE id = ?`,
     ).bind(t.owner_user_id).first<{ avatar_url: string | null }>();
+    // The level each entrant played at, once his run is over (src/tournaments/performanceDetail.ts).
+    const performances = await entrantPerformances(ctx, t, bracket, entrants, rosters);
 
     const lobbies = new Map<string, { id: string; host_user_id: string; status: string }>();
     for (const m of bracket) {
@@ -1208,6 +1211,8 @@ async function buildDetail(ctx: AppContext, id: string): Promise<unknown> {
             // the arrival of `top_maps`.
             member_ids: (rosters.get(e.id) ?? []).map((m) => m.user_id),
             members: (rosters.get(e.id) ?? []).map(withRank),
+            // Additive: an older launcher ignores it.
+            ...(performances.has(e.id) ? { performance: performances.get(e.id) } : {}),
         })),
         matches: bracket.map((m) => ({
             id: m.id,

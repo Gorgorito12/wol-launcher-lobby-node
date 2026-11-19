@@ -140,6 +140,9 @@ export interface Config {
     ipHashSecret: string;
     /** Under this many seconds a match is "very short" for the new-account rule and the alerts. */
     newAccountShortMatchSeconds: number;
+    ladderHideInactive: boolean;
+    ladderInactiveDays: number;
+    ladderInactiveDaysTeam: number;
     /** Alert the operator when one side has beaten the same opponent this many times in a row. */
     alertFarmStreak: number;
     /** …or when a pair has played this many very short matches within the window below. */
@@ -315,6 +318,10 @@ export function loadConfig(): Config {
 
         ipHashSecret: strEnv('IP_HASH_SECRET', ''),
         newAccountShortMatchSeconds: intEnv('NEW_ACCOUNT_SHORT_MATCH_SECONDS', 600),
+        // The public table lists active players only (src/stats/ladderActivity.ts).
+        ladderHideInactive: strEnv('LADDER_HIDE_INACTIVE', 'true').toLowerCase() !== 'false',
+        ladderInactiveDays: intEnv('LADDER_INACTIVE_DAYS', 30),
+        ladderInactiveDaysTeam: intEnv('LADDER_INACTIVE_DAYS_TEAM', 30),
         alertFarmStreak: intEnv('ALERT_FARM_STREAK', 5),
         alertShortMatches: intEnv('ALERT_SHORT_MATCHES', 3),
         alertShortWindowDays: intEnv('ALERT_SHORT_WINDOW_DAYS', 7),

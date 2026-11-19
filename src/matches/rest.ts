@@ -168,8 +168,14 @@ async function ratingExtras(
     const required = placementRequired(mode);
     const completed = [...rated.perPlayer].filter(([, c]) => c.gamesAfter === required).map(([id]) => id);
     const ranks = completed.length ? await ladderRanks(ctx, completed, mode) : new Map<string, number>();
+    // A percentage gives the other side's rating back (it is computed from both), so it goes to
+    // its owner only and never while another participant is hidden from him after this match —
+    // being placed, or a private rating — exactly when resultParticipantsFor hides that rating.
+    const hiddenAfter = (id: string, c: { gamesAfter: number }) =>
+        isRatingPrivate(id) || (c.gamesAfter > 0 && c.gamesAfter < required);
     for (const [id, c] of rated.perPlayer) {
         const done = c.gamesAfter === required;
+        const otherHidden = [...rated.perPlayer].some(([o, oc]) => o !== id && hiddenAfter(o, oc));
         perUser.set(id, {
             rd_before: c.rdBefore,
             rd_after: c.rdAfter,
@@ -177,6 +183,7 @@ async function ratingExtras(
             placement_required: required,
             placement_completed: done,
             entered_rank: done ? (ranks.get(id) ?? null) : null,
+            ...(c.winExpected !== null && !otherHidden ? { win_expected: c.winExpected } : {}),
         });
     }
     return { top, perUser };

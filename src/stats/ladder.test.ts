@@ -52,16 +52,17 @@ test('nobody with no rated match is listed anywhere', () => {
     assert.equal(isInPlacement(1, 'default'), true, 'the very first match starts placement');
 });
 
-test('the ladder and its size ask the same question, bound mode then requirement', () => {
+test('the ladder and its size ask the same question, bound mode, requirement, then activity', () => {
     assert.match(LADDER_WHERE.trim(), /^WHERE/);
     assert.match(LADDER_WHERE, /e\.mode\s*=\s*\?/);
     assert.match(LADDER_WHERE, /u\.is_banned\s*=\s*0/);
     assert.match(LADDER_WHERE, /e\.games_played\s*>=\s*\?/);
-    assert.equal((LADDER_WHERE.match(/\?/g) ?? []).length, 2);
-    assert.deepEqual(ladderBinds('default'), ['default', 10]);
-    assert.deepEqual(ladderBinds('team'), ['team', 5]);
-    // Inactive players are NOT filtered out: they keep their place.
-    assert.doesNotMatch(LADDER_WHERE, /last_rated_at/);
+    // Since 2026-11-18 the table lists ACTIVE players only (src/stats/ladderActivity.ts): the
+    // binds are the mode, the requirement, then the activity rule's switch and its days.
+    assert.match(LADDER_WHERE, /last_rated_at/);
+    assert.equal((LADDER_WHERE.match(/\?/g) ?? []).length, ladderBinds('default').length);
+    assert.deepEqual(ladderBinds('default'), ['default', 10, 1, '-30 days']);
+    assert.deepEqual(ladderBinds('team'), ['team', 5, 1, '-30 days']);
 });
 
 test("the room's position and the table's are the same query", () => {

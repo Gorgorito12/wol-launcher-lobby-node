@@ -57,3 +57,15 @@ test('a room with a private player shows no odds', () => {
     assert.equal(odds.players, null);
     assert.equal(odds.hidden_reason, 'private');
 });
+
+test('THE ONE THAT MATTERS: win_expected belongs to its owner alone — no other recipient ever gets it', () => {
+    const list = [
+        { user_id: 'a', rating_before: 1600, rating_after: 1610, win_expected: 72, placement_played: 10, placement_required: 10 },
+        { user_id: 'b', rating_before: 1500, rating_after: 1490, win_expected: 28, placement_played: 10, placement_required: 10 },
+    ];
+    const forA = resultParticipantsFor(list, 'a') as Array<Record<string, unknown>>;
+    assert.equal(forA[0]!.win_expected, 72);
+    assert.equal('win_expected' in forA[1]!, false);
+    const forNobody = resultParticipantsFor(list, null) as Array<Record<string, unknown>>;
+    assert.ok(forNobody.every((p) => !('win_expected' in p)));
+});
