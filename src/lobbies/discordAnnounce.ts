@@ -1,3 +1,4 @@
+import { gameRulesLabel } from './gameRules';
 import { fetch } from 'undici';
 import { normaliseSqliteTimestamp } from '../lib/time';
 import { modIdInList, modsForWebhook } from '../lib/modIds';
@@ -166,6 +167,8 @@ interface RoomAnnounceState {
      * from the embed on the very next edit.
      */
     competitive: boolean;
+    /** The room's Game Rules, fixed at creation; read back in rehydrate for the same reason. */
+    gameRules: number;
     createdAt: string;
     targets: Target[];
     /** players+status of the last render, to skip no-op edits. */
@@ -230,6 +233,7 @@ export interface NewRoom {
     hostName: string;
     hostAvatar?: string | null;
     competitive?: boolean;
+    gameRules?: number;
 }
 
 /**
@@ -261,6 +265,7 @@ export async function announceLobbyCreated(room: NewRoom): Promise<void> {
         players: 1,
         status: 'open',
         competitive: room.competitive === true,
+        gameRules: room.gameRules ?? 0,
         createdAt: new Date().toISOString(),
         targets: [],
         lastKey: '',
@@ -367,7 +372,7 @@ async function rehydrate(lobbyId: string): Promise<RoomAnnounceState | null> {
             // The COALESCE is what makes it safe for rooms opened before migration 0010: their
             // created_by is NULL and they fall back to exactly the old behaviour.
             `SELECT l.id, l.title, l.mod_id, l.max_players, l.current_players, l.status,
-                    l.competitive, l.created_at, l.discord_targets,
+                    l.competitive, l.game_rules, l.created_at, l.discord_targets,
                     u.display_name, u.discord_username, u.avatar_url
              FROM lobbies l JOIN users u ON u.id = COALESCE(l.created_by, l.host_user_id)
              WHERE l.id = ?`,
@@ -379,6 +384,7 @@ async function rehydrate(lobbyId: string): Promise<RoomAnnounceState | null> {
             current_players: number;
             status: string;
             competitive: number;
+            game_rules: number | null;
             created_at: string;
             discord_targets: string | null;
             display_name: string | null;
@@ -413,6 +419,7 @@ async function rehydrate(lobbyId: string): Promise<RoomAnnounceState | null> {
                 : row.status === 'closed' ? 'closed'
                     : 'open') as RoomStatus,
             competitive: row.competitive === 1,
+            gameRules: row.game_rules ?? 0,
             createdAt,
             targets,
             lastKey: '',
@@ -639,6 +646,11 @@ function buildEmbed(state: RoomAnnounceState): Record<string, unknown> {
             // what it has always been. It is the reason to click: this one moves rating.
             ...(state.competitive
                 ? [{ name: 'Mode', value: '⚔️ Ranked match', inline: true }]
+                : []),
+            // Only when not Standard, for the same reason: a 40-minute treaty is something to
+            // know before joining, and "Standard" on every embed would say nothing.
+            ...(state.gameRules !== 0
+                ? [{ name: 'Rules', value: gameRulesLabel(state.gameRules), inline: true }]
                 : []),
         ],
         thumbnail: { url: `${MOD_ICON_BASE}/${encodeURIComponent(state.modId)}/icon.png` },

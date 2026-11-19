@@ -10,6 +10,7 @@ import { effectiveRatings } from './elo/ladder';
 import { requestIpHash } from './lib/ipHash';
 import { KvStore } from './kv';
 import { LobbyRoomRegistry, attachGlobalChat } from './lobbies/LobbyRoom';
+import { loadRatingPrivacy } from './elo/ratingPrivacy';
 import { GlobalChatRoom } from './global/GlobalChatRoom';
 import { HttpError, Errors, apiError } from './lib/errors';
 import type { AppContext } from './context';
@@ -50,6 +51,8 @@ async function main(): Promise<void> {
     const kv = new KvStore(db);
     kv.init();
     kv.startSweepLoop();
+    // Who keeps his rating private (migration 0034): every redactor asks this set by owner id.
+    await loadRatingPrivacy(db);
 
     // ----- App context -----
     const rooms = new LobbyRoomRegistry();

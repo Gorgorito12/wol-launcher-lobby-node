@@ -23,11 +23,12 @@
  * keeps `tournaments/rest.ts → create.ts` from becoming a cycle. Same rule the
  * `attachGlobalChat` shim in LobbyRoom.ts exists for.
  *
- * `discordAnnounce` is safe to import (it is a leaf: it imports nothing from this
- * directory), and the room registry and global chat arrive through `ctx` rather than as
+ * `discordAnnounce` is safe to import (from this directory it imports only `gameRules`,
+ * itself a leaf), and the room registry and global chat arrive through `ctx` rather than as
  * value imports, so there is no runtime edge to `LobbyRoom.ts` or `GlobalChatRoom.ts`.
  */
-import { Errors } from '../lib/errors';
+import { resolveGameRules } from './gameRules';
+import { Errors, HttpError } from '../lib/errors';
 import { shortId, sha256Hex } from '../lib/ids';
 import { announceLobbyCreated, finalizeRoom } from './discordAnnounce';
 import { noteLobbiesChanged } from '../global/lobbiesChanged';
@@ -118,6 +119,12 @@ export interface CreateLobbyInput {
     /** A request, not a decision. Clamped below; the result is echoed back. */
     askedCompetitive?: boolean;
     /**
+     * The Game Rules the host's game opens with (gameRules.ts). A request: a competitive or
+     * bound room is always Standard, and the effective value is echoed back. Absent = Standard,
+     * which is what every older launcher sends.
+     */
+    gameRules?: unknown;
+    /**
      * The bracket slot this room plays out, or null for an ordinary room.
      *
      * Only `POST /tournaments/:id/matches/:mid/lobby` passes this. It is written to the
@@ -167,6 +174,8 @@ export interface CreatedLobby {
     tournament_match_id: string | null;
     /** Null for an ordinary room. Additive: old launchers ignore it. */
     matchmaking: boolean;
+    /** The EFFECTIVE Game Rules after clamping (gameRules.ts). Additive. */
+    game_rules: number;
 }
 
 export async function createLobby(
@@ -196,7 +205,10 @@ export async function createLobby(
         `SELECT COUNT(*) AS n FROM lobbies WHERE status IN ('open','locked','in_game')`,
     ).bind().first<{ n: number }>();
     if ((active?.n ?? 0) >= cfg.maxActiveGames) {
-        throw Errors.Conflict('Server full — max concurrent lobbies reached.');
+        // Its own code (2026-11-18) so a launcher can say it in words; the message is unchanged,
+        // so an older launcher prints what it always printed.
+        throw new HttpError(409, 'server_full', 'Server full — max concurrent lobbies reached.',
+            { max_active_games: cfg.maxActiveGames });
     }
 
     // Competitive is a PROMISE — only this room's matches score, and the launcher holds
@@ -217,6 +229,10 @@ export async function createLobby(
     const isPrivate = passwordHash ? 1 : 0;
     const tournamentMatchId = input.tournamentMatchId ?? null;
     const matchmakingMatchId = input.matchmakingMatchId ?? null;
+    const gameRules = resolveGameRules(input.gameRules, {
+        competitive: competitive === 1,
+        bound: tournamentMatchId !== null || matchmakingMatchId !== null,
+    });
 
     await ctx.db.batch([
         ctx.db.prepare(
@@ -226,12 +242,12 @@ export async function createLobby(
             `INSERT INTO lobbies (id, host_user_id, created_by, title, mod_id, mod_combined_hash,
                                   max_players, current_players, is_private, password_hash,
                                   status, competitive, tournament_match_id, spectator_slots,
-                                  matchmaking_match_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'open', ?, ?, ?, ?)`,
+                                  matchmaking_match_id, game_rules)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'open', ?, ?, ?, ?, ?)`,
         ).bind(
             lobbyId, userId, userId, title, input.modId, input.modCombinedHash,
             maxPlayers, isPrivate, passwordHash, competitive, tournamentMatchId, spectatorSlots,
-            matchmakingMatchId,
+            matchmakingMatchId, gameRules,
         ),
         ctx.db.prepare(
             `INSERT INTO lobby_members (lobby_id, user_id, role) VALUES (?, ?, 'player')`,
@@ -267,6 +283,7 @@ export async function createLobby(
             id: lobbyId, title, modId: input.modId, maxPlayers,
             hostUserId: userId, hostName, hostAvatar,
             competitive: competitive === 1,
+            gameRules,
         });
 
         if (cfg.discordWebhookUrls.length > 0) {
@@ -274,6 +291,7 @@ export async function createLobby(
                 id: lobbyId, title, modId: input.modId, maxPlayers,
                 isPrivate: false, hostName, hostAvatar,
                 competitive: competitive === 1,
+                gameRules,
             });
         }
     }
@@ -291,6 +309,7 @@ export async function createLobby(
         competitive: competitive === 1,
         tournament_match_id: tournamentMatchId,
         matchmaking: matchmakingMatchId !== null,
+        game_rules: gameRules,
     };
 }
 

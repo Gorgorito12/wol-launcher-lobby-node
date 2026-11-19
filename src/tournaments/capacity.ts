@@ -17,3 +17,33 @@ export function clampCapacity(raw: unknown): number {
     const n = typeof raw === 'number' && Number.isFinite(raw) ? Math.trunc(raw) : DEFAULT_CAPACITY;
     return Math.min(MAX_CAPACITY, Math.max(MIN_CAPACITY, n));
 }
+
+/**
+ * The places a NEW tournament may offer on this server (2026-11-18): the largest power of two
+ * not above MAX_ACTIVE_GAMES, between 4 and {@link MAX_CAPACITY}. A first round then needs at most
+ * half the rooms the server can hold at once (16 -> 16 places, 32 -> 32, 64 -> 64), so a bracket
+ * is never offered that the server cannot start. An existing bigger tournament is never shrunk.
+ */
+export function offeredCapacity(maxActiveGames: number): number {
+    let places = 4;
+    while (places * 2 <= maxActiveGames && places * 2 <= MAX_CAPACITY) places *= 2;
+    return places;
+}
+
+let offered = offeredCapacity(16);
+
+/** Set once at start from the server's MAX_ACTIVE_GAMES. */
+export function configureOfferedCapacity(maxActiveGames: number): void {
+    offered = offeredCapacity(maxActiveGames);
+}
+
+/** What the list and the detail say as `max_capacity`. */
+export function offeredMax(): number {
+    return offered;
+}
+
+/** A requested size for a new tournament, or for one whose current size is `current`: never
+ *  above what the server offers, except that an existing tournament keeps its own size. */
+export function clampOffered(raw: unknown, current = 0): number {
+    return Math.min(Math.max(offered, current), clampCapacity(raw));
+}

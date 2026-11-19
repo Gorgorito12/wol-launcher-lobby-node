@@ -1,0 +1,14 @@
+-- The Game Rules the room's game opens with: 0 Standard, 1 Classic, 2-5 Treaty 10/20/30/40 min,
+-- 6 Treaty - No Blockade, 7 King of the Hill (the launcher's LanAutoStartArgs, in the game's
+-- own dropdown order).
+--
+-- WHY IT HAS TO BE ON THE SERVER. The host's launcher passes the rules to his game when the
+-- match starts, and until now only the launcher that CREATED the room knew them: nobody who
+-- joined could see that the room was a 40-minute treaty, a host promoted after the creator
+-- left launched with Standard, and a rematch lost them. Stored here, every member, every
+-- promoted host and every list reads the same value.
+--
+-- Clamped by src/lobbies/gameRules.ts: a competitive, tournament or quick-match room is always
+-- 0. Existing rooms get 0, which is what every one of them was launched with by anybody who
+-- was not its creator.
+ALTER TABLE lobbies ADD COLUMN game_rules INTEGER NOT NULL DEFAULT 0;

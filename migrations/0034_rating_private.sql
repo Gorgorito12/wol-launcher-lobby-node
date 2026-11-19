@@ -1,0 +1,13 @@
+-- A player may keep his rating to himself (the launcher's "Show my ELO", off).
+--
+-- What it does, decided with the maintainer on 2026-11-18: the player LEAVES the public ladder
+-- (no row, no place, no rank badge — a row without its number would give the number away to
+-- within the gap between its neighbours), and everybody else sees no number of his anywhere:
+-- rooms, the players panel, history, results, odds, highlights, his profile. His record, streaks,
+-- history and placement progress stay public; he still sees his own number; matchmaking and
+-- tournament seeding still use it.
+--
+-- Read through src/elo/ratingPrivacy.ts (an in-memory set loaded at start and kept in step by
+-- POST /me/rating-visibility), because every redactor in src/elo/placementPrivacy.ts already
+-- funnels through one predicate that knows the owner's id. Existing players get 0: shown.
+ALTER TABLE users ADD COLUMN rating_private INTEGER NOT NULL DEFAULT 0;

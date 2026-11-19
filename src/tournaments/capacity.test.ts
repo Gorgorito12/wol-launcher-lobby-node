@@ -7,7 +7,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { clampCapacity, DEFAULT_CAPACITY, MAX_CAPACITY, MIN_CAPACITY } from './capacity';
+import {
+    clampCapacity, clampOffered, configureOfferedCapacity, DEFAULT_CAPACITY, MAX_CAPACITY, MIN_CAPACITY,
+    offeredCapacity, offeredMax,
+} from './capacity';
 import { bracketSize, generateBracket, roundsFor } from './bracket';
 
 test('32 and 64 survive the clamp', () => {
@@ -42,7 +45,28 @@ for (const entrants of [17, 32, 33, 64]) {
 test('a list row and the detail both say the limit', () => {
     const rest = readFileSync('src/tournaments/rest.ts', 'utf8');
     // The list payload also says the server knows private tournaments (2026-11-13).
-    assert.match(rest, /payload = \{ tournaments: rows\.map\(listView\), max_capacity: MAX_CAPACITY, private_tournaments: true \}/);
+    assert.match(rest, /payload = \{ tournaments: rows\.map\(listView\), max_capacity: offeredMax\(\), private_tournaments: true, live_view: true, visibility_editable: true \}/);
     // The list payload, every list row and the detail.
-    assert.equal((rest.match(/max_capacity: MAX_CAPACITY,/g) ?? []).length, 3);
+    assert.equal((rest.match(/max_capacity: offeredMax\(\),/g) ?? []).length, 3);
+});
+
+test('THE ONE THAT MATTERS: the places offered follow the rooms the server can open', () => {
+    assert.equal(offeredCapacity(16), 16);
+    assert.equal(offeredCapacity(32), 32);
+    assert.equal(offeredCapacity(64), 64);
+    assert.equal(offeredCapacity(200), 64);
+    assert.equal(offeredCapacity(10), 8);
+    assert.equal(offeredCapacity(1), 4);
+});
+
+test('a new tournament is clamped to what is offered; an existing bigger one is never shrunk', () => {
+    configureOfferedCapacity(16);
+    try {
+        assert.equal(offeredMax(), 16);
+        assert.equal(clampOffered(64), 16);
+        assert.equal(clampOffered(8), 8);
+        assert.equal(clampOffered(64, 32), 32);
+    } finally {
+        configureOfferedCapacity(16);
+    }
 });

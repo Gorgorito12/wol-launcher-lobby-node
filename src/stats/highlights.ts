@@ -41,6 +41,7 @@ import type { AppContext } from '../context';
 import { toSqliteText } from '../lib/time';
 import { placementRequired } from '../elo/placement';
 import { bestWinRunWithin } from '../elo/streaks';
+import { isRatingPrivate } from '../elo/ratingPrivacy';
 import type { RatingMode } from '../elo/glicko2';
 import { modLabel } from '../lobbies/discordAnnounce';
 
@@ -215,7 +216,8 @@ export function computeHighlights(rows: readonly HighlightRow[], bounds: MonthBo
             list.sort((a, b) => a.atMs - b.atMs || (a.match_id < b.match_id ? -1 : 1));
             const ref = { user_id: list[0]!.user_id, display_name: list[0]!.display_name, avatar_url: list[0]!.avatar_url };
             const placed = list.filter((r) => r.ordinal > placementRequired(mode));
-            if (placed.length >= HIGHLIGHT_MIN_MATCHES) {
+            // A climb prints two ratings: never for somebody who keeps his to himself.
+            if (placed.length >= HIGHLIGHT_MIN_MATCHES && !isRatingPrivate(ref.user_id)) {
                 const from = placed[0]!.rating_before;
                 const to = placed[placed.length - 1]!.rating_after;
                 const points = Math.round(to - from);
@@ -340,6 +342,8 @@ export function biggestUpsets(inMonth: readonly HighlightRow[]): UpsetHighlight[
     for (const [matchId, rows] of byMatch) {
         const mode = rows[0]!.mode;
         if (rows.some((r) => r.ordinal <= placementRequired(mode))) continue;
+        // The upset prints both sides' average rating: not with a private rating in it.
+        if (rows.some((r) => isRatingPrivate(r.user_id))) continue;
         const winners = rows.filter((r) => r.result >= 0.999);
         const losers = rows.filter((r) => r.result <= 0.001);
         if (winners.length === 0 || losers.length === 0 || winners.length + losers.length !== rows.length) continue;
