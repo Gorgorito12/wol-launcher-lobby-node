@@ -13,7 +13,10 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { sanitiseNameMap, NAME_MAP_MAX_LEN, FILL_CIV_SQL, FILL_HOME_CITY_SQL } from './rest';
+import {
+    sanitiseNameMap, NAME_MAP_MAX_LEN, FILL_CIV_SQL, FILL_HOME_CITY_SQL, mergeNameMaps, civsFromReadings,
+    planCivBackfill,
+} from './rest';
 
 const ROSTER = new Set(['host', 'guest']);
 
@@ -57,4 +60,49 @@ test('the UPDATE fills gaps and never overwrites', () => {
         // Exactly three placeholders, in the order fillMissingCivs binds them: value, match, user.
         assert.equal(sql.match(/\?/g)?.length, 3);
     }
+});
+
+test('merging two readings keeps what the first said and adds only what it lacked', () => {
+    assert.deepEqual(
+        mergeNameMaps({ host: 'Ethiopians' }, { host: 'Zulu', guest: 'Dutch' }),
+        { host: 'Ethiopians', guest: 'Dutch' });
+    assert.deepEqual(mergeNameMaps({}, {}), {});
+});
+
+test('THE ONE THAT MATTERS: a founded match takes every reading, the founder first', () => {
+    // The founder is the side that conceded and usually named only itself; the winner's own
+    // reading, stored earlier, used to be ignored.
+    const readings = [
+        { user_id: 'winner', civs: JSON.stringify({ winner: 'Spanish', loser: 'British' }), home_cities: null, created_at: '2026-11-18 20:00:00' },
+        { user_id: 'loser', civs: JSON.stringify({ loser: 'Ottomans' }), home_cities: JSON.stringify({ loser: 'Istanbul' }), created_at: '2026-11-18 20:01:00' },
+    ];
+    const merged = civsFromReadings(readings, 'loser');
+    assert.deepEqual(merged.civs, { loser: 'Ottomans', winner: 'Spanish' });
+    assert.deepEqual(merged.homeCities, { loser: 'Istanbul' });
+});
+
+test('the backfill fills blank cells only, from the oldest reading first', () => {
+    const fills = planCivBackfill(
+        [
+            { user_id: 'a', civ: 'Spanish', home_city: null },
+            { user_id: 'b', civ: null, home_city: '  ' },
+        ],
+        [
+            { user_id: 'b', civs: JSON.stringify({ a: 'British', b: 'Dutch' }), home_cities: JSON.stringify({ b: 'Amsterdam' }), created_at: '2026-11-18 20:00:00' },
+            { user_id: 'a', civs: JSON.stringify({ b: 'Ottomans' }), home_cities: null, created_at: '2026-11-18 20:05:00' },
+        ]);
+    // a's civ is already stored and stays; b's blanks are filled from the first reading.
+    assert.deepEqual(fills, [
+        { userId: 'b', field: 'civ', value: 'Dutch' },
+        { userId: 'b', field: 'home_city', value: 'Amsterdam' },
+    ]);
+    assert.deepEqual(planCivBackfill([{ user_id: 'a', civ: 'X', home_city: 'Y' }], []), []);
+});
+
+test('readings with nothing, or with broken JSON, add nothing', () => {
+    const merged = civsFromReadings([
+        { user_id: 'a', civs: null, home_cities: null, created_at: '2026-11-18 20:00:00' },
+        { user_id: 'b', civs: '{not json', home_cities: '[]', created_at: '2026-11-18 20:00:01' },
+    ], 'a');
+    assert.deepEqual(merged, { civs: {}, homeCities: {} });
 });

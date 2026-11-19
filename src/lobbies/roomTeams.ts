@@ -25,6 +25,7 @@
  */
 import { winProbability } from '../elo/glicko2';
 import { anyPlacing } from '../elo/placementPrivacy';
+import { isRatingPrivate } from '../elo/ratingPrivacy';
 
 export type TeamNo = 1 | 2;
 
@@ -153,7 +154,7 @@ export interface RoomOdds {
      * empty seat or team), so a launcher can tell "nothing to show yet" from "not shown on
      * purpose". A launcher older than the key just sees no odds, as it would for an empty seat.
      */
-    hidden_reason?: 'placement';
+    hidden_reason?: 'placement' | 'private';
 }
 
 /**
@@ -169,6 +170,9 @@ export function roomOdds(playingSeats: number, players: readonly OddsPlayer[]): 
             .filter((p) => p.team === t && p.ratingTeam !== undefined && p.rdTeam !== undefined)
             .map((p) => ({ rating: p.ratingTeam!, rd: p.rdTeam! }));
         const p = winProbability(side(1), side(2));
+        if (p && players.some((x) => isRatingPrivate(x.id))) {
+            return { mode: 'team', teams: null, players: null, hidden_reason: 'private' };
+        }
         if (p && anyPlacing(players, 'team')) {
             return { mode: 'team', teams: null, players: null, hidden_reason: 'placement' };
         }
@@ -180,6 +184,10 @@ export function roomOdds(playingSeats: number, players: readonly OddsPlayer[]): 
     }
     const [a, b] = rated as [OddsPlayer, OddsPlayer];
     const p = winProbability([{ rating: a.rating!, rd: a.rd! }], [{ rating: b.rating!, rd: b.rd! }]);
+    // Two numbers and a percentage solve for the third: a private rating hides the odds too.
+    if (p && players.some((x) => isRatingPrivate(x.id))) {
+        return { mode: 'default', teams: null, players: null, hidden_reason: 'private' };
+    }
     if (p && anyPlacing(players, 'default')) {
         return { mode: 'default', teams: null, players: null, hidden_reason: 'placement' };
     }

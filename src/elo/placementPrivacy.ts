@@ -30,6 +30,7 @@
  * older server still shows nothing it should not.</p>
  */
 import { isInPlacement, placementRequired } from './placement';
+import { isRatingPrivate } from './ratingPrivacy';
 import type { RatingMode } from './glicko2';
 
 /**
@@ -44,6 +45,10 @@ export function ratingHiddenFrom(
     mode: RatingMode,
 ): boolean {
     if (viewerId != null && viewerId !== '' && viewerId === ownerId) return false;
+    // A player who keeps his rating to himself (migration 0034) hides it from everybody else on
+    // every ladder, placed or not. Every redactor below goes through here, so this one line is
+    // what makes the switch reach rooms, presence, history and the rooms list.
+    if (isRatingPrivate(ownerId)) return true;
     if (typeof gamesPlayed !== 'number' || !Number.isFinite(gamesPlayed)) return false;
     return isInPlacement(gamesPlayed, mode);
 }
@@ -154,8 +159,17 @@ export interface StandingRatings {
  * gets everything; anybody else gets no rating, deviation or volatility while that ladder is
  * still placing him. Wins, losses, streaks and the progress stay — they are not the number.
  */
-export function standingShownTo<T extends StandingRatings>(standing: T, mode: RatingMode, self: boolean): T {
-    if (self || !isInPlacement(standing.games_played, mode)) return standing;
+export function standingShownTo<T extends StandingRatings>(
+    standing: T, mode: RatingMode, self: boolean, ownerPrivate = false,
+): T {
+    if (self) return standing;
+    // A private rating hides everything that says roughly where it is: the peak and the low
+    // (with their dates) and the place on the table, which he no longer has anyway.
+    if (ownerPrivate) {
+        return without(standing, ['rating', 'rd', 'volatility', 'rating_peak', 'rating_peak_at',
+            'rating_low', 'rating_low_at', 'ladder_rank']);
+    }
+    if (!isInPlacement(standing.games_played, mode)) return standing;
     return without(standing, ['rating', 'rd', 'volatility']);
 }
 
@@ -237,6 +251,7 @@ export interface ResultParticipant {
 export function resultParticipantsFor<T extends ResultParticipant>(list: readonly T[], recipientId: string | null): T[] {
     return list.map((p) => {
         if (recipientId != null && recipientId === p.user_id) return p;
+        if (isRatingPrivate(p.user_id)) return without(p, ['rating_before', 'rating_after', 'rd_before', 'rd_after']);
         const played = p.placement_played;
         const required = p.placement_required;
         const placing = typeof played === 'number' && typeof required === 'number'

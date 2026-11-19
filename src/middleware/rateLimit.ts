@@ -225,6 +225,8 @@ export const Limits = {
     // writes above; generous per minute because somebody trying the three options clicks
     // three times in a row, small per day because nothing legitimate changes it often.
     BadgeModeUser:    { scope: 'badge-u',   keyKind: 'user', perMinute: 20,  perDay: 200  } as const,
+    // Each change re-ranks the whole ladder for everybody: few, on purpose.
+    RatingVisibilityUser: { scope: 'ratvis-u', keyKind: 'user', perMinute: 3, perDay: 20 } as const,
     // Competitive recordings: asking for an upload URL and confirming it. By USER for the
     // usual reason (two players behind one Radmin NAT each report their own matches). A
     // launcher makes two calls per reported match, so this is far above honest use.

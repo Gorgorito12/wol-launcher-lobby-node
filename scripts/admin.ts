@@ -58,6 +58,7 @@ import { highlightsFor, monthOf, previousMonth, renderDiscord } from '../src/sta
 import { highlightsEmbeds, highlightsMessage, postHighlights } from '../src/stats/highlightsAnnounce';
 import * as tourn from './adminTournaments';
 import { bareArgsOf, looksLikeDbPath } from './adminArgs';
+import { planCivBackfill, FILL_CIV_SQL, FILL_HOME_CITY_SQL } from '../src/matches/rest';
 
 // ---------------------------------------------------------------- argv
 
@@ -617,6 +618,50 @@ async function cmdMatchList(db: Db): Promise<void> {
             `\n  ${blind} of the rated match(es) above carry NO civilization. `
             + 'Use match:show <id> to see whether the confirmations carried them.');
     }
+}
+
+/**
+ * Fill the civilizations and home cities that readings stored for a match's room but nothing
+ * applied — a founded match used to take the founder's reading alone, and a late report on a
+ * founded match was stored without filling anything. Only rooms with exactly ONE match (a
+ * reading is keyed by room, not by match). Fill-only, so it can be run again safely. A match
+ * no launcher ever sent the missing civilization for cannot be recovered: there is nothing here.
+ */
+async function cmdMatchBackfillCivs(db: Db): Promise<void> {
+    const rows = await db.prepare(
+        `SELECT mp.match_id, mp.user_id, mp.civ, mp.home_city, m.lobby_id
+           FROM match_participants mp JOIN matches m ON m.id = mp.match_id
+          WHERE m.lobby_id IS NOT NULL
+            AND (mp.civ IS NULL OR TRIM(mp.civ) = '' OR mp.home_city IS NULL OR TRIM(mp.home_city) = '')`,
+    ).bind().all<{ match_id: string; user_id: string; civ: string | null; home_city: string | null; lobby_id: string }>();
+
+    const byMatch = new Map<string, { lobbyId: string; participants: { user_id: string; civ: string | null; home_city: string | null }[] }>();
+    for (const r of rows.results ?? []) {
+        const entry = byMatch.get(r.match_id) ?? { lobbyId: r.lobby_id, participants: [] };
+        entry.participants.push({ user_id: r.user_id, civ: r.civ, home_city: r.home_city });
+        byMatch.set(r.match_id, entry);
+    }
+
+    let changed = 0;
+    for (const [matchId, { lobbyId, participants }] of byMatch) {
+        const count = await db.prepare(`SELECT COUNT(*) AS n FROM matches WHERE lobby_id = ?`)
+            .bind(lobbyId).first<{ n: number }>();
+        if ((count?.n ?? 0) !== 1) continue;
+        const readings = await db.prepare(
+            `SELECT user_id, civs, home_cities, created_at FROM match_confirmations
+              WHERE lobby_id = ? AND (civs IS NOT NULL OR home_cities IS NOT NULL)`,
+        ).bind(lobbyId).all<{ user_id: string; civs: string | null; home_cities: string | null; created_at: string }>();
+        const fills = planCivBackfill(participants, readings.results ?? []);
+        for (const f of fills) {
+            console.log(`  ${pad(matchId, 36)}  ${pad(f.userId, 20)}  ${pad(f.field, 9)}  ${f.value}`);
+            if (APPLY) {
+                await db.prepare(f.field === 'civ' ? FILL_CIV_SQL : FILL_HOME_CITY_SQL)
+                    .bind(f.value, matchId, f.userId).run();
+            }
+            changed++;
+        }
+    }
+    summarise(changed, 'cell(s)');
 }
 
 async function cmdMatchShow(db: Db): Promise<void> {
@@ -1729,6 +1774,8 @@ function usage(): void {
                                             rate a stored 2v2/3v3 from its recordings by
                                             naming the losing side, then replay both ladders
   match:void <id>                           stop it counting, then replay the ladder
+  match:backfill-civs                       fill blank civilizations / home cities from the
+                                            readings stored for each match's room (fill-only)
   elo:recompute                             rebuild every rating from the history under the
                                             current rules (dry run prints who moves)
   player:show <player>                      rating, placement, streaks, ban state, memberships
@@ -1770,7 +1817,7 @@ function cli(): tourn.CliCtx {
 const KNOWN = new Set([
     'status',
     'rooms:list', 'rooms:close', 'rooms:prune',
-    'match:list', 'match:show', 'match:decide', 'match:decide-team', 'match:void',
+    'match:list', 'match:show', 'match:decide', 'match:decide-team', 'match:void', 'match:backfill-civs',
     'elo:recompute', 'season:show',
     'player:show', 'player:history', 'player:reset',
     'versions',
@@ -1817,6 +1864,7 @@ async function main(): Promise<void> {
             case 'rooms:prune': return await cmdRoomsPrune(db);
             case 'match:list': return await cmdMatchList(db);
             case 'match:show': return await cmdMatchShow(db);
+            case 'match:backfill-civs': return await cmdMatchBackfillCivs(db);
             case 'player:show': return await cmdPlayerShow(db);
             case 'player:history': return await cmdPlayerHistory(db);
             case 'player:ban': return await cmdPlayerBan(db, true);

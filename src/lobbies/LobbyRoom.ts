@@ -287,6 +287,8 @@ class LobbyRoom {
          * Null for an ordinary room. When set, the server seats everybody and nobody moves.
          */
         sides: Record<string, TeamNo> | null;
+        /** The room's Game Rules (migration 0033); fixed at creation. */
+        gameRules: number;
     } | null = null;
     /** The IP hash each socket arrived with, recorded once its hello proves who it is. */
     private pendingIp = new Map<WebSocket, string | null>();
@@ -602,6 +604,9 @@ class LobbyRoom {
             // launcher locks its team picker on THIS, never on merely being a tournament room,
             // so a newer launcher against an older server still lets players pick.
             ...(this.info?.sides ? { teams_locked: true } : {}),
+            // The rules every member's window shows, and the ones a host promoted after the
+            // creator left must launch with: only the creator's launcher used to know them.
+            ...(this.info ? { game_rules: this.info.gameRules } : {}),
         });
         const m = this.members[userId]!;
         // Everybody BUT the member who joined receives this, so a ladder he is still being placed
@@ -636,13 +641,14 @@ class LobbyRoom {
         if (this.info) return;
         try {
             const row = await ctx.db.prepare(
-                `SELECT max_players, spectator_slots, competitive, tournament_match_id
+                `SELECT max_players, spectator_slots, competitive, tournament_match_id, game_rules
                    FROM lobbies WHERE id = ?`,
             ).bind(this.lobbyId).first<{
                 max_players: number;
                 spectator_slots: number | null;
                 competitive: number;
                 tournament_match_id: string | null;
+                game_rules: number | null;
             }>();
             if (row) {
                 const tournamentMatchId = row.tournament_match_id ?? null;
@@ -657,6 +663,7 @@ class LobbyRoom {
                     competitive: row.competitive === 1,
                     tournamentMatchId,
                     sides: sides && Object.keys(sides).length > 0 ? sides : null,
+                    gameRules: row.game_rules ?? 0,
                 };
             }
         } catch {

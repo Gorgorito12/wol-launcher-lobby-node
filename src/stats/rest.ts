@@ -3,6 +3,7 @@ import { chargeIpQuota, ipRateLimit, userRateLimit, Limits } from '../middleware
 import { requireAuth } from '../middleware/auth';
 import { Errors, HttpError } from '../lib/errors';
 import { WIN_AT, LOSS_AT } from '../elo/ratability';
+import { isRatingPrivate } from '../elo/ratingPrivacy';
 import { attachParticipants } from '../matches/rest';
 import { replayView } from '../replays/rules';
 import { decayRd, type RatingMode } from '../elo/glicko2';
@@ -66,6 +67,7 @@ export const LADDER_ORDER_BY = 'e.rating DESC, e.user_id ASC';
  */
 export const LADDER_WHERE = `WHERE e.mode = ?
            AND u.is_banned = 0
+           AND u.rating_private = 0
            AND e.games_played >= ?`;
 
 /** The two values {@link LADDER_WHERE} binds, for one ladder. */
@@ -116,7 +118,8 @@ export async function ladderRanks(
         const rows = await ctx.db.prepare(ladderRankSql(unique.length))
             .bind(...ladderBinds(mode), ...unique)
             .all<{ user_id: string; ladder_pos: number }>();
-        for (const id of unique) out.set(id, 0);
+        // A private rating has no place and no badge, not the lowest one: absent, never 0.
+        for (const id of unique) if (!isRatingPrivate(id)) out.set(id, 0);
         for (const r of rows.results ?? []) out.set(r.user_id, r.ladder_pos);
     } catch {
         out.clear();

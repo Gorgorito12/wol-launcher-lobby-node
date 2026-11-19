@@ -17,6 +17,7 @@
  *    so the whole flow can be driven by a test with a fake clock (Matchmaker.test.ts).
  */
 import { randomUUID } from 'node:crypto';
+import { isRatingPrivate } from '../elo/ratingPrivacy';
 import {
     ACCEPT_WINDOW_MS, DISCORD_AFTER_MS, GIVE_UP_AFTER_MS, RECONNECT_GRACE_MS, ROOM_ENTRY_MS, STALE_AFTER_MS,
     chooseHost, compatible, decayedStrikes, lockForStrike, parseKind, pickPair, playKindFor,
@@ -144,7 +145,7 @@ export class Matchmaker {
                 avatar_url: t.profile.avatarUrl,
                 ...(t.profile.ladderRank !== undefined ? { ladder_rank: t.profile.ladderRank } : {}),
                 ...(t.profile.badgeMode ? { badge_mode: t.profile.badgeMode } : {}),
-                ...(t.placing ? {} : { rating: Math.round(t.rating) }),
+                ...(t.placing || isRatingPrivate(t.userId) ? {} : { rating: Math.round(t.rating) }),
                 games_played: t.profile.gamesPlayed,
                 in_placement: t.placing,
                 mod_id: t.modId,
@@ -406,7 +407,7 @@ export class Matchmaker {
                     avatar_url: other.profile.avatarUrl,
                     ...(other.profile.ladderRank !== undefined ? { ladder_rank: other.profile.ladderRank } : {}),
                     ...(other.profile.badgeMode ? { badge_mode: other.profile.badgeMode } : {}),
-                    ...(other.placing ? {} : { rating: Math.round(other.rating) }),
+                    ...(other.placing || isRatingPrivate(other.userId) ? {} : { rating: Math.round(other.rating) }),
                     games_played: other.profile.gamesPlayed,
                     in_placement: other.placing,
                 },

@@ -323,6 +323,8 @@ export class GlobalChatRoom implements MmTransport {
         hostName: string;
         hostAvatar: string | null;
         competitive: boolean;
+        /** The room's Game Rules; absent on a caller that does not know them (= Standard). */
+        gameRules?: number;
     }): void {
         try {
             this.broadcast(
@@ -334,6 +336,7 @@ export class GlobalChatRoom implements MmTransport {
                         modId: lobby.modId,
                         maxPlayers: lobby.maxPlayers,
                         competitive: lobby.competitive,
+                        gameRules: lobby.gameRules ?? 0,
                         host: { userId: lobby.hostUserId, login: lobby.hostName, avatarUrl: lobby.hostAvatar },
                     },
                 },

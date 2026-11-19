@@ -29,6 +29,8 @@ import { maybePostMonthlyHighlights } from '../stats/highlightsAnnounce';
 import { parseRoomTeams, sidesFromParticipants, sidesFromRoomTeams, teamsMismatch } from './teamsMismatch';
 import { recordIpHash, requestIpHash } from '../lib/ipHash';
 import { normalizeBadgeMode } from '../users/badgeMode';
+import { isRatingPrivate } from '../elo/ratingPrivacy';
+import { clearLiveMemo } from '../lobbies/live';
 import { replayView } from '../replays/rules';
 import { TOURNAMENT_REF_COLUMNS, TOURNAMENT_REF_JOIN, withTournamentRef } from '../tournaments/matchRef';
 import { teamEvidenceForMatch, type GameFingerprint } from './teamEvidence';
@@ -218,6 +220,64 @@ export function sanitiseNameMap(raw: unknown, roster: ReadonlySet<string>): Name
     return out;
 }
 
+/**
+ * Two readings' maps as one: every key of `base`, then the keys only `extra` names. The FIRST
+ * wins, the same rule the fill-only SQL applies to stored rows, so a later reading never
+ * replaces what an earlier one said about a player. Exported for the tests.
+ */
+export function mergeNameMaps(base: NameMap, extra: NameMap): NameMap {
+    const out: NameMap = { ...base };
+    for (const [userId, name] of Object.entries(extra)) {
+        if (!(userId in out)) out[userId] = name;
+    }
+    return out;
+}
+
+/**
+ * Every stored reading's civilizations and home cities as one pair of maps, the founder's first
+ * and the others in the order they arrived. A founded match used to take the founder's reading
+ * alone — the conceding side, which usually named only itself — and the other readings already
+ * stored were never applied. Exported for the tests.
+ */
+export function civsFromReadings(
+    readings: ReadonlyArray<{ user_id: string; civs: string | null; home_cities: string | null; created_at: string }>,
+    founderId: string | null,
+): { civs: NameMap; homeCities: NameMap } {
+    const ordered = [...readings].sort((a, b) => {
+        if (a.user_id === founderId) return -1;
+        if (b.user_id === founderId) return 1;
+        return a.created_at < b.created_at ? -1 : a.created_at > b.created_at ? 1 : 0;
+    });
+    let civs: NameMap = {};
+    let homeCities: NameMap = {};
+    for (const r of ordered) {
+        civs = mergeNameMaps(civs, parseNameMap(r.civs));
+        homeCities = mergeNameMaps(homeCities, parseNameMap(r.home_cities));
+    }
+    return { civs, homeCities };
+}
+
+/** One cell a backfill would fill: a blank civilization or home city a stored reading names. */
+export interface CivFill { userId: string; field: 'civ' | 'home_city'; value: string }
+
+/**
+ * What `admin.ts match:backfill-civs` would write for one match: every blank cell that a
+ * reading stored for its lobby names, oldest reading first. Pure; the writes go through the
+ * fill-only SQL, so running it twice changes nothing the second time.
+ */
+export function planCivBackfill(
+    participants: ReadonlyArray<{ user_id: string; civ: string | null; home_city: string | null }>,
+    readings: ReadonlyArray<{ user_id: string; civs: string | null; home_cities: string | null; created_at: string }>,
+): CivFill[] {
+    const merged = civsFromReadings(readings, null);
+    const fills: CivFill[] = [];
+    for (const p of participants) {
+        if (!p.civ?.trim() && merged.civs[p.user_id]) fills.push({ userId: p.user_id, field: 'civ', value: merged.civs[p.user_id]! });
+        if (!p.home_city?.trim() && merged.homeCities[p.user_id]) fills.push({ userId: p.user_id, field: 'home_city', value: merged.homeCities[p.user_id]! });
+    }
+    return fills;
+}
+
 /** The stored JSON, or null when there is nothing to store — never "{}". */
 function nameMapJson(map: NameMap): string | null {
     return Object.keys(map).length > 0 ? JSON.stringify(map) : null;
@@ -290,6 +350,8 @@ async function fillMissingCivs(
 async function notifyMatchesChanged(ctx: AppContext, matchId: string): Promise<void> {
     try {
         invalidateMatchStatsCaches();
+        // A watched room shows its result as soon as it is stored.
+        clearLiveMemo();
         const rows = await ctx.db.prepare(
             `SELECT user_id FROM match_participants WHERE match_id = ?`,
         ).bind(matchId).all<{ user_id: string }>();
@@ -1229,8 +1291,10 @@ async function upsertReading(
            replay_sha256 = excluded.replay_sha256,
            game_seed = excluded.game_seed,
            game_host_time = excluded.game_host_time,
-           civs = excluded.civs,
-           home_cities = excluded.home_cities,
+           -- A re-sent reading without civilizations keeps the ones an earlier one carried: they
+           -- may not have been applied yet (a match founded later reads them from here).
+           civs = COALESCE(excluded.civs, match_confirmations.civs),
+           home_cities = COALESCE(excluded.home_cities, match_confirmations.home_cities),
            created_at = datetime('now')`,
     ).bind(
         lobbyId, userId, result,
@@ -1414,8 +1478,11 @@ async function foundMatchFromReadingsInner(
 
     const matchId = uuid();
     const results = new Map<string, 0 | 1>([[decision.winnerId, 1], [decision.loserId, 0]]);
-    const civs = parseNameMap(founder.civs);
-    const homeCities = parseNameMap(founder.home_cities);
+    // Every reading's civilizations, the founder's first: the founder is the side that conceded,
+    // and its map usually named only itself.
+    const merged = civsFromReadings(readings, founder.user_id);
+    const civs = sanitiseNameMap(merged.civs, roster);
+    const homeCities = sanitiseNameMap(merged.homeCities, roster);
 
     // Inserted UNRATED first and promoted only once the ratings are in — a row claiming
     // `rated = 1` with no ratings behind it is the inconsistency every other path here goes
@@ -1815,6 +1882,18 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
                     gameSeed: normaliseFingerprint(body.game_seed),
                     gameHostTime: normaliseFingerprint(body.game_host_time),
                 }, civs, homeCities);
+                // The host's map fills what the founding left blank: it was stored as a reading
+                // and nothing used to apply it.
+                const foundedRoster = parseRoster(rosterAtStart);
+                if (foundedRoster !== null) {
+                    try {
+                        await fillMissingCivs(ctx, founded.id,
+                            sanitiseNameMap(civs, foundedRoster), sanitiseNameMap(homeCities, foundedRoster));
+                    } catch (err) {
+                        req.log.info({ match_id: founded.id, err: String(err) },
+                            'late report could not fill civilizations');
+                    }
+                }
                 await maybeRevertContradictedFounding(ctx, req.log, body.lobby_id, founded.id);
                 const state = await ctx.db.prepare(
                     `SELECT rated, unrated_reason FROM matches WHERE id = ?`,
@@ -2223,6 +2302,43 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
         });
     });
 
+    // POST /matches/civs — the civilizations and home cities a participant's recording names, and
+    // NOTHING else: no result, no seed, no reading stored, no decision asked. It exists for the
+    // HOST, whose report usually goes out before the recording exists and who may not confirm his
+    // own report (that would echo his verdict as the other side's evidence). Fills gaps only, so
+    // it can change nobody's rating and can never overwrite a civilization already stored.
+    app.post('/matches/civs', {
+        preHandler: [requireAuth(), ipRateLimit(ctx, Limits.LobbyCreateIp)],
+    }, async (req, reply) => {
+        const userId = req.userId!;
+        const body = (req.body ?? null) as {
+            lobby_id?: string;
+            civs?: Record<string, string>;
+            home_cities?: Record<string, string>;
+        } | null;
+        if (!body?.lobby_id) throw Errors.BadRequest('lobby_id required');
+
+        const lobby = await ctx.db.prepare(
+            `SELECT roster_at_start FROM lobbies WHERE id = ?`,
+        ).bind(body.lobby_id).first<{ roster_at_start: string | null }>();
+        if (!lobby) throw Errors.NotFound('Lobby');
+        const roster = parseRoster(lobby.roster_at_start);
+        if (roster === null || !roster.has(userId)) throw Errors.Forbidden();
+
+        const civs = sanitiseNameMap(body.civs, roster);
+        const homeCities = sanitiseNameMap(body.home_cities, roster);
+        const match = await ctx.db.prepare(
+            `SELECT id FROM matches WHERE lobby_id = ? ORDER BY created_at DESC LIMIT 1`,
+        ).bind(body.lobby_id).first<{ id: string }>();
+        if (!match) return reply.send({ ok: true, matched: false, filled: 0 });
+
+        const filled = await fillMissingCivs(ctx, match.id, civs, homeCities);
+        if (filled > 0) {
+            req.log.info({ match_id: match.id, user_id: userId, filled }, 'civilizations filled from a participant');
+        }
+        return reply.send({ ok: true, matched: true, filled });
+    });
+
     // POST /matches/confirm — the OTHER player's own reading of a match.
     //
     // Reporting stays host-only (N reporters would insert N copies of one match), so
@@ -2496,14 +2612,17 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
         // The player's OWN business — placement results and refunds — only when the request is
         // authenticated as that player. Everybody else gets the public standing.
         const self = req.userId === userId;
+        // Migration 0034: the player keeps his rating to himself. Said to everybody (the launcher
+        // shows "Hidden" instead of nothing, and his own Settings row reads it), never the number.
+        const ownerPrivate = isRatingPrivate(userId);
 
         // A ladder this player is still being PLACED on goes to anybody else without its number —
         // rating, deviation and volatility, flat and under `ladders` alike — while he gets all of
         // it (src/elo/placementPrivacy.ts). Omitted rather than null: every launcher reads the
         // flat pair as plain numbers, and asks only for its own standing.
         const [solo, team] = await Promise.all([
-            standingFor(ctx, userId, 'default', now, { self }).then((s) => standingShownTo(s, 'default', self)),
-            standingFor(ctx, userId, 'team', now, { self }).then((s) => standingShownTo(s, 'team', self)),
+            standingFor(ctx, userId, 'default', now, { self }).then((s) => standingShownTo(s, 'default', self, ownerPrivate)),
+            standingFor(ctx, userId, 'team', now, { self }).then((s) => standingShownTo(s, 'team', self, ownerPrivate)),
         ]);
 
         // Decided games of every kind, all time: the pair launchers already shipped read. A result
@@ -2554,6 +2673,7 @@ export function registerMatchesRest(app: FastifyInstance, ctx: AppContext): void
             // ---- the standing per ladder (design 55d-55f) ----
             placement_required: { default: solo.placement_required, team: team.placement_required },
             ladders: { default: solo, team },
+            rating_private: ownerPrivate,
             ...(refunds ? { refunds } : {}),
         });
     });

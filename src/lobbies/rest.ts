@@ -17,6 +17,8 @@ import { ladderRanks } from '../stats/rest';
 import { normalizeBadgeMode } from '../users/badgeMode';
 import type { AppContext } from '../context';
 import { onLobbiesChanged } from '../global/lobbiesChanged';
+import { buildLive, clearLiveMemo, loadLiveLobby, mayWatch, memoGet, memoPut } from './live';
+import { getTournament, isManager } from '../tournaments/store';
 
 /**
  * The "one active lobby" guard: is this player a member of some OTHER room that is still
@@ -55,6 +57,8 @@ interface LobbyRow {
     tournament_match_id: string | null;
     /** The quick-match proposal this room plays out, or null. Written only by the Matchmaker. */
     matchmaking_match_id: string | null;
+    /** The Game Rules (migration 0033). 0 for every older room. */
+    game_rules: number;
 }
 
 /** The tournament a room's bracket slot belongs to, for a window that opens with no other way to
@@ -78,6 +82,8 @@ interface CreateLobbyBody {
     password?: string;
     /** Whether the host is putting rating on this match. Clamped below — see the insert. */
     competitive?: boolean;
+    /** The Game Rules the host's game opens with. A request; see src/lobbies/gameRules.ts. */
+    game_rules?: number;
 }
 
 interface JoinLobbyBody {
@@ -102,6 +108,7 @@ export const LOBBY_LIST_SQL =
     `SELECT l.id, l.host_user_id, l.title, l.mod_id, l.mod_combined_hash,
             l.max_players, l.spectator_slots, l.current_players, l.is_private,
             l.status, l.competitive, l.tournament_match_id, l.matchmaking_match_id,
+            l.game_rules,
             ${ROOM_TOURNAMENT_ID_SQL} AS tournament_id,
             -- Counted rather than denormalised, unlike current_players. This is read
             -- once per row on a list capped at 100 and covered by lobby_members' own
@@ -145,6 +152,7 @@ let lobbyListInFlightGeneration = -1;
 onLobbiesChanged(() => {
     lobbyListCache = null;
     lobbyListGeneration++;
+    clearLiveMemo();
 });
 
 /** The public room list, exactly as GET /lobbies has always answered it. */
@@ -166,6 +174,7 @@ async function buildLobbyList(ctx: AppContext): Promise<unknown> {
         competitive: number;
         tournament_match_id: string | null;
         matchmaking_match_id: string | null;
+        game_rules: number;
         tournament_id: string | null;
         created_at: string;
         started_at: string | null;
@@ -219,6 +228,8 @@ async function buildLobbyList(ctx: AppContext): Promise<unknown> {
             // Before joining, not after: this is what tells a player their rating is
             // on the line and that leaving the room will not be free.
             competitive: r.competitive === 1,
+            // What the host's game opens with, so a 40-minute treaty is not a surprise.
+            game_rules: r.game_rules ?? 0,
             // Null for an ordinary room. Lets the rooms table show a tournament chip
             // and hide Join from anyone who is not one of the two entrants.
             tournament_match_id: r.tournament_match_id ?? null,
@@ -276,6 +287,9 @@ async function buildLobbyList(ctx: AppContext): Promise<unknown> {
                     ? isInPlacement(hostTeam.get(r.host_user_id)?.games_played ?? 0, 'team') : undefined,
             }),
         })),
+        // GET /lobbies/:id/live exists: "See match" may open the read-only window. A 404 there
+        // cannot tell an old server from a closed room, so the server says it here.
+        live_view: true,
     };
 }
 
@@ -367,6 +381,7 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
             spectatorSlots: body.spectator_slots,
             password: body.password,
             askedCompetitive: body.competitive,
+            gameRules: body.game_rules,
         });
         await recordIpHash(ctx, created.id, req.userId!, requestIpHash(ctx, req));
         return reply.code(201).send(created);
@@ -410,6 +425,7 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
             is_private: lobby.is_private === 1,
             status: lobby.status,
             competitive: lobby.competitive === 1,
+            game_rules: lobby.game_rules ?? 0,
             tournament_match_id: lobby.tournament_match_id ?? null,
             tournament_id: await tournamentIdOf(ctx, lobby.tournament_match_id),
             matchmaking: lobby.matchmaking_match_id != null,
@@ -424,6 +440,47 @@ export function registerLobbiesRest(app: FastifyInstance, ctx: AppContext): void
                 // Team 1 or 2 in a 2v2/3v3 room; null while the member has not picked one.
                 team: m.team === 1 || m.team === 2 ? m.team : null,
             })),
+        });
+    });
+
+    // GET /lobbies/:id/live — the room as somebody OUTSIDE it may see it (src/lobbies/live.ts).
+    // A private tournament's room is a 404 to anybody who may not see that tournament, decided
+    // BEFORE the memo; the memo holds only what every permitted viewer sees alike.
+    app.get('/lobbies/:id/live', {
+        preHandler: [ipRateLimit(ctx, Limits.LobbyListIp)],
+    }, async (req, reply) => {
+        const lobbyId = (req.params as { id: string }).id;
+        const code = (req.query as { code?: unknown } | undefined)?.code;
+        const row = await loadLiveLobby(ctx.db, lobbyId);
+        const now = Date.now();
+        const access = await mayWatch(ctx.db, row, req.userId, typeof code === 'string' ? code : undefined, now);
+        if (!access.ok || !row) throw Errors.NotFound('Lobby');
+        if (access.private) reply.header('Cache-Control', 'private, no-store');
+        const cached = memoGet(lobbyId, now);
+        if (cached) return reply.send(cached);
+        const body = await buildLive(ctx.db, row);
+        memoPut(lobbyId, body, now);
+        return reply.send(body);
+    });
+
+    // GET /lobbies/:id/live/chat — the room's chat, for the owner or a co-organiser of the
+    // tournament it belongs to, and nobody else (404). Room chat reaches members only, people type
+    // passwords and addresses there, and lines already written were written under that promise;
+    // an organiser who may have to settle a dispute is the one exception.
+    app.get('/lobbies/:id/live/chat', {
+        preHandler: [requireAuth(), ipRateLimit(ctx, Limits.LobbyListIp)],
+    }, async (req, reply) => {
+        const lobbyId = (req.params as { id: string }).id;
+        const row = await loadLiveLobby(ctx.db, lobbyId);
+        if (!row?.tournament_id) throw Errors.NotFound('Lobby');
+        const t = await getTournament(ctx.db, row.tournament_id);
+        const userId = req.userId!;
+        const organiser = !!t && (t.owner_user_id === userId || await isManager(ctx.db, t.id, userId));
+        if (!organiser) throw Errors.NotFound('Lobby');
+        reply.header('Cache-Control', 'private, no-store');
+        const room = ctx.rooms.get(lobbyId);
+        return reply.send({
+            chat: (room?.chatRing ?? []).map((l) => ({ id: l.id, user_id: l.userId, login: l.login, body: l.body, at: l.at })),
         });
     });
 

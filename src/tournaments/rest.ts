@@ -40,7 +40,7 @@
  * (see advance.ts and reportVerdict.ts).
  */
 import type { FastifyInstance } from 'fastify';
-import { Errors } from '../lib/errors';
+import { Errors, HttpError } from '../lib/errors';
 import { uuid, shortId } from '../lib/ids';
 import { requireAuth, requireTournamentOwner, requireTournamentManager } from '../middleware/auth';
 import { ipRateLimit, userRateLimit, Limits } from '../middleware/rateLimit';
@@ -58,7 +58,8 @@ import { generateBracket, advance, disqualify, roundsFor, bracketSize } from './
 import * as store from './store';
 import * as teams from '../teams/store';
 import { reportVerdictFor } from './advance';
-import { clampCapacity, MAX_CAPACITY } from './capacity';
+import { clampOffered, configureOfferedCapacity, offeredMax } from './capacity';
+import { decideVisibility, mayRenewCode } from './visibility';
 import { composeTournamentRoomTitle, TOURNAMENT_ROOM_TITLE_MAX } from './roomTitle';
 import {
     invalidateTournament, readDetailCache, readListCache, writeDetailCache, writeListCache,
@@ -111,6 +112,9 @@ async function freshInviteCode(ctx: AppContext): Promise<string> {
 }
 
 export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): void {
+    // The places a new tournament may offer follow the rooms this server can open at once.
+    configureOfferedCapacity(ctx.config.maxActiveGames);
+
     // ------------------------------------------------------------ public reads
 
     app.get('/tournaments', {
@@ -126,7 +130,7 @@ export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): 
             // private_tournaments: this server understands `visibility` and invite codes, so a
             // launcher may offer them. Absent on an older server, which would make a private
             // request public in silence.
-            payload = { tournaments: rows.map(listView), max_capacity: MAX_CAPACITY, private_tournaments: true };
+            payload = { tournaments: rows.map(listView), max_capacity: offeredMax(), private_tournaments: true, live_view: true, visibility_editable: true };
             writeListCache(payload, now);
         }
 
@@ -238,7 +242,7 @@ export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): 
         const id = shortId(8);
         await store.insertTournament(ctx.db, {
             id, name, modId, ownerUserId: userId,
-            format, teamSource, entryMode, capacity: clampCapacity(body.capacity),
+            format, teamSource, entryMode, capacity: clampOffered(body.capacity),
             visibility, inviteCode: visibility === 'private' ? await freshInviteCode(ctx) : null,
         });
         invalidate(id);
@@ -476,7 +480,7 @@ export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): 
             fields.name = name;
         }
         if (body.capacity !== undefined) {
-            const capacity = clampCapacity(body.capacity);
+            const capacity = clampOffered(body.capacity, t.capacity);
             // Lowering below what is already confirmed would make confirmed_count > capacity
             // and every later claim fail for ever.
             if (capacity < t.confirmed_count) {
@@ -935,6 +939,47 @@ export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): 
         return { ok: true, deleted: true };
     });
 
+    // POST /tournaments/:id/visibility { visibility } — the OWNER changes it (a co-organiser may
+    // not), and only before the bracket is drawn: entrants joined under one expectation. Going
+    // private mints a fresh code; going public clears it. Rooms and match references are derived
+    // at read time, so only the caches are dropped.
+    app.post('/tournaments/:id/visibility', {
+        preHandler: [requireTournamentOwner(ctx), userRateLimit(ctx, Limits.TournamentWriteUser)],
+    }, async (req) => {
+        const id = paramId(req, 'id');
+        const t = await store.getTournament(ctx.db, id);
+        if (!t) throw Errors.NotFound('Tournament');
+        const body = (req.body ?? {}) as { visibility?: unknown };
+        const visibility = readEnum(body.visibility, ['public', 'private'] as const, 'visibility');
+        const decision = decideVisibility(t.status, t.visibility, visibility);
+        if (decision === 'locked') {
+            throw new HttpError(409, 'visibility_locked', 'The bracket is drawn; the visibility can no longer change.');
+        }
+        if (decision === 'unchanged') {
+            return { visibility, ...(visibility === 'private' && t.invite_code ? { invite_code: t.invite_code } : {}) };
+        }
+        const code = visibility === 'private' ? await freshInviteCode(ctx) : null;
+        await ctx.db.prepare(`UPDATE tournaments SET visibility = ?, invite_code = ? WHERE id = ?`)
+            .bind(visibility, code, id).run();
+        invalidate(id);
+        return { visibility, ...(code ? { invite_code: code } : {}) };
+    });
+
+    // POST /tournaments/:id/invite-code — the OWNER renews a private tournament's code (a leaked
+    // code opens a finished bracket too). Entrants stay in; whoever held only the old code gets 404.
+    app.post('/tournaments/:id/invite-code', {
+        preHandler: [requireTournamentOwner(ctx), userRateLimit(ctx, Limits.TournamentWriteUser)],
+    }, async (req) => {
+        const id = paramId(req, 'id');
+        const t = await store.getTournament(ctx.db, id);
+        if (!t) throw Errors.NotFound('Tournament');
+        if (!mayRenewCode(t.visibility)) throw new HttpError(409, 'not_private', 'Only a private tournament has a code.');
+        const code = await freshInviteCode(ctx);
+        await ctx.db.prepare(`UPDATE tournaments SET invite_code = ? WHERE id = ?`).bind(code, id).run();
+        invalidate(id);
+        return { invite_code: code };
+    });
+
     app.post('/tournaments/:id/cancel', {
         preHandler: [requireTournamentOwner(ctx), userRateLimit(ctx, Limits.TournamentWriteUser)],
     }, async (req) => {
@@ -974,7 +1019,7 @@ function listView(t: store.TournamentListRow): Record<string, unknown> {
         entry_mode: t.entry_mode,
         status: t.status,
         capacity: t.capacity,
-        max_capacity: MAX_CAPACITY,
+        max_capacity: offeredMax(),
         confirmed_count: t.confirmed_count,
         // How many players each entrant fields. Its presence also tells a launcher this server
         // understands a registered captain choosing WHO plays (`member_ids` on entry).
@@ -1142,7 +1187,7 @@ async function buildDetail(ctx: AppContext, id: string): Promise<unknown> {
         status: t.status,
         visibility: t.visibility ?? 'public',
         capacity: t.capacity,
-        max_capacity: MAX_CAPACITY,
+        max_capacity: offeredMax(),
         confirmed_count: t.confirmed_count,
         bracket_size: t.bracket_size,
         rounds_total: t.bracket_size ? Math.log2(t.bracket_size) : null,

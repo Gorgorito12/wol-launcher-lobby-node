@@ -223,6 +223,34 @@ sudo systemctl status wol-lobby --no-pager   # → active (running)
 curl http://127.0.0.1:8080/health            # → {"ok":true, ...}
 ```
 
+### Game Rules on the server (migration 0033, 2026-11-18)
+
+`lobbies.game_rules` (0 Standard … 7 King of the Hill) is applied by the restart like every
+migration. It is additive: older launchers send nothing and get 0, which is what they launched.
+A ranked, tournament or quick-match room is always 0 (`src/lobbies/gameRules.ts`). Nothing to
+configure. The room's embed gains a "Rules" field only when the rules are not Standard.
+
+### Private ratings, watching a match, tournament visibility (2026-11-18)
+
+Migration **0034** (`users.rating_private`) is applied by the restart; everybody starts shown.
+All additive, so **deploy the server first**:
+
+- `POST /me/rating-visibility { show_rating }` — the launcher's "Show my ELO". Off, the player
+  leaves the public ladder and nobody else sees his number anywhere (`src/elo/ratingPrivacy.ts`,
+  an in-memory set loaded at start). **Never set the column with the CLI**: the running server
+  would not see it until its next restart.
+- `GET /lobbies/:id/live` — a room as somebody outside it may see it (members with public
+  ratings, and the stored result for 24 h after it closes); `live_view: true` in `GET /lobbies`
+  and `GET /tournaments` says it exists. A private tournament's room is a 404 to a stranger.
+  `GET /lobbies/:id/live/chat` is the room's chat for that tournament's owner and co-organisers
+  only.
+- `POST /tournaments/:id/visibility` and `POST /tournaments/:id/invite-code` — the OWNER only;
+  the visibility only before the bracket is drawn. `visibility_editable: true` in the list.
+- Creating a room on a full server answers 409 with code **`server_full`** (same message).
+- The places a NEW tournament may offer follow `MAX_ACTIVE_GAMES` (the largest power of two not
+  above it, 4-64): 16 by default. **For 32 or 64 places set `MAX_ACTIVE_GAMES=32` or `64`**; an
+  existing bigger tournament keeps its size.
+
 ### The launcher redesign (design_base_launcher_2): what this server adds, and the order
 
 Code only: no dependency, no migration (`started_at` is migration 0021, already applied), no
@@ -889,7 +917,7 @@ sudo -u wol-lobby ./node_modules/.bin/tsx scripts/admin.ts match:show <matchId>
 #   room mode  casual (never scores)      <- there is your answer
 ```
 
-**A tournament can now take 32 or 64 entrants** (`src/tournaments/capacity.ts`). Their first rounds are 16 and 32 rooms, so before running one raise `MAX_ACTIVE_GAMES`: a room that finds the server full gets the 409 and can try again when a match ends, and until then other players cannot open rooms either.
+**A tournament can take 32 or 64 entrants** (`src/tournaments/capacity.ts`), and since 2026-11-18 the server OFFERS only what `MAX_ACTIVE_GAMES` can start (`offeredCapacity`: 16 -> 16 places, 32 -> 32, 64 -> 64). Raise it first: a room that finds the server full gets the 409 `server_full` and can try again when a match ends.
 
 ### Walking out counts as a loss
 
@@ -1145,6 +1173,16 @@ the Statistics page showed one row).
   first one standing. A confirmer can add a civilization; nobody can repaint one.
 - `0019` runs on start like every other migration. Nothing to do by hand; nothing is
   backfilled for old matches, because there is nothing to backfill it from.
+
+- **`POST /matches/civs` (2026-11-18)** takes `{lobby_id, civs?, home_cities?}` from anybody in
+  `roster_at_start` and only fills gaps: no result, no seed, no reading stored, no decision asked.
+  It is how the HOST adds the civilizations of his own recording (his report goes out before it
+  exists, and he may not confirm his own report). An older server answers 404 and the launcher
+  shrugs. A founded match now takes every stored reading's civilizations (founder first), a late
+  report on a founded match fills gaps, and a re-sent reading without civs keeps the earlier map.
+- **Old matches**: `npx tsx scripts/admin.ts match:backfill-civs` lists the blank cells that a
+  reading stored for the match's room names (rooms with one match only); add `--apply` to write.
+  Fill-only, safe to repeat. A match nobody's launcher ever sent the civilization for stays blank.
 
 ```bash
 # Matches that gained a civilization after the fact.
