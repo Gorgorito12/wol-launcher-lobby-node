@@ -51,6 +51,7 @@ import { teamEvidenceForMatch } from '../matches/teamEvidence';
 import type { TournamentFormat } from './entrants';
 import * as store from './store';
 import { invalidateTournament } from './cache';
+import { noteTournamentFinished } from '../achievements/hooks';
 
 export interface AdvanceOutcome {
     tournamentId: string;
@@ -204,6 +205,7 @@ async function advanceLinked(
 
     if (result.tournamentDone) {
         await store.finishTournament(ctx.db, tournamentId, result.championEntrantId);
+        void noteTournamentFinished(ctx, tournamentId);
     }
 
     log.info(

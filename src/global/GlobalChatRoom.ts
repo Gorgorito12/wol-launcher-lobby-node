@@ -294,6 +294,20 @@ export class GlobalChatRoom implements MmTransport {
         return false;
     }
 
+    /**
+     * The user's one socket, only when his launcher said in its hello that it speaks `feature`.
+     * An older launcher would show an unknown frame as nothing at best; this is how a new frame
+     * reaches only the launchers that draw it. Returns whether it was sent.
+     */
+    sendToFeature(userId: string, feature: string, frame: object): boolean {
+        for (const [ws, a] of this.attached) {
+            if (a.userId !== userId || ws.readyState !== 1 || !a.features.has(feature)) continue;
+            this.send(ws, frame);
+            return true;
+        }
+        return false;
+    }
+
     /** MmTransport: every launcher that said it speaks quick match. */
     broadcastFeature(frame: object): void {
         const payload = JSON.stringify(frame);

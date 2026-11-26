@@ -35,6 +35,7 @@ import { replayView } from '../replays/rules';
 import { TOURNAMENT_REF_COLUMNS, TOURNAMENT_REF_JOIN, withTournamentRef } from '../tournaments/matchRef';
 import { teamEvidenceForMatch, type GameFingerprint } from './teamEvidence';
 import type { AppContext } from '../context';
+import { noteMatchChanged } from '../achievements/hooks';
 
 interface ReportMatchBody {
     lobby_id?: string;
@@ -363,6 +364,8 @@ async function notifyMatchesChanged(ctx: AppContext, matchId: string): Promise<v
             `SELECT user_id FROM match_participants WHERE match_id = ?`,
         ).bind(matchId).all<{ user_id: string }>();
         ctx.globalChat.announceMatchesChanged(matchId, (rows.results ?? []).map((r) => r.user_id));
+        // Its players' medals, a second later and outside this chain (src/achievements/hooks.ts).
+        void noteMatchChanged(ctx, matchId);
     } catch { /* best-effort */ }
 }
 
