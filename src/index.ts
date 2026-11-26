@@ -29,6 +29,7 @@ import { registerStatsRest } from './stats/rest';
 import { registerTournamentsRest } from './tournaments/rest';
 import { registerTeamsRest } from './teams/rest';
 import { registerUsersRest } from './users/rest';
+import { registerAchievementsRest } from './achievements/rest';
 import { sweepStaleTournaments } from './tournaments/sweep';
 import { maybePostMonthlyHighlights } from './stats/highlightsAnnounce';
 import { registerReplaysRest } from './replays/rest';
@@ -215,6 +216,7 @@ async function main(): Promise<void> {
     registerTournamentsRest(app, ctx);
     registerTeamsRest(app, ctx);
     registerUsersRest(app, ctx);
+    registerAchievementsRest(app, ctx);
     registerMatchmakingRest(app, ctx);
 
     // /me — current user + ELO snapshot. Requires auth.

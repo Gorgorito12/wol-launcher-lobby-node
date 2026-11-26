@@ -182,6 +182,13 @@ export const Limits = {
     // as the tables above: opened lazily by people who keep the community strip open, and
     // behind one Radmin NAT they share the count. Memoised five minutes server-side.
     StatsHighlightsIp: { scope: 'statsh',   keyKind: 'ip',   perMinute: 20,  perDay: 600  } as const,
+    // A player's medals (src/achievements). Its own scope for the reason the tables above have
+    // one: the profile already spends StatsIp on /matches/elo and /matches/history, and a profile
+    // opened behind one Radmin NAT must not starve them. Asked once per profile and game.
+    AchievementsIp:   { scope: 'achv',      keyKind: 'ip',   perMinute: 30,  perDay: 1500 } as const,
+    // "The launcher showed these medals". Keyed by user: a celebration is per player, and the
+    // launcher marks once per medal shown, so honest use is a handful a day.
+    AchievementsSeenUser: { scope: 'achvseen', keyKind: 'user', perMinute: 10, perDay: 300 } as const,
     // Keyed by USER, not IP: two players behind one Radmin NAT each upload their own decks,
     // and an IP budget would make the second one's silently fail. Deliberately tiny — the
     // launcher uploads once a session, and there is no reason for a legitimate client to

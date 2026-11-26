@@ -1382,3 +1382,40 @@ npm run admin -- highlights:post 2026-10      # dry run: prints the exact JSON i
 
 Paste that JSON into any Discord embed viewer to see it. `--apply` posts; nothing is posted by
 the dry run.
+
+## Achievements (medals per game, 2026-11-21)
+
+Migration `0036_achievements.sql` adds `player_achievements` and two indexes; it applies itself on
+start like every other. The medals, their rules and their limits live in `src/achievements/`
+(`catalog.ts` is the list, `rules.ts` the limits). They are computed here, never in the launcher.
+
+**When they are given.** A second after a match of the player is stored or changes (the same
+moment `matches_changed` goes out), when a tournament he won or organised finishes, and whenever
+he opens his own profile. A medal is never taken back by the code — a voided match keeps the medal
+it gave. A launcher that announced `achievements` in its hello gets an `achievement_unlocked`
+frame; an older one simply sees the medals in the profile.
+
+**After deploying, run the backfill once:**
+
+```bash
+npm run admin -- achievements:backfill            # dry run: how many of each medal, and the
+                                                  # civilization / map names the catalogue does
+                                                  # not know (each is a medal nobody can earn)
+npm run admin -- achievements:backfill --apply    # write them, already marked as seen
+```
+
+Everything earned before the migration is born seen anyway, so skipping the backfill loses no
+medal: each player gets his on his next match or profile, silently. The backfill only makes them
+all visible at once. The age and podium medals use the ladder as it is the day it runs: no rank
+history is stored, so nobody gets an age he held only in the past.
+
+**Taking one back:** `npm run admin -- achievements:revoke <player> <mod> <id> [--tier N] --apply`.
+The row stays with `revoked_at`, so it is not given again.
+
+**The limits** (constants in `src/achievements/rules.ts`): a match counts if it came from a launcher
+room, lasted 3 minutes and everybody in it was in the room; at most 3 wins a day against the same
+side count; a rated win the ELO discounted below half earns nothing; ages and the podium need a
+table of 10 or more; Champion and Organiser need a tournament with 3 games played.
+
+**One fix that came with it:** disqualifying a finalist settled the final but never finished the
+tournament (it stayed `running` with its champion known). The disqualify route now finishes it.

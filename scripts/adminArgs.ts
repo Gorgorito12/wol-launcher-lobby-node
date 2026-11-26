@@ -10,8 +10,8 @@
  * opened the recording as the database, and a `--reason` with a slash in it did the same.
  */
 export const VALUE_FLAGS: ReadonlySet<string> = new Set([
-    'days', 'file', 'from-season', 'kind', 'limit', 'losers', 'older-than', 'player',
-    'reason', 'refund-since', 'since', 'to', 'winner',
+    'days', 'file', 'from-season', 'kind', 'limit', 'losers', 'mod', 'older-than', 'player',
+    'reason', 'refund-since', 'since', 'tier', 'to', 'winner',
 ]);
 
 /** The arguments that are neither a flag nor a flag's value, in order. */

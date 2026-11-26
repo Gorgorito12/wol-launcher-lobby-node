@@ -57,6 +57,9 @@ import { standingFor } from '../src/stats/standing';
 import { highlightsFor, monthOf, previousMonth, renderDiscord } from '../src/stats/highlights';
 import { highlightsEmbeds, highlightsMessage, postHighlights } from '../src/stats/highlightsAnnounce';
 import * as tourn from './adminTournaments';
+import * as achv from './adminAchievements';
+import { loadRatingPrivacy } from '../src/elo/ratingPrivacy';
+import { configureLadderActivity } from '../src/stats/ladderActivity';
 import { bareArgsOf, looksLikeDbPath } from './adminArgs';
 import { planCivBackfill, FILL_CIV_SQL, FILL_HOME_CITY_SQL } from '../src/matches/rest';
 
@@ -1790,6 +1793,11 @@ function usage(): void {
   alerts:list [--all] [--kind K]            open operator alerts (farm streaks, short matches)
   alerts:ack <id>                           close one
   alerts:scan [--days 30]                   look for both patterns in the history; writes nothing
+  achievements:backfill [--mod K]           give every player the medals his history already
+                                            earned, written as seen; the dry run also lists
+                                            civilizations and maps the catalogue does not know
+  achievements:revoke <player> <mod> <id> [--tier N]
+                                            take one medal back (it is not given again)
   highlights:show [YYYY-MM]                 a month's highlights and its Discord text
   highlights:post [YYYY-MM] [--force]       post them to the highlights webhook
   replay:selftest                           upload, read and delete a tiny test object in the
@@ -1826,6 +1834,7 @@ const KNOWN = new Set([
     'highlights:show', 'highlights:post',
     'replay:selftest', 'replay:attach',
     ...tourn.TOURNAMENT_COMMANDS,
+    ...achv.ACHIEVEMENT_COMMANDS,
 ]);
 
 async function main(): Promise<void> {
@@ -1880,6 +1889,19 @@ async function main(): Promise<void> {
 
             // Tournaments and teams. The maintainer inspects and overrules; creating,
             // seeding and starting belong to whoever owns the tournament.
+            case 'achievements:backfill': {
+                // The ladder as the server reads it: who is private, and its activity rule from
+                // the same .env (the CLI is another process; nothing configures these for it).
+                const config = loadConfig();
+                await loadRatingPrivacy(db);
+                configureLadderActivity({
+                    hide: config.ladderHideInactive, days: config.ladderInactiveDays,
+                    daysTeam: config.ladderInactiveDaysTeam,
+                });
+                return await achv.cmdAchievementsBackfill({ db, config } as unknown as AppContext, cli());
+            }
+            case 'achievements:revoke':
+                return await achv.cmdAchievementsRevoke(db, cli(), async (n) => (await findUser(db, n))?.id ?? null);
             case 'tournament:list': return await tourn.cmdTournamentList(db, cli());
             case 'tournament:show': return await tourn.cmdTournamentShow(db, cli());
             case 'tournament:void': return await tourn.cmdTournamentVoid(db, cli());

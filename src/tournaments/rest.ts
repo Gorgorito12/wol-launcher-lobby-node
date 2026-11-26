@@ -68,6 +68,7 @@ import {
 import { ladderRanks } from '../stats/rest';
 import { mayDelete } from './lifecycle';
 import { readCode } from './inviteCode';
+import { noteTournamentFinished } from '../achievements/hooks';
 
 // ---------------------------------------------------------------- bounds
 
@@ -759,6 +760,7 @@ export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): 
         await store.applyMatchUpdates(ctx.db, result.updates.filter((u) => u.id !== mid));
         if (result.tournamentDone) {
             await store.finishTournament(ctx.db, id, result.championEntrantId);
+            void noteTournamentFinished(ctx, id);
         }
         invalidate(id);
         return { ok: true, tournament_done: result.tournamentDone };
@@ -857,6 +859,14 @@ export function registerTournamentsRest(app: FastifyInstance, ctx: AppContext): 
         const updates = disqualify(bracket, eid);
         await store.applyMatchUpdates(ctx.db, updates);
         await store.touch(ctx.db, id);
+        // A disqualification can settle the FINAL (the other finalist wins it by walkover), and
+        // nothing finished the tournament then: it sat 'running' with a champion in its last
+        // match. Finish it the way a decided final is finished everywhere else.
+        const final = (await store.loadBracket(ctx.db, id)).find((m) => m.nextMatchId === null);
+        if (final?.winnerEntrantId && (final.status === 'done' || final.status === 'bye')) {
+            await store.finishTournament(ctx.db, id, final.winnerEntrantId);
+            void noteTournamentFinished(ctx, id);
+        }
         invalidate(id);
         return { ok: true, matches_awarded: updates.length };
     });
