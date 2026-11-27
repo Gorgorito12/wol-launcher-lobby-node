@@ -114,7 +114,7 @@ test('Phoenix: a win right after three losses', () => {
     assert.ok(!earned(evaluate(input(notYet)), 'wol', 'phoenix'));
 });
 
-function rated(i: number, p: Partial<MatchRow> & { oppRating?: number } = {}): MatchRow {
+function rated(i: number, p: Partial<MatchRow> & { opp?: string; oppRating?: number } = {}): MatchRow {
     return match({ rated: 1, unratedReason: null, ratingAfter: 1500 + i, ratingBefore: 1500 + i - 1, ...p });
 }
 
@@ -247,4 +247,132 @@ test('evaluating twice gives the same answer', () => {
     const b = evaluate(input(rows));
     const flat = (m: ReturnType<typeof evaluate>) => JSON.stringify([...m.get('wol')!.entries()].map(([k, v]) => [k, v.earned]));
     assert.equal(flat(a), flat(b));
+});
+
+// ---------------------------------------------------------------- the medals added on 2026-11-26
+
+const side = (mine: boolean, n: number, prefix: string) => Array.from({ length: n }, (_, i) => ({
+    userId: `${prefix}${i}`, team: mine ? 1 : 2, civ: 'French', result: mine ? 1 : 0, ratingBefore: null,
+}));
+
+test('Steadfast counts days, not matches', () => {
+    const sameDay = Array.from({ length: 40 }, (_, i) => match({ atMs: T0 + i * 60_000, opp: `o${i}` }));
+    assert.equal(evaluate(input(sameDay)).get('wol')!.get('steadfast')!.value, 1);
+    const days = Array.from({ length: 30 }, (_, i) => match({ atMs: T0 + i * DAY }));
+    assert.ok(earned(evaluate(input(days)), 'wol', 'steadfast'));
+});
+
+test('Invincible needs ten counted wins in a row', () => {
+    const nine = Array.from({ length: 9 }, () => match({}));
+    assert.ok(!earned(evaluate(input(nine)), 'wol', 'invincible'));
+    assert.ok(earned(evaluate(input([...nine, match({})])), 'wol', 'invincible'));
+});
+
+test('Revenge: a 1v1 win against the player who beat you the last time', () => {
+    assert.ok(earned(evaluate(input([match({ opp: 'r', result: 0 }), match({ opp: 'r' })])), 'wol', 'revenge'));
+    // A win against someone else, or against a rival you had beaten: neither.
+    assert.ok(!earned(evaluate(input([match({ opp: 'r', result: 0 }), match({ opp: 'other' })])), 'wol', 'revenge'));
+    assert.ok(!earned(evaluate(input([match({ opp: 'r' }), match({ opp: 'r' })])), 'wol', 'revenge'));
+    // A loss in a match that does not count is no grudge.
+    assert.ok(!earned(evaluate(input([match({ opp: 'r', result: 0, durationSeconds: 60 }), match({ opp: 'r' })])), 'wol', 'revenge'));
+});
+
+test('Revenge is a 1v1 medal', () => {
+    const others = [...side(true, 1, 'm'), ...side(false, 2, 'r')];
+    const lost = match({ team: 1, result: 0, others: others.map((o) => ({ ...o, result: o.team === 1 ? 0 : 1 })) });
+    const won = match({ team: 1, others });
+    assert.ok(!earned(evaluate(input([lost, won])), 'wol', 'revenge'));
+});
+
+test('All-Rounder: a win in each of 1v1, 2v2 and 3v3', () => {
+    const v2 = match({ team: 1, others: [...side(true, 1, 'a'), ...side(false, 2, 'b')] });
+    const v3 = match({ team: 1, others: [...side(true, 2, 'c'), ...side(false, 3, 'd')] });
+    const uneven = match({ team: 1, others: [...side(true, 1, 'e'), ...side(false, 3, 'f')] });
+    assert.equal(evaluate(input([match({}), v2, uneven])).get('wol')!.get('all_rounder')!.value, 2);
+    assert.ok(earned(evaluate(input([match({}), v2, v3])), 'wol', 'all_rounder'));
+});
+
+test('only matches the quick-match queue made count as quick matches', () => {
+    const r = evaluate(input([match({}), match({ quickMatch: true })]));
+    assert.ok(earned(r, 'wol', 'ready_for_battle'));
+    assert.equal(r.get('wol')!.get('skirmisher')!.value, 1);
+    assert.ok(!earned(evaluate(input([match({}), match({ quickMatch: true, result: 0 })])), 'wol', 'ready_for_battle'));
+});
+
+test('a continent needs a win with each of its civilizations', () => {
+    const africa = ['Ethiopians', 'Egyptians', 'Zulu', 'Australians'].map((civ) => match({ civ }));
+    assert.equal(evaluate(input(africa)).get('wol')!.get('africa_oceania')!.value, 4);
+    assert.ok(earned(evaluate(input([...africa, match({ civ: 'Maori' })])), 'wol', 'africa_oceania'));
+});
+
+test('a historical war is won from either side, and only against the other', () => {
+    const war = (civ: string, oppCiv: string, result = 1) => evaluate(input([match({ civ, oppCiv, result })]));
+    assert.ok(earned(war('Paraguayans', 'Brazilians'), 'wol', 'war_triple_alliance'));
+    assert.ok(earned(war('Uruguayans', 'Paraguayans'), 'wol', 'war_triple_alliance'));
+    assert.ok(!earned(war('Argentines', 'Brazilians'), 'wol', 'war_triple_alliance'));
+    assert.ok(!earned(war('Paraguayans', 'Brazilians', 0), 'wol', 'war_triple_alliance'));
+    assert.ok(earned(war('Spanish', 'Mexicans'), 'wol', 'war_independence'));
+    assert.ok(!earned(war('Spanish', 'Brazilians'), 'wol', 'war_independence'));
+});
+
+test('the tournament medals come from their events, in their own game', () => {
+    const ev = [{ modKey: 'wol', atMs: T0, tournamentId: 't1' }];
+    const r = evaluate(input([], { tournamentsPlayed: ev, finalistOf: ev }));
+    assert.ok(earned(r, 'wol', 'in_the_bracket'));
+    assert.ok(earned(r, 'wol', 'finalist'));
+    assert.ok(!earned(r, 'wol', 'champion'));
+    const other = evaluate(input([match({})], { tournamentsPlayed: ev.map((e) => ({ ...e, modKey: TAD_KEY })) }));
+    assert.ok(!earned(other, 'wol', 'in_the_bracket'));
+    assert.ok(earned(other, TAD_KEY, 'in_the_bracket'));
+});
+
+// ---------------------------------------------------------------- the feats (platinum, 2026-11-26)
+
+test('Number One is the first place of a table of ten, never the second or a small table', () => {
+    const rows = [rated(1)];
+    assert.ok(earned(evaluate(input(rows, { position: { default: { rank: 1, size: 12 } } })), 'wol', 'number_one'));
+    assert.ok(!earned(evaluate(input(rows, { position: { default: { rank: 2, size: 12 } } })), 'wol', 'number_one'));
+    assert.ok(!earned(evaluate(input(rows, { position: { default: { rank: 1, size: 9 } } })), 'wol', 'number_one'));
+    // Second place is still On Top.
+    assert.ok(earned(evaluate(input(rows, { position: { default: { rank: 2, size: 12 } } })), 'wol', 'on_top'));
+});
+
+test('Iron Streak counts competitive 1v1 wins only; a casual match neither adds nor breaks it', () => {
+    const ten = Array.from({ length: 10 }, (_, i) => rated(i, { opp: `r${i}` }));
+    const withCasuals = ten.flatMap((m, i) => (i === 4 ? [m, match({ result: 0 }), match({})] : [m]));
+    const r = evaluate(input(withCasuals));
+    assert.ok(earned(r, 'wol', 'iron_streak'));
+    const nineAndCasual = [...ten.slice(0, 9), match({})];
+    assert.equal(evaluate(input(nineAndCasual)).get('wol')!.get('iron_streak')!.value, 9);
+    const broken = [...ten.slice(0, 5), rated(20, { result: 0 }), ...ten.slice(5)];
+    assert.ok(!earned(evaluate(input(broken)), 'wol', 'iron_streak'));
+});
+
+test('a team win does not feed the 1v1 streak', () => {
+    const rows = Array.from({ length: 10 }, (_, i) => rated(i, { ratingMode: 'team', opp: `t${i}` }));
+    assert.ok(!earned(evaluate(input(rows)), 'wol', 'iron_streak'));
+});
+
+test('Triple Crown is the third tournament won in this game', () => {
+    const ev = (n: number, mod = 'wol') => Array.from({ length: n }, (_, i) => ({ modKey: mod, atMs: T0 + i, tournamentId: `t${i}` }));
+    const two = evaluate(input([match({})], { championOf: ev(2) }));
+    assert.ok(earned(two, 'wol', 'champion'));
+    assert.ok(!earned(two, 'wol', 'triple_crown'));
+    assert.equal(two.get('wol')!.get('triple_crown')!.value, 2);
+    const three = evaluate(input([match({})], { championOf: ev(3) }));
+    assert.equal(three.get('wol')!.get('triple_crown')!.earned[0]!.tournamentId, 't2');
+    assert.ok(!earned(evaluate(input([match({})], { championOf: [...ev(2), ...ev(1, TAD_KEY)] })), 'wol', 'triple_crown'));
+});
+
+test('Living Legend counts the stored medals too, and never itself', () => {
+    const goal = evaluate(input([match({})])).get('wol')!.get('living_legend')!.goal!;
+    assert.equal(goal, 54);
+    // One match earns two medals; 52 stored ones bring it to 54.
+    const stored = Array.from({ length: 52 }, (_, i) => `stored_${i}|0`);
+    assert.ok(earned(evaluate(input([match({})], { held: { wol: stored } })), 'wol', 'living_legend'));
+    // Its own stored row does not count toward it.
+    const withItself = [...stored.slice(0, 51), 'living_legend|0'];
+    assert.ok(!earned(evaluate(input([match({})], { held: { wol: withItself } })), 'wol', 'living_legend'));
+    // A medal held in another game does not count here.
+    assert.ok(!earned(evaluate(input([match({})], { held: { [TAD_KEY]: stored } })), 'wol', 'living_legend'));
 });

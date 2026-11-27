@@ -2,8 +2,9 @@
  * The achievements (design 121 "Logros"): which medals exist, in which game, and what each asks.
  *
  * <p><b>Counted per game.</b> Every medal is earned by a match (or tournament) OF THAT GAME, keyed
- * by the room's mod id lowercased ({@link modKeyOf}). The Asian Dynasties ({@link TAD_KEY}) has a
- * set of its own; every other mod — Wars of Liberty first — uses the {@link GENERAL_SET}.</p>
+ * by the room's mod id lowercased ({@link modKeyOf}). The Asian Dynasties ({@link TAD_KEY}) and Wars
+ * of Liberty ({@link WOL_SET}: the general medals plus its continents and historical wars) have sets
+ * of their own; every other mod uses the {@link GENERAL_SET}.</p>
  *
  * <p><b>This is data.</b> The evaluator (evaluate.ts) knows the KINDS below and nothing about
  * individual medals, so moving a medal to another metal, changing a goal or reordering a group is
@@ -18,7 +19,8 @@
  * know is printed by `achievements:backfill` — that is the check that they are complete.</p>
  */
 
-export type Metal = 'b' | 's' | 'g';
+/** Bronze, silver, gold, and platinum for the feats (2026-11-26; an older launcher draws it as bronze). */
+export type Metal = 'b' | 's' | 'g' | 'p';
 export type Ladder = 'default' | 'team';
 
 /** What an achievement asks. The evaluator implements each kind once. */
@@ -33,7 +35,7 @@ export type AchievementKind =
     | { kind: 'phoenix'; losses: number }
     | { kind: 'giant_slayer'; gap: number }
     | { kind: 'promotion' }
-    | { kind: 'on_top' }
+    | { kind: 'on_top'; places?: number }
     | { kind: 'distinct_civ_wins'; goal: number }
     | { kind: 'every_civ_win' }
     | { kind: 'same_civ_wins'; goal: number }
@@ -48,8 +50,17 @@ export type AchievementKind =
     | { kind: 'rules_win'; rules: readonly number[] }
     | { kind: 'distinct_opponents'; goal: number }
     | { kind: 'host'; goal: number }
-    | { kind: 'champion' }
-    | { kind: 'organiser' };
+    | { kind: 'champion'; goal?: number }
+    | { kind: 'organiser' }
+    | { kind: 'distinct_days_played'; goal: number }
+    | { kind: 'revenge' }
+    | { kind: 'formats_won'; formats: readonly string[] }
+    | { kind: 'quick_wins'; goal: number }
+    | { kind: 'tournament_played' }
+    | { kind: 'finalist' }
+    | { kind: 'civ_set_wins'; civs: readonly string[] }
+    | { kind: 'rated_win_streak'; ladder: Ladder; goal: number }
+    | { kind: 'collector'; share: number };
 
 export interface AchievementDef {
     /** Stable id; the launcher's string keys and stored rows use it. Never rename. */
@@ -65,7 +76,7 @@ export interface AchievementDef {
 
 export interface AchievementGroup {
     id: string;
-    /** The enamel colour the launcher paints the group's medals with, 0-6 (design 121's table). */
+    /** The enamel colour the launcher paints the group's medals with: 0-6 design 121's table, 7 the feats' steel. */
     enamel: number;
     name: string;
     items: readonly AchievementDef[];
@@ -135,51 +146,103 @@ const PROMOTION = a('promotion', 'promotion', 'b', 'Promotion', 'Reach an age of
 const DIPLOMAT = a('diplomat', 'people', 'b', 'Diplomat', 'Play against 25 different players', { kind: 'distinct_opponents', goal: 25 });
 const CHAMPION = a('champion', 'trophy', 'g', 'Champion', 'Win a tournament', { kind: 'champion' });
 
-/** Wars of Liberty, and every mod without a set of its own. */
+// Beyond design 121 (2026-11-26): long goals for veterans, quick match, tournaments and three
+// small ones. Every game has them; they reuse the 21 icons the launcher already draws, so an
+// older launcher shows them too (with the English name sent alongside).
+const FIELD_MARSHAL = a('field_marshal', 'star', 'g', 'Field Marshal', 'Play 500 matches', { kind: 'played', goal: 500 });
+const STEADFAST = a('steadfast', 'clock', 's', 'Steadfast', 'Play on 30 different days', { kind: 'distinct_days_played', goal: 30 });
+const INVINCIBLE = a('invincible', 'flame', 'g', 'Invincible', 'Win 10 matches in a row', { kind: 'win_streak', goal: 10 });
+const REVENGE = a('revenge', 'sword', 'b', 'Revenge', 'Win a 1v1 against the player who beat you the last time you met', { kind: 'revenge' });
+const COSMOPOLITAN = a('cosmopolitan', 'globe', 'g', 'Cosmopolitan', 'Play against 100 different players', { kind: 'distinct_opponents', goal: 100 });
+const ALL_ROUNDER = a('all_rounder', 'star', 's', 'All-Rounder', 'Win a 1v1, a 2v2 and a 3v3', { kind: 'formats_won', formats: ['1v1', '2v2', '3v3'] });
+const READY_FOR_BATTLE = a('ready_for_battle', 'bolt', 'b', 'Ready for Battle', 'Win a quick match', { kind: 'quick_wins', goal: 1 });
+const SKIRMISHER = a('skirmisher', 'bolt', 's', 'Skirmisher', 'Win 10 quick matches', { kind: 'quick_wins', goal: 10 });
+const MINUTEMAN = a('minuteman', 'target', 'g', 'Minuteman', 'Win 50 quick matches', { kind: 'quick_wins', goal: 50 });
+const IN_THE_BRACKET = a('in_the_bracket', 'bracket', 'b', 'In the Bracket', 'Play a tournament match', { kind: 'tournament_played' });
+const FINALIST = a('finalist', 'trophy', 's', 'Finalist', 'Play the final of a tournament', { kind: 'finalist' });
+
+const FIRST_STEPS: AchievementGroup = {
+    id: 'first_steps', enamel: 0, name: 'First steps', items: [
+        a('baptism_of_fire', 'sword', 'b', 'Baptism of Fire', 'Play your first multiplayer match', { kind: 'played', goal: 1 }),
+        FIRST_BLOOD,
+        a('veteran', 'shield', 's', 'Veteran', 'Play 100 matches', { kind: 'played', goal: 100 }),
+        CONQUEROR,
+        FIELD_MARSHAL,
+        STEADFAST,
+    ],
+};
+
+const STREAKS_RANKING: AchievementGroup = {
+    id: 'streaks_ranking', enamel: 1, name: 'Streaks and ranking', items: [
+        UNSTOPPABLE,
+        INVINCIBLE,
+        a('phoenix', 'phoenix', 'b', 'Phoenix', 'Win after losing 3 in a row', { kind: 'phoenix', losses: 3 }),
+        REVENGE,
+        GIANT_SLAYER,
+        a('graduate', 'cap', 'b', 'Graduate', 'Finish your placement matches', { kind: 'graduate', ladder: 'default' }),
+        PROMOTION,
+        a('on_top', 'crown', 'g', 'On Top', 'Enter the podium (top 3)', { kind: 'on_top' }),
+    ],
+};
+
+const AMBASSADOR = a('ambassador', 'flag', 's', 'Ambassador', 'Win with 10 different civilizations', { kind: 'distinct_civ_wins', goal: 10 });
+const CITIZEN = a('citizen_of_the_world', 'globe', 'g', 'Citizen of the World', 'Win with every civilization of the mod', { kind: 'every_civ_win' });
+const SPECIALIST = a('specialist', 'star', 's', 'Specialist', 'Win 25 matches with the same civilization', { kind: 'same_civ_wins', goal: 25 });
+const CARTOGRAPHER = a('cartographer', 'compass', 's', 'Cartographer', 'Play on 20 different maps', { kind: 'distinct_maps_played', goal: 20 });
+
+const FORMATS: AchievementGroup = {
+    id: 'formats', enamel: 5, name: 'Formats', items: [
+        a('brothers_in_arms', 'people', 'b', 'Brothers in Arms', 'Win 10 team matches', { kind: 'team_wins', goal: 10 }),
+        ALL_ROUNDER,
+        a('lightning_war', 'bolt', 's', 'Lightning War', 'Win a match shorter than 15 minutes', { kind: 'short_win', maxSeconds: 15 * 60 }),
+        a('endless_siege', 'clock', 'b', 'Endless Siege', 'Win a match longer than 60 minutes', { kind: 'long_win', minSeconds: 60 * 60 }),
+        READY_FOR_BATTLE,
+        SKIRMISHER,
+        MINUTEMAN,
+    ],
+};
+
+const COMMUNITY: AchievementGroup = {
+    id: 'community', enamel: 6, name: 'Community', items: [
+        DIPLOMAT,
+        COSMOPOLITAN,
+        a('host', 'host', 's', 'Host', 'Create 20 rooms that get played', { kind: 'host', goal: 20 }),
+        IN_THE_BRACKET,
+        FINALIST,
+        CHAMPION,
+        a('organiser', 'bracket', 's', 'Organiser', 'Organise a tournament that reaches the end', { kind: 'organiser' }),
+    ],
+};
+
+/**
+ * The feats (2026-11-26): very hard, never impossible — each is a step past a medal somebody already
+ * holds, or a place that somebody always occupies. Platinum, last in every game. "Living Legend" is
+ * three in four of the game's other medals, counting the stored ones (a medal is never lost).
+ */
+const FEATS: AchievementGroup = {
+    id: 'feats', enamel: 7, name: 'Feats', items: [
+        a('grandmaster', 'climb', 'p', 'Grandmaster', 'Reach 1900 ELO in 1v1', { kind: 'elo', ladder: 'default', goal: 1900 }),
+        a('number_one', 'crown', 'p', 'Number One', 'Be first on a ranking of 10 or more', { kind: 'on_top', places: 1 }),
+        a('iron_streak', 'flame', 'p', 'Iron Streak', 'Win 10 competitive 1v1 matches in a row', { kind: 'rated_win_streak', ladder: 'default', goal: 10 }),
+        a('centurion', 'sword', 'p', 'Centurion', 'Win 100 competitive 1v1 matches', { kind: 'rated_won', ladder: 'default', goal: 100 }),
+        a('legion', 'people', 'p', 'Legion', 'Win 100 competitive team matches', { kind: 'rated_won', ladder: 'team', goal: 100 }),
+        a('emperor', 'shield', 'p', 'Emperor', 'Win 250 matches', { kind: 'won', goal: 250 }),
+        a('virtuoso', 'flag', 'p', 'Virtuoso', 'Win 100 matches with the same civilization', { kind: 'same_civ_wins', goal: 100 }),
+        a('triple_crown', 'trophy', 'p', 'Triple Crown', 'Win 3 tournaments', { kind: 'champion', goal: 3 }),
+        a('living_legend', 'star', 'p', 'Living Legend', 'Earn three in four of this game\'s medals', { kind: 'collector', share: 0.75 }),
+    ],
+};
+
+/** Every mod without a set of its own. Wars of Liberty's ({@link WOL_SET}) is this plus its civilizations. */
 export const GENERAL_SET: readonly AchievementGroup[] = [
-    {
-        id: 'first_steps', enamel: 0, name: 'First steps', items: [
-            a('baptism_of_fire', 'sword', 'b', 'Baptism of Fire', 'Play your first multiplayer match', { kind: 'played', goal: 1 }),
-            FIRST_BLOOD,
-            a('veteran', 'shield', 's', 'Veteran', 'Play 100 matches', { kind: 'played', goal: 100 }),
-            CONQUEROR,
-        ],
-    },
-    {
-        id: 'streaks_ranking', enamel: 1, name: 'Streaks and ranking', items: [
-            UNSTOPPABLE,
-            a('phoenix', 'phoenix', 'b', 'Phoenix', 'Win after losing 3 in a row', { kind: 'phoenix', losses: 3 }),
-            GIANT_SLAYER,
-            a('graduate', 'cap', 'b', 'Graduate', 'Finish your placement matches', { kind: 'graduate', ladder: 'default' }),
-            PROMOTION,
-            a('on_top', 'crown', 'g', 'On Top', 'Enter the podium (top 3)', { kind: 'on_top' }),
-        ],
-    },
+    FIRST_STEPS,
+    STREAKS_RANKING,
     COMPETITIVE_1V1,
     COMPETITIVE_TEAMS,
-    {
-        id: 'civs_maps', enamel: 4, name: 'Civilizations and maps', items: [
-            a('ambassador', 'flag', 's', 'Ambassador', 'Win with 10 different civilizations', { kind: 'distinct_civ_wins', goal: 10 }),
-            a('citizen_of_the_world', 'globe', 'g', 'Citizen of the World', 'Win with every civilization of the mod', { kind: 'every_civ_win' }),
-            a('specialist', 'star', 's', 'Specialist', 'Win 25 matches with the same civilization', { kind: 'same_civ_wins', goal: 25 }),
-            a('cartographer', 'compass', 's', 'Cartographer', 'Play on 20 different maps', { kind: 'distinct_maps_played', goal: 20 }),
-        ],
-    },
-    {
-        id: 'formats', enamel: 5, name: 'Formats', items: [
-            a('brothers_in_arms', 'people', 'b', 'Brothers in Arms', 'Win 10 team matches', { kind: 'team_wins', goal: 10 }),
-            a('lightning_war', 'bolt', 's', 'Lightning War', 'Win a match shorter than 15 minutes', { kind: 'short_win', maxSeconds: 15 * 60 }),
-            a('endless_siege', 'clock', 'b', 'Endless Siege', 'Win a match longer than 60 minutes', { kind: 'long_win', minSeconds: 60 * 60 }),
-        ],
-    },
-    {
-        id: 'community', enamel: 6, name: 'Community', items: [
-            DIPLOMAT,
-            a('host', 'host', 's', 'Host', 'Create 20 rooms that get played', { kind: 'host', goal: 20 }),
-            CHAMPION,
-            a('organiser', 'bracket', 's', 'Organiser', 'Organise a tournament that reaches the end', { kind: 'organiser' }),
-        ],
-    },
+    { id: 'civs_maps', enamel: 4, name: 'Civilizations and maps', items: [AMBASSADOR, CITIZEN, SPECIALIST, CARTOGRAPHER] },
+    FORMATS,
+    COMMUNITY,
+    FEATS,
 ];
 
 /** The Asian Dynasties: the game's own medals, the two competitive groups, and the general ones. */
@@ -224,9 +287,16 @@ export const TAD_SET: readonly AchievementGroup[] = [
     COMPETITIVE_TEAMS,
     {
         id: 'general', enamel: 6, name: 'General', items: [
-            FIRST_BLOOD, CONQUEROR, UNSTOPPABLE, GIANT_SLAYER, PROMOTION, DIPLOMAT, CHAMPION,
+            FIRST_BLOOD, CONQUEROR, FIELD_MARSHAL, STEADFAST, UNSTOPPABLE, INVINCIBLE, REVENGE, GIANT_SLAYER, PROMOTION,
         ],
     },
+    {
+        id: 'formats', enamel: 5, name: 'Formats', items: [ALL_ROUNDER, READY_FOR_BATTLE, SKIRMISHER, MINUTEMAN],
+    },
+    {
+        id: 'community', enamel: 0, name: 'Community', items: [DIPLOMAT, COSMOPOLITAN, IN_THE_BRACKET, FINALIST, CHAMPION],
+    },
+    FEATS,
 ];
 
 /**
@@ -261,6 +331,79 @@ export const CIV_LISTS: Readonly<Record<string, readonly string[]>> = Object.fre
         'Lakota', 'Mapuche', 'Tupi', 'Maori',
     ].map(civKey),
 });
+
+const civs = (...names: string[]): readonly string[] => names.map(civKey);
+
+/**
+ * Wars of Liberty's civilizations by continent. Together they are the whole of {@link CIV_LISTS}.wol,
+ * each exactly once (catalog.test.ts pins it), so the four are the steps to "Citizen of the World".
+ */
+export const WOL_CONTINENTS = Object.freeze({
+    africa_oceania: civs('Ethiopians', 'Egyptians', 'Zulu', 'Australians', 'Maori'),
+    eastern_empires: civs('Chinese', 'Indians', 'Japanese', 'Koreans', 'Afghans', 'Persians', 'Saudis', 'Uzbeks'),
+    old_continent: civs(
+        'Austro-Hungarians', 'Belgians', 'British', 'Danes', 'Dutch', 'French', 'Germans', 'Italians',
+        'Ottomans', 'Portuguese', 'Russians', 'Spanish', 'Swedes', 'Bulgarians', 'Greeks', 'Romanians', 'Serbians'),
+    the_americas: civs(
+        'United States', 'Canadians', 'Argentines', 'Bolivians', 'Brazilians', 'Central Americans', 'Chileans',
+        'Colombians', 'Haitians', 'Mexicans', 'Paraguayans', 'Peruvians', 'Uruguayans',
+        'Haudenosaunee', 'Inca', 'Lakota', 'Mapuche', 'Tupi'),
+});
+
+/** The former Spanish colonies Wars of Liberty plays (not Brazil, Portuguese; not Haiti, French). */
+const SPANISH_AMERICA = civs(
+    'Argentines', 'Bolivians', 'Central Americans', 'Chileans', 'Colombians', 'Mexicans',
+    'Paraguayans', 'Peruvians', 'Uruguayans');
+
+const war = (id: string, icon: string, metal: Metal, name: string, condition: string,
+    one: readonly string[], other: readonly string[]): AchievementDef =>
+    a(id, icon, metal, name, condition, { kind: 'matchup_win', mine: one, theirs: other, either: true });
+
+const continent = (id: keyof typeof WOL_CONTINENTS, icon: string, metal: Metal, name: string, condition: string) =>
+    a(id, icon, metal, name, condition, { kind: 'civ_set_wins', civs: WOL_CONTINENTS[id] });
+
+/** Wars of Liberty: the general set, its civilizations by continent, and the wars of the century. */
+export const WOL_SET: readonly AchievementGroup[] = [
+    FIRST_STEPS,
+    STREAKS_RANKING,
+    COMPETITIVE_1V1,
+    COMPETITIVE_TEAMS,
+    {
+        id: 'civs_maps', enamel: 4, name: 'Civilizations and maps', items: [
+            AMBASSADOR,
+            continent('africa_oceania', 'compass', 'b', 'Africa and Oceania', 'Win with each civilization of Africa and Oceania'),
+            continent('eastern_empires', 'star', 's', 'Eastern Empires', 'Win with each civilization of Asia'),
+            continent('old_continent', 'crown', 's', 'Old Continent', 'Win with each civilization of Europe'),
+            continent('the_americas', 'flag', 's', 'The Americas', 'Win with each civilization of the Americas'),
+            CITIZEN,
+            SPECIALIST,
+            CARTOGRAPHER,
+        ],
+    },
+    {
+        id: 'historical_wars', enamel: 1, name: 'Historical wars', items: [
+            war('war_triple_alliance', 'people', 'b', 'Triple Alliance', 'Win Paraguayans vs Argentines, Brazilians or Uruguayans, either side',
+                civs('Paraguayans'), civs('Argentines', 'Brazilians', 'Uruguayans')),
+            war('war_pacific', 'compass', 'b', 'War of the Pacific', 'Win Chileans vs Peruvians or Bolivians, either side',
+                civs('Chileans'), civs('Peruvians', 'Bolivians')),
+            war('war_independence', 'flag', 'b', 'Independence', 'Win a former Spanish colony vs Spain, either side',
+                SPANISH_AMERICA, civs('Spanish')),
+            war('war_crimean', 'shield', 'b', 'Crimean War', 'Win Russians vs Ottomans, British or French, either side',
+                civs('Russians'), civs('Ottomans', 'British', 'French')),
+            war('war_mexican_american', 'target', 's', 'Mexican-American War', 'Win Mexicans vs the United States, either side',
+                civs('Mexicans'), civs('United States')),
+            war('war_franco_prussian', 'crown', 's', 'Franco-Prussian War', 'Win French vs Germans, either side',
+                civs('French'), civs('Germans')),
+            war('war_anglo_zulu', 'sword', 's', 'Anglo-Zulu War', 'Win British vs Zulu, either side',
+                civs('British'), civs('Zulu')),
+            war('war_russo_japanese', 'star', 's', 'Russo-Japanese War', 'Win Russians vs Japanese, either side',
+                civs('Russians'), civs('Japanese')),
+        ],
+    },
+    FORMATS,
+    COMMUNITY,
+    FEATS,
+];
 
 /** TAD's three families, by the English display name (the canonical key). */
 export const TAD_FAMILIES: Readonly<Record<CivFamily, readonly string[]>> = Object.freeze({
@@ -317,6 +460,7 @@ export function mapKey(name: string | null | undefined): string {
 /** The groups a game's medals come in, with "Citizen of the World" only where the civ list is known. */
 export function catalogFor(modKey: string): readonly AchievementGroup[] {
     if (modKey === TAD_KEY) return TAD_SET;
+    if (modKey === 'wol') return WOL_SET;
     if (CIV_LISTS[modKey]) return GENERAL_SET;
     return GENERAL_SET.map((g) => g.id !== 'civs_maps'
         ? g
@@ -328,6 +472,11 @@ export function medalCount(modKey: string): number {
     let n = 0;
     for (const g of catalogFor(modKey)) for (const i of g.items) n += i.rule.kind === 'promotion' ? PROMOTION_TIERS.length : 1;
     return n;
+}
+
+/** How many of a game's other medals "Living Legend" asks: the share of all of them but itself, rounded up. */
+export function collectorGoal(modKey: string, share = 0.75): number {
+    return Math.ceil(share * (medalCount(modKey) - 1));
 }
 
 /** One achievement of a game with the group it sits in, or null when the game has no such medal. */

@@ -1415,7 +1415,26 @@ The row stays with `revoked_at`, so it is not given again.
 **The limits** (constants in `src/achievements/rules.ts`): a match counts if it came from a launcher
 room, lasted 3 minutes and everybody in it was in the room; at most 3 wins a day against the same
 side count; a rated win the ELO discounted below half earns nothing; ages and the podium need a
-table of 10 or more; Champion and Organiser need a tournament with 3 games played.
+table of 10 or more; Champion, Organiser, In the Bracket and Finalist need a tournament with 3
+games played.
+
+**The catalogue (2026-11-26):** Wars of Liberty 68 achievements / 72 medals, The Asian Dynasties
+57 / 61, every other mod 55 / 59 ("Promotion" is five medals). Design 121 drew 36 / 40 and 37 / 41;
+the rest — long goals, quick match, tournament play, the continents and historical wars of Wars of
+Liberty, and the nine platinum **feats** — was added after it.
+
+**Before deploying, look at the best 1v1 rating:** "Grandmaster" asks 1900
+(`src/achievements/catalog.ts`, `grandmaster`). If nobody is anywhere near it, lower that one
+number (1850) rather than ship a medal nobody can earn. The other feats scale from medals players
+already hold (1v1 and team wins x2, 250 wins, 3 tournaments, the first place of a table of 10, ten
+competitive 1v1 wins in a row, 100 wins with one civilization, and "Living Legend": three in four of
+the game's other medals, counting the stored ones). A quick match is one whose room the queue opened
+(`lobbies.matchmaking_match_id`).
+
+**Adding a medal later:** an addition is an edit to `catalog.ts`, but the history after the
+migration epoch is NOT born seen, so every player whose past matches already satisfy the new medal
+would be told about it on his next match. Run `achievements:backfill --apply` right after deploying
+the change: it writes them all as seen first.
 
 **One fix that came with it:** disqualifying a finalist settled the final but never finished the
 tournament (it stayed `running` with its champion known). The disqualify route now finishes it.

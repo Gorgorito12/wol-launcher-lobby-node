@@ -13,7 +13,7 @@
  * age held after his latest rated match — which is in some game.</p>
  */
 import {
-    allOf, catalogFor, civKey, mapKey, CIV_LISTS, MAP_LISTS, PROMOTION_TIERS, TAD_FAMILIES,
+    allOf, catalogFor, civKey, collectorGoal, mapKey, CIV_LISTS, MAP_LISTS, PROMOTION_TIERS, TAD_FAMILIES,
     type AchievementDef, type CivFamily, type Ladder,
 } from './catalog';
 import {
@@ -53,6 +53,8 @@ export interface MatchRow {
     ratingBefore: number | null;
     ratingAfter: number | null;
     others: OtherPlayer[];
+    /** The room was opened by the quick-match queue (lobbies.matchmaking_match_id). */
+    quickMatch?: boolean;
 }
 
 export interface DatedEvent {
@@ -78,8 +80,13 @@ export interface EvalInput {
     /** Finished tournaments he won / organised that qualify. */
     championOf: DatedEvent[];
     organiserOf: DatedEvent[];
+    /** Qualifying tournaments he played a game in, and those whose final he played. */
+    tournamentsPlayed?: DatedEvent[];
+    finalistOf?: DatedEvent[];
     /** His rated games on each ladder, from player_ratings (placement is about the ladder, not the game). */
     gamesPlayed: Record<Ladder, number>;
+    /** The medals already stored for him, not revoked, by game, as "id|tier" (for "Living Legend"). */
+    held?: Readonly<Record<string, readonly string[]>>;
     /** Where he stands right now, when known. Absent = not evaluated (the backfill of old rows). */
     position?: Partial<Record<Ladder, LadderPosition>>;
 }
@@ -117,7 +124,8 @@ export function modsOf(input: EvalInput): string[] {
         count.set(k, c);
     };
     for (const m of input.matches) bump(m.modKey, m.atMs, isCountable(m) ? 1 : 0);
-    for (const e of [...input.hostedRooms, ...input.championOf, ...input.organiserOf]) bump(e.modKey, e.atMs, 0);
+    for (const e of [...input.hostedRooms, ...input.championOf, ...input.organiserOf,
+        ...(input.tournamentsPlayed ?? []), ...(input.finalistOf ?? [])]) bump(e.modKey, e.atMs, 0);
     return [...count.entries()]
         .sort((x, y) => y[1].n - x[1].n || y[1].last - x[1].last || (x[0] < y[0] ? -1 : 1))
         .map(([k]) => k);
@@ -128,6 +136,13 @@ function opponentsOf(m: MatchRow): OtherPlayer[] {
     const distinctTeams = new Set([m.team, ...m.others.map((o) => o.team)]);
     if (distinctTeams.size < 2) return m.others;
     return m.others.filter((o) => o.team !== m.team);
+}
+
+/** "1v1", "2v2", "3v3" when the match had two sides of the same size, else ''. */
+function formatOf(m: MatchRow): string {
+    const opp = opponentsOf(m).length;
+    const mine = 1 + m.others.length - opp;
+    return opp > 0 && opp === mine ? `${mine}v${opp}` : '';
 }
 
 function isTeamMatch(m: MatchRow): boolean {
@@ -233,6 +248,23 @@ function evaluateMod(
     for (const def of allOf(modKey)) {
         progress.set(def.id, itemFor(def));
     }
+    // "Living Legend" last: it counts the others, earned now or stored before (a medal is never
+    // lost, so one the history no longer satisfies still counts), and never itself.
+    for (const def of allOf(modKey)) {
+        if (def.rule.kind !== 'collector') continue;
+        const have = new Set<string>(input.held?.[modKey] ?? []);
+        for (const item of progress.values()) {
+            if (item.def.rule.kind === 'collector') continue;
+            for (const e of item.earned) have.add(`${item.def.id}|${e.tier}`);
+        }
+        for (const key of [...have]) if (key.startsWith(`${def.id}|`)) have.delete(key);
+        const goal = collectorGoal(modKey, def.rule.share);
+        progress.set(def.id, {
+            def,
+            earned: have.size >= goal ? [{ tier: 0, atMs: input.nowMs }] : [],
+            ...goalOf(have.size, goal),
+        });
+    }
     return progress;
 
     function itemFor(def: AchievementDef): ItemProgress {
@@ -282,6 +314,25 @@ function evaluateMod(
                     && ordinals.get(x.matchId) === required);
                 return { def, earned: m ? [{ tier: 0, atMs: m.atMs, matchId: m.matchId }] : [] };
             }
+            case 'rated_win_streak': {
+                // Competitive matches of that ladder only: a casual match in between neither adds
+                // nor breaks the run, and a win the ELO or the per-rival cap discounted is skipped.
+                let run = 0;
+                let best = 0;
+                let last: number | null = null;
+                let at: Earned | null = null;
+                for (const m of rows) {
+                    if (m.rated !== 1 || m.ratingMode !== r.ladder || skippedWin(m)) continue;
+                    if (last !== null && m.atMs - last > STREAK_IDLE_CUTOFF_MS) run = 0;
+                    run = isWin(m) ? run + 1 : 0;
+                    last = m.atMs;
+                    best = Math.max(best, run);
+                    if (at === null && run >= r.goal) at = { tier: 0, atMs: m.atMs, matchId: m.matchId };
+                }
+                return { def, earned: once(at), ...goalOf(best, r.goal) };
+            }
+            case 'collector':
+                return { def, earned: [] }; // decided after every other medal, below
             case 'win_streak': {
                 let run = 0;
                 let best = 0;
@@ -334,11 +385,12 @@ function evaluateMod(
                 return { def, earned, tierNow: tier };
             }
             case 'on_top': {
+                const places = r.places ?? 3;
                 let top = false;
                 for (const ladder of ['default', 'team'] as const) {
                     if (positionMod[ladder] !== modKey) continue;
                     const p = input.position?.[ladder];
-                    if (p && p.rank >= 1 && p.rank <= 3 && p.size >= MIN_LADDER_FOR_POSITION_MEDALS) top = true;
+                    if (p && p.rank >= 1 && p.rank <= places && p.size >= MIN_LADDER_FOR_POSITION_MEDALS) top = true;
                 }
                 return { def, earned: top ? [{ tier: 0, atMs: input.nowMs }] : [] };
             }
@@ -439,11 +491,58 @@ function evaluateMod(
                     ...goalOf(mine.length, r.goal),
                 };
             }
+            case 'distinct_days_played': {
+                const c = new DistinctCounter(r.goal);
+                for (const m of rows) c.add(utcDay(m.atMs), m);
+                return { def, earned: once(c.at), ...goalOf(c.seen.size, r.goal) };
+            }
+            case 'revenge': {
+                // Who won the last 1v1 against each rival; a counted win right after a loss to him.
+                const lastLost = new Map<string, boolean>();
+                let at: Earned | null = null;
+                for (const m of rows) {
+                    const opp = opponentsOf(m);
+                    if (m.others.length !== 1 || opp.length !== 1) continue;
+                    const rival = opp[0]!.userId;
+                    if (at === null && isWin(m) && lastLost.get(rival) === true) {
+                        at = { tier: 0, atMs: m.atMs, matchId: m.matchId };
+                    }
+                    if (m.result >= WIN_AT) lastLost.set(rival, false);
+                    else if (m.result <= LOSS_AT) lastLost.set(rival, true);
+                }
+                return { def, earned: once(at) };
+            }
+            case 'formats_won': {
+                const c = new DistinctCounter(r.formats.length, r.formats);
+                for (const m of wins) c.add(formatOf(m), m);
+                return { def, earned: once(c.at), ...goalOf(c.seen.size, r.formats.length) };
+            }
+            case 'quick_wins': {
+                const c = new Counter(r.goal);
+                for (const m of wins) if (m.quickMatch) c.add(m);
+                return { def, earned: once(c.at), ...goalOf(c.n, r.goal) };
+            }
+            case 'civ_set_wins': {
+                const c = new DistinctCounter(r.civs.length, r.civs);
+                for (const m of wins) c.add(civKey(m.civ), m);
+                return { def, earned: once(c.at), ...goalOf(c.seen.size, r.civs.length) };
+            }
+            case 'tournament_played':
+            case 'finalist':
             case 'champion':
             case 'organiser': {
-                const list = (r.kind === 'champion' ? input.championOf : input.organiserOf).filter((e) => e.modKey === modKey);
-                const first = list[0];
-                return { def, earned: first ? [{ tier: 0, atMs: first.atMs, tournamentId: first.tournamentId }] : [] };
+                const source = r.kind === 'champion' ? input.championOf
+                    : r.kind === 'organiser' ? input.organiserOf
+                        : r.kind === 'finalist' ? input.finalistOf ?? []
+                            : input.tournamentsPlayed ?? [];
+                const list = source.filter((e) => e.modKey === modKey);
+                const goal = r.kind === 'champion' ? r.goal ?? 1 : 1;
+                const hit = list[goal - 1];
+                return {
+                    def,
+                    earned: hit ? [{ tier: 0, atMs: hit.atMs, tournamentId: hit.tournamentId }] : [],
+                    ...goalOf(list.length, goal),
+                };
             }
         }
     }

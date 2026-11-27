@@ -150,7 +150,7 @@ test('a private rating hides every medal from others, and nothing from him', asy
     assert.deepEqual(Object.keys(other).sort(), ['hidden', 'mod', 'total']);
     const own = buildPayload({ modKey: 'wol', mods: modsOf(input), progress: progress.get('wol'), earned, self: true, ratingPrivate: true });
     assert.equal(own.earned, 2);
-    assert.equal(own.total, 40);
+    assert.equal(own.total, 72);
     assert.equal(own.unseen!.length, 2);
 });
 
@@ -178,7 +178,7 @@ test('only unseen medals become a frame, one per game', () => {
     const wol = frames.find((f) => f.mod === 'wol')!;
     assert.deepEqual(wol.items.map((i) => i.id), ['first_blood']);
     assert.equal(wol.earned, 7);
-    assert.equal(wol.total, 40);
+    assert.equal(wol.total, 72);
     assert.equal(wol.items[0]!.earned_at, '2026-11-21T10:00:00Z');
 });
 
@@ -205,4 +205,72 @@ test('an older launcher (no "achievements" in its hello) never receives the fram
     assert.equal(room.sendToFeature('old', 'achievements', { type: 'achievement_unlocked' }), false);
     assert.equal(room.sendToFeature('new', 'achievements', { type: 'achievement_unlocked' }), true);
     assert.equal(sent.length, 1);
+});
+
+test('a room the quick-match queue opened is read as a quick match', async () => {
+    const db = freshDb();
+    const id = addMatch(db);
+    db.raw().prepare(`UPDATE lobbies SET matchmaking_match_id = 'q1' WHERE id = (SELECT lobby_id FROM matches WHERE id = ?)`).run(id);
+    addMatch(db);
+    const input = await loadEvalInput(db, 'me', Date.now());
+    assert.deepEqual(input.matches.map((m) => m.quickMatch), [true, false]);
+    const r = await evaluateAndAward(ctxOf(db), 'me');
+    assert.ok(r.awarded.some((a) => a.id === 'ready_for_battle'));
+});
+
+/** A finished 1v1 tournament of four: me beats third, rival beats x, then the final, me against rival. */
+function addTournament(db: Db, played = 3): void {
+    const raw = db.raw();
+    raw.prepare(`INSERT INTO users (id, discord_id, discord_username, display_name) VALUES ('x', 'dc-x', 'x', 'x')`).run();
+    raw.prepare(
+        `INSERT INTO tournaments (id, name, mod_id, owner_user_id, status, finished_at, winner_entrant_id)
+         VALUES ('t1', 'Cup', 'wol', 'third', 'finished', datetime('now'), 'e-rival')`,
+    ).run();
+    for (const u of ['me', 'rival', 'third', 'x']) {
+        raw.prepare(
+            `INSERT INTO tournament_entrants (id, tournament_id, kind, display_name, captain_user_id, status)
+             VALUES (?, 't1', 'solo', ?, ?, 'confirmed')`,
+        ).run(`e-${u}`, u, u);
+        raw.prepare(`INSERT INTO tournament_entrant_members (entrant_id, user_id) VALUES (?, ?)`).run(`e-${u}`, u);
+    }
+    const games: Array<[string, number, number, string, string]> = [
+        ['tm1', 1, 0, 'e-me', 'e-third'], ['tm2', 1, 1, 'e-rival', 'e-x'], ['tm3', 2, 0, 'e-me', 'e-rival'],
+    ];
+    games.forEach(([id, round, pos, a, b], i) => {
+        raw.prepare(
+            `INSERT INTO tournament_matches (id, tournament_id, round, position, entrant1_id, entrant2_id, status, outcome, decided_at)
+             VALUES (?, 't1', ?, ?, ?, ?, 'done', ?, datetime('now'))`,
+        ).run(id, round, pos, a, b, i < played ? 'played' : 'walkover');
+    });
+}
+
+test('both finalists earn Finalist; the semi-finalist only In the Bracket', async () => {
+    const db = freshDb();
+    addTournament(db);
+    for (const u of ['me', 'rival', 'third']) await evaluateAndAward(ctxOf(db), u);
+    const has = async (u: string, id: string) => (await listEarned(db, u)).some((r) => r.achievement_id === id);
+    assert.ok(await has('me', 'finalist'));
+    assert.ok(await has('rival', 'finalist'));
+    assert.ok(await has('third', 'in_the_bracket'));
+    assert.ok(!(await has('third', 'finalist')));
+    assert.ok(await has('rival', 'champion'));
+    assert.ok(!(await has('me', 'champion')));
+});
+
+test('a tournament with fewer than three games played gives no tournament medal', async () => {
+    const db = freshDb();
+    addTournament(db, 2);
+    await evaluateAndAward(ctxOf(db), 'me');
+    const ids = (await listEarned(db, 'me')).map((r) => r.achievement_id);
+    assert.ok(!ids.includes('in_the_bracket'));
+    assert.ok(!ids.includes('finalist'));
+});
+
+test('the stored medals reach the evaluation, revoked ones left out', async () => {
+    const db = freshDb();
+    addMatch(db);
+    await evaluateAndAward(ctxOf(db), 'me');
+    await revoke(db, 'me', 'wol', 'first_blood', 0);
+    const input = await loadEvalInput(db, 'me', Date.now());
+    assert.deepEqual(input.held, { wol: ['baptism_of_fire|0'] });
 });

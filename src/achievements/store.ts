@@ -48,7 +48,7 @@ function parseRoster(json: string | null): Set<string> | null {
 const msOf = (ts: string | null | undefined): number => sqliteTimestampToMs(ts ?? null) ?? 0;
 
 /**
- * Everything evaluate.ts needs about one player, in nine indexed queries. `position` is asked only
+ * Everything evaluate.ts needs about one player, in eight indexed queries. `position` is asked only
  * when the caller wants the age and the podium judged now (never for a backfill of old rows).
  */
 export async function loadEvalInput(
@@ -62,7 +62,7 @@ export async function loadEvalInput(
                 COALESCE(l.mod_id, m.mod_id) AS mod_id,
                 m.map_name, m.duration_seconds, m.rated, m.unrated_reason, m.decided_by,
                 COALESCE(m.rating_mode, 'default') AS rating_mode, m.elo_factor,
-                l.game_rules, l.roster_at_start,
+                l.game_rules, l.roster_at_start, l.matchmaking_match_id,
                 p.team, p.civ, p.result, p.rating_before, p.rating_after
            FROM match_participants p
            JOIN matches m ON m.id = p.match_id
@@ -74,6 +74,7 @@ export async function loadEvalInput(
         map_name: string | null; duration_seconds: number | null; rated: number | null;
         unrated_reason: string | null; decided_by: string | null; rating_mode: string;
         elo_factor: number | null; game_rules: number | null; roster_at_start: string | null;
+        matchmaking_match_id: string | null;
         team: number | null; civ: string | null; result: number;
         rating_before: number | null; rating_after: number | null;
     }>();
@@ -118,6 +119,7 @@ export async function loadEvalInput(
             ratingBefore: r.rating_before,
             ratingAfter: r.rating_after,
             others: list,
+            quickMatch: !!r.matchmaking_match_id,
         };
     });
 
@@ -157,6 +159,26 @@ export async function loadEvalInput(
         `SELECT t.id, t.mod_id, t.finished_at FROM tournaments t
           WHERE t.owner_user_id = ? AND t.status = 'finished' AND ${playedGames} >= ?
           ORDER BY t.finished_at ASC`);
+    // "In the Bracket": a game he actually played (not a bye, a walkover or a disqualification),
+    // dated by the first one. "Finalist": the last round of a finished tournament, played.
+    const playedTm = `JOIN tournament_matches tm ON tm.outcome = 'played'
+                       AND (tm.entrant1_id = em.entrant_id OR tm.entrant2_id = em.entrant_id)
+                     JOIN tournaments t ON t.id = tm.tournament_id`;
+    const tournamentsPlayed = await tournamentEvents(
+        `SELECT t.id, t.mod_id, MIN(tm.decided_at) AS finished_at
+           FROM tournament_entrant_members em
+           ${playedTm}
+          WHERE em.user_id = ? AND t.status IN ('running', 'finished') AND ${playedGames} >= ?
+          GROUP BY t.id
+          ORDER BY finished_at ASC`);
+    const finalistOf = await tournamentEvents(
+        `SELECT t.id, t.mod_id, t.finished_at
+           FROM tournament_entrant_members em
+           ${playedTm}
+          WHERE em.user_id = ? AND t.status = 'finished' AND ${playedGames} >= ?
+            AND tm.round = (SELECT MAX(x.round) FROM tournament_matches x WHERE x.tournament_id = t.id)
+          GROUP BY t.id
+          ORDER BY t.finished_at ASC`);
 
     const ratings = await db.prepare(
         `SELECT mode, games_played FROM player_ratings WHERE user_id = ?`,
@@ -164,7 +186,13 @@ export async function loadEvalInput(
     const gamesPlayed: Record<Ladder, number> = { default: 0, team: 0 };
     for (const r of ratings.results ?? []) if (r.mode === 'default' || r.mode === 'team') gamesPlayed[r.mode] = r.games_played;
 
-    return { userId, nowMs, matches, hostedRooms, championOf, organiserOf, gamesPlayed, position };
+    const held: Record<string, string[]> = {};
+    for (const r of await listEarned(db, userId)) (held[r.mod_key] ??= []).push(`${r.achievement_id}|${r.tier}`);
+
+    return {
+        userId, nowMs, matches, hostedRooms, championOf, organiserOf, tournamentsPlayed, finalistOf,
+        gamesPlayed, held, position,
+    };
 }
 
 /**

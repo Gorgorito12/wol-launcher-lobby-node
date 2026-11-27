@@ -121,13 +121,17 @@ export async function noteMatchChanged(ctx: AppContext, matchId: string): Promis
     } catch { /* best-effort */ }
 }
 
-/** A tournament finished: evaluate its champion's players and its organiser. */
+/**
+ * A tournament finished: evaluate everybody who entered it and its organiser. Not only the
+ * champion: the finalists earn "Finalist", and a player whose game came before the tournament had
+ * the games it needs to qualify earns "In the Bracket" only now.
+ */
 export async function noteTournamentFinished(ctx: AppContext, tournamentId: string): Promise<void> {
     try {
         const rows = await ctx.db.prepare(
-            `SELECT em.user_id FROM tournaments t
-               JOIN tournament_entrant_members em ON em.entrant_id = t.winner_entrant_id
-              WHERE t.id = ?
+            `SELECT em.user_id FROM tournament_entrants e
+               JOIN tournament_entrant_members em ON em.entrant_id = e.id
+              WHERE e.tournament_id = ?
              UNION
              SELECT owner_user_id FROM tournaments WHERE id = ?`,
         ).bind(tournamentId, tournamentId).all<{ user_id: string | null }>();
